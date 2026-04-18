@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import torch.utils.data
 import pickle as pkl
@@ -7,11 +8,23 @@ import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
 from model import Vgg16, Res18, Res50, WRN
 from train_model import train, test
-from cut import pattern_translate, get_structure_mask, get_ORC_mask, get_shape_mask, pattern_value_identical_translate, pattern_value_similar_translate, structure_and_value_identical_translate, pattern_shape_and_value_similar_translate
+from cut import (
+    pattern_translate,
+    get_structure_mask,
+    get_ORC_mask,
+    get_shape_mask,
+    pattern_value_identical_translate,
+    pattern_value_similar_translate,
+    structure_and_value_identical_translate,
+    pattern_shape_and_value_similar_translate,
+    ft_group_score_mask,
+    ft_group_cluster_translate,
+    ft_group_translate_train,
+)
 
 
 model_name = 'Vgg16'  # select one from[Vgg16, Res18, Res50, WRN]
-translate_name = 'weight_pattern_shape_and_value_similar_translate'  # select one from['structure_pruning', 'ORC_pruning', 'weight_pattern_shape_translate', 'weight_pattern_value_identical_translate', 'weight_pattern_value_similar_translate', 'structure_pruning_and_weight_pattern_value_identical_translate', 'weight_pattern_shape_and_value_similar_translate']
+translate_name = 'ft_group_cluster_translate'  # 新默认方法：面向容错的OU分组剪枝/映射
 
 lr = 0.1
 epoches = 200
@@ -22,6 +35,17 @@ weight_decay_2 = 0.001
 OU_size = 8
 pattern_shape_number = 8
 translate_epoch = [150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200]
+
+ft_min_group_size = 2
+ft_target_group_size_default = 4
+ft_similarity_threshold_default = 0.85
+ft_exact_similarity_threshold = 0.98
+ft_scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+ft_group_refresh_epoch = [150, 160, 170, 180, 190, 195, 200]
+ft_balance_lambda = 1e-4
+ft_proto_lambda = 1e-3
+ft_mask_lambda = 1e-3
+ft_sep_lambda = 5e-5
 
 
 def get_dataloader(data_name):
@@ -47,7 +71,108 @@ def get_dataloader(data_name):
         return cifar10_train_loader, cifar10_test_loader, cifar10_train_size, cifar10_test_size, cifar10_classes, cifar10_input_size
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='FT-oriented grouping training entry')
+    parser.add_argument('--model', type=str, default=model_name, choices=['Vgg16', 'Res18', 'Res50', 'WRN'], help='model name')
+    parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
+    return parser.parse_args()
+
+
+def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel,
+                         kernel_size, channel_number, pattern_value_number, mask, map_information,
+                         multiple_relationship_information, reuse_ratio_information, ft_layer_enabled,
+                         ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold):
+    group_information = {layer: None for layer in weight_name}
+
+    mask_file = f'model_{model_name}_{translate_name}_mask.pkl'
+    map_file = f'model_{model_name}_{translate_name}_map_information.pkl'
+    mult_file = f'model_{model_name}_{translate_name}_multiple_relationship_information.pkl'
+    reuse_file = f'model_{model_name}_{translate_name}_reuse_ratio_information.pkl'
+    group_file = f'model_{model_name}_{translate_name}_group_information.pkl'
+
+    cache_files = [mask_file, map_file, mult_file, reuse_file]
+    need_regenerate = any(not os.path.exists(file_path) for file_path in cache_files)
+
+    if need_regenerate:
+        checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(translate_epoch[0]) + '_ckpt.pth')
+        model_original.load_state_dict(checkpoint['model'])
+
+        for i in range(0, len(weight_name)):
+            if not ft_layer_enabled[i]:
+                group_information[weight_name[i]] = {
+                    'layer_name': weight_name[i],
+                    'group_count': 0,
+                    'ou_count': layer_in_channel[i] * layer_out_channel[i],
+                    'coverage_ratio': 0.0,
+                    'groups': [],
+                }
+                continue
+
+            target_group_size = ft_target_group_size[i]
+            similarity_threshold = ft_similarity_threshold[i]
+            mask[weight_name[i]], group_seed_info = ft_group_score_mask(
+                model=model_original,
+                weight_name=weight_name[i],
+                in_channel=layer_in_channel[i],
+                out_channel=layer_out_channel[i],
+                kernel_size=kernel_size[i],
+                channel_number=channel_number[i],
+                pattern_value_number=pattern_value_number[i],
+                pattern_shape_number=pattern_shape_number,
+                OU_size=OU_size,
+                target_group_size=target_group_size,
+                sim_threshold=similarity_threshold,
+            )
+            map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = ft_group_cluster_translate(
+                model=model_original,
+                in_channel=layer_in_channel[i],
+                out_channel=layer_out_channel[i],
+                weight_name=weight_name[i],
+                kernel_size=kernel_size[i],
+                channel_number=channel_number[i],
+                mask=mask[weight_name[i]],
+                min_group_size=ft_min_group_size,
+                target_group_size=target_group_size,
+                sim_threshold=similarity_threshold,
+                exact_threshold=ft_exact_similarity_threshold,
+                scale_candidates=ft_scale_candidates,
+            )
+            group_information[weight_name[i]]['target_ratio'] = ft_group_target_ratio[i]
+            group_information[weight_name[i]]['seed_info'] = group_seed_info
+
+        with open(mask_file, 'wb') as f_mask:
+            pkl.dump(mask, f_mask, pkl.HIGHEST_PROTOCOL)
+        with open(map_file, 'wb') as f_map:
+            pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
+        with open(mult_file, 'wb') as f_mult:
+            pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
+        with open(reuse_file, 'wb') as f_reuse:
+            pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
+        with open(group_file, 'wb') as f_group:
+            pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
+    else:
+        with open(mask_file, 'rb') as f_mask:
+            mask = pkl.load(f_mask)
+        with open(map_file, 'rb') as f_map:
+            map_information = pkl.load(f_map)
+        with open(mult_file, 'rb') as f_mult:
+            multiple_relationship_information = pkl.load(f_mult)
+        with open(reuse_file, 'rb') as f_reuse:
+            reuse_ratio_information = pkl.load(f_reuse)
+        if os.path.exists(group_file):
+            with open(group_file, 'rb') as f_group:
+                group_information = pkl.load(f_group)
+        else:
+            print(f'Warning: missing {group_file}, simulator will fallback to map_information.')
+
+    return mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information
+
+
 if __name__ == '__main__':
+    args = parse_args()
+    model_name = args.model
+    translate_name = args.translate
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
         cudnn.deterministic = True
@@ -136,6 +261,32 @@ if __name__ == '__main__':
         # 记录每一层weight-pattern的重用率
         layer_reuse_ratio_list = [torch.zeros(1) for i in range(0, len(weight_name))]
         reuse_ratio_information = dict(zip(weight_name, layer_reuse_ratio_list))
+        ft_layer_enabled = [True] * len(weight_name)
+        ft_group_target_ratio = [0.75] * len(weight_name)
+        ft_target_group_size = [ft_target_group_size_default] * len(weight_name)
+        ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
+        group_information = {layer: None for layer in weight_name}
+
+        if translate_name == 'ft_group_cluster_translate':
+            mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                model_original=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                layer_in_channel=layer_in_channel,
+                layer_out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                channel_number=channel_number,
+                pattern_value_number=pattern_value_number,
+                mask=mask,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_layer_enabled=ft_layer_enabled,
+                ft_group_target_ratio=ft_group_target_ratio,
+                ft_target_group_size=ft_target_group_size,
+                ft_similarity_threshold=ft_similarity_threshold,
+            )
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -309,7 +460,44 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
+        if translate_name == 'ft_group_cluster_translate':
+            ft_group_translate_train(
+                model=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                in_channel=layer_in_channel,
+                out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                ft_layer_enabled=ft_layer_enabled,
+                mask=mask,
+                group_information=group_information,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_mask_lambda=ft_mask_lambda,
+                ft_proto_lambda=ft_proto_lambda,
+                ft_balance_lambda=ft_balance_lambda,
+                ft_sep_lambda=ft_sep_lambda,
+                device=device,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                max_epoches=epoches,
+                translate_epoch=translate_epoch,
+                group_refresh_epoch=ft_group_refresh_epoch,
+                min_group_size=ft_min_group_size,
+                target_group_size=ft_target_group_size_default,
+                sim_threshold=ft_similarity_threshold_default,
+                exact_threshold=ft_exact_similarity_threshold,
+                scale_candidates=ft_scale_candidates,
+                pattern_value_number=pattern_value_number,
+                pattern_shape_number=pattern_shape_number,
+                OU_size=OU_size,
+            )
+        else:
+            pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
 
 
     # 创建并训练模型
@@ -420,6 +608,32 @@ if __name__ == '__main__':
         # 记录每一层weight-pattern的重用率
         layer_reuse_ratio_list = [torch.zeros(1) for i in range(0, len(weight_name))]
         reuse_ratio_information = dict(zip(weight_name, layer_reuse_ratio_list))
+        ft_layer_enabled = [True] * len(weight_name)
+        ft_group_target_ratio = [0.75] * len(weight_name)
+        ft_target_group_size = [ft_target_group_size_default] * len(weight_name)
+        ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
+        group_information = {layer: None for layer in weight_name}
+
+        if translate_name == 'ft_group_cluster_translate':
+            mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                model_original=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                layer_in_channel=layer_in_channel,
+                layer_out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                channel_number=channel_number,
+                pattern_value_number=pattern_value_number,
+                mask=mask,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_layer_enabled=ft_layer_enabled,
+                ft_group_target_ratio=ft_group_target_ratio,
+                ft_target_group_size=ft_target_group_size,
+                ft_similarity_threshold=ft_similarity_threshold,
+            )
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -593,7 +807,44 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
+        if translate_name == 'ft_group_cluster_translate':
+            ft_group_translate_train(
+                model=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                in_channel=layer_in_channel,
+                out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                ft_layer_enabled=ft_layer_enabled,
+                mask=mask,
+                group_information=group_information,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_mask_lambda=ft_mask_lambda,
+                ft_proto_lambda=ft_proto_lambda,
+                ft_balance_lambda=ft_balance_lambda,
+                ft_sep_lambda=ft_sep_lambda,
+                device=device,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                max_epoches=epoches,
+                translate_epoch=translate_epoch,
+                group_refresh_epoch=ft_group_refresh_epoch,
+                min_group_size=ft_min_group_size,
+                target_group_size=ft_target_group_size_default,
+                sim_threshold=ft_similarity_threshold_default,
+                exact_threshold=ft_exact_similarity_threshold,
+                scale_candidates=ft_scale_candidates,
+                pattern_value_number=pattern_value_number,
+                pattern_shape_number=pattern_shape_number,
+                OU_size=OU_size,
+            )
+        else:
+            pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
 
 
     # 创建并训练模型
@@ -742,6 +993,32 @@ if __name__ == '__main__':
         # 记录每一层weight-pattern的重用率
         layer_reuse_ratio_list = [torch.zeros(1) for i in range(0, len(weight_name))]
         reuse_ratio_information = dict(zip(weight_name, layer_reuse_ratio_list))
+        ft_layer_enabled = [True] * len(weight_name)
+        ft_group_target_ratio = [0.75] * len(weight_name)
+        ft_target_group_size = [ft_target_group_size_default] * len(weight_name)
+        ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
+        group_information = {layer: None for layer in weight_name}
+
+        if translate_name == 'ft_group_cluster_translate':
+            mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                model_original=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                layer_in_channel=layer_in_channel,
+                layer_out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                channel_number=channel_number,
+                pattern_value_number=pattern_value_number,
+                mask=mask,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_layer_enabled=ft_layer_enabled,
+                ft_group_target_ratio=ft_group_target_ratio,
+                ft_target_group_size=ft_target_group_size,
+                ft_similarity_threshold=ft_similarity_threshold,
+            )
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -915,7 +1192,44 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
+        if translate_name == 'ft_group_cluster_translate':
+            ft_group_translate_train(
+                model=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                in_channel=layer_in_channel,
+                out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                ft_layer_enabled=ft_layer_enabled,
+                mask=mask,
+                group_information=group_information,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_mask_lambda=ft_mask_lambda,
+                ft_proto_lambda=ft_proto_lambda,
+                ft_balance_lambda=ft_balance_lambda,
+                ft_sep_lambda=ft_sep_lambda,
+                device=device,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                max_epoches=epoches,
+                translate_epoch=translate_epoch,
+                group_refresh_epoch=ft_group_refresh_epoch,
+                min_group_size=ft_min_group_size,
+                target_group_size=ft_target_group_size_default,
+                sim_threshold=ft_similarity_threshold_default,
+                exact_threshold=ft_exact_similarity_threshold,
+                scale_candidates=ft_scale_candidates,
+                pattern_value_number=pattern_value_number,
+                pattern_shape_number=pattern_shape_number,
+                OU_size=OU_size,
+            )
+        else:
+            pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
 
 
     # 创建并训练模型
@@ -1012,6 +1326,32 @@ if __name__ == '__main__':
         # 记录每一层weight-pattern的重用率
         layer_reuse_ratio_list = [torch.zeros(1) for i in range(0, len(weight_name))]
         reuse_ratio_information = dict(zip(weight_name, layer_reuse_ratio_list))
+        ft_layer_enabled = [True] * len(weight_name)
+        ft_group_target_ratio = [0.75] * len(weight_name)
+        ft_target_group_size = [ft_target_group_size_default] * len(weight_name)
+        ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
+        group_information = {layer: None for layer in weight_name}
+
+        if translate_name == 'ft_group_cluster_translate':
+            mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                model_original=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                layer_in_channel=layer_in_channel,
+                layer_out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                channel_number=channel_number,
+                pattern_value_number=pattern_value_number,
+                mask=mask,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_layer_enabled=ft_layer_enabled,
+                ft_group_target_ratio=ft_group_target_ratio,
+                ft_target_group_size=ft_target_group_size,
+                ft_similarity_threshold=ft_similarity_threshold,
+            )
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -1185,4 +1525,41 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
+        if translate_name == 'ft_group_cluster_translate':
+            ft_group_translate_train(
+                model=model_original,
+                model_name=model_name,
+                translate_name=translate_name,
+                weight_name=weight_name,
+                in_channel=layer_in_channel,
+                out_channel=layer_out_channel,
+                kernel_size=kernel_size,
+                ft_layer_enabled=ft_layer_enabled,
+                mask=mask,
+                group_information=group_information,
+                map_information=map_information,
+                multiple_relationship_information=multiple_relationship_information,
+                reuse_ratio_information=reuse_ratio_information,
+                ft_mask_lambda=ft_mask_lambda,
+                ft_proto_lambda=ft_proto_lambda,
+                ft_balance_lambda=ft_balance_lambda,
+                ft_sep_lambda=ft_sep_lambda,
+                device=device,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                max_epoches=epoches,
+                translate_epoch=translate_epoch,
+                group_refresh_epoch=ft_group_refresh_epoch,
+                min_group_size=ft_min_group_size,
+                target_group_size=ft_target_group_size_default,
+                sim_threshold=ft_similarity_threshold_default,
+                exact_threshold=ft_exact_similarity_threshold,
+                scale_candidates=ft_scale_candidates,
+                pattern_value_number=pattern_value_number,
+                pattern_shape_number=pattern_shape_number,
+                OU_size=OU_size,
+            )
+        else:
+            pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)

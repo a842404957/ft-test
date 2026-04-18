@@ -25,7 +25,7 @@ class CompressedPatternDataLoader(PatternDataLoader):
     """压缩模式数据加载器，继承自PatternDataLoader"""
 
     def __init__(self, model_name: str = 'Res50',
-                 translate_name: str = 'weight_pattern_shape_and_value_similar_translate',
+                 translate_name: str = 'ft_group_cluster_translate',
                  data_dir: str = './'):
         """
         初始化压缩模式数据加载器
@@ -376,7 +376,7 @@ class CompressedPatternDataLoader(PatternDataLoader):
 
 
 def create_compressed_loader(model_name: str = 'Res50',
-                           translate_name: str = 'weight_pattern_shape_and_value_similar_translate',
+                           translate_name: str = 'ft_group_cluster_translate',
                            data_dir: str = './') -> CompressedPatternDataLoader:
     """
     创建压缩模式数据加载器的便捷函数

@@ -32,7 +32,7 @@ class FaultToleranceSimulator:
     def __init__(self, 
                  model: nn.Module,
                  model_name: str = 'Vgg16',
-                 translate_name: str = 'weight_pattern_shape_and_value_similar_translate',
+                 translate_name: str = 'ft_group_cluster_translate',
                  config_file: str = None,
                  data_dir: str = './'):
         """
@@ -46,7 +46,7 @@ class FaultToleranceSimulator:
             data_dir: 数据文件目录
         """
         print("=" * 70)
-        print("🛡️ PRAP-PIM 容错机制仿真器")
+        print("🛡️ FT-Oriented 容错机制仿真器")
         print("=" * 70)
         
         self.model = model
@@ -373,6 +373,41 @@ class FaultToleranceSimulator:
 
         self._mask_group_index[layer_name] = groups
         return groups
+
+    @staticmethod
+    def compute_member_to_member_scale(alpha_i: float, alpha_j: float, eps: float = 1e-8) -> float:
+        """从group中的两个member multiplier推导member-to-member缩放比例。"""
+        return alpha_i / (alpha_j + eps)
+
+    @staticmethod
+    def _extract_ou_weight(weight_tensor: torch.Tensor, ou: Tuple[int, int]) -> torch.Tensor:
+        out_ch, in_ch = ou
+        if weight_tensor.dim() == 4:
+            return weight_tensor[out_ch, in_ch, :, :]
+        return weight_tensor[out_ch, in_ch]
+
+    @staticmethod
+    def _compute_ou_similarity(faulty_weight: torch.Tensor,
+                               candidate_weight: torch.Tensor,
+                               mask_slice: Optional[torch.Tensor] = None) -> float:
+        if mask_slice is not None and faulty_weight.dim() > 0 and mask_slice.shape == faulty_weight.shape:
+            mask_bool = mask_slice.bool()
+            faulty_vec = faulty_weight[mask_bool].flatten()
+            candidate_vec = candidate_weight[mask_bool].flatten()
+        else:
+            faulty_vec = faulty_weight.flatten()
+            candidate_vec = candidate_weight.flatten()
+
+        if faulty_vec.numel() == 0 or candidate_vec.numel() == 0:
+            return 0.0
+
+        norm_f = torch.norm(faulty_vec, p=2)
+        norm_c = torch.norm(candidate_vec, p=2)
+        if norm_f <= 1e-8 or norm_c <= 1e-8:
+            return 0.0
+
+        cosine = torch.dot(faulty_vec.float(), candidate_vec.float()) / (norm_f * norm_c)
+        return ((cosine + 1.0) / 2.0).item()
     
     def _inject_ou_level_faults(self) -> Dict[str, List[Tuple[int, int]]]:
         """
@@ -546,6 +581,11 @@ class FaultToleranceSimulator:
         level1_count = 0
         level2_count = 0
         level3_count = 0
+        level1_prototype_repairs = 0
+        level1_member_repairs = 0
+        level1_exact_repairs = 0
+        level1_scaled_repairs = 0
+        level1_failed_singleton = 0
 
         level1_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
         level2_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
@@ -581,49 +621,15 @@ class FaultToleranceSimulator:
             layer_level1 = []
             layer_level2 = []
             layer_level3 = []
+            layer_mask = self.data_loader.get_layer_mask(layer_name)
+            if layer_mask is not None and layer_mask.shape[:2] == layer_weights.shape[:2]:
+                layer_mask = layer_mask.to(layer_weights.device)
+            else:
+                layer_mask = None
 
             # ---------- Level 1: 冗余组缩放替换（100%恢复）----------
             # 策略：用冗余组内健康OU的权重，按倍数关系缩放后替换故障OU
             if hierarchical_config.get('level1', {}).get('enabled', True) and groups:
-            # level1_cfg = hierarchical_config.get('level1', {})
-            # level1_similarity_threshold = level1_cfg.get('similarity_threshold', 0.95)
-            # level1_require_mask_match = level1_cfg.get('require_mask_match', True)
-            # layer_mask = self.data_loader.get_layer_mask(layer_name)
-            # mask_for_calc = None
-            # if layer_mask is not None and layer_mask.shape[:2] == layer_weights.shape[:2]:
-            #     mask_for_calc = layer_mask.to(layer_weights.device)
-
-            # def get_mask_key(out_ch: int, in_ch: int) -> Optional[bytes]:
-            #     if mask_for_calc is None:
-            #         return None
-            #     return mask_for_calc[out_ch, in_ch].flatten().to(torch.uint8).cpu().numpy().tobytes()
-
-            # def compute_similarity(faulty_weight: torch.Tensor,
-            #                        candidate_weight: torch.Tensor,
-            #                        out_ch: int,
-            #                        in_ch: int) -> float:
-            #     if layer_weights.dim() == 4:
-            #         if mask_for_calc is not None:
-            #             mask_local = mask_for_calc[out_ch, in_ch].bool()
-            #             faulty_vec = faulty_weight[mask_local].flatten()
-            #             candidate_vec = candidate_weight[mask_local].flatten()
-            #         else:
-            #             faulty_vec = faulty_weight.flatten()
-            #             candidate_vec = candidate_weight.flatten()
-            #     else:
-            #         faulty_vec = faulty_weight.reshape(1)
-            #         candidate_vec = candidate_weight.reshape(1)
-
-            #     if faulty_vec.numel() == 0 or candidate_vec.numel() == 0:
-            #         return 0.0
-            #     norm_f = torch.norm(faulty_vec)
-            #     norm_c = torch.norm(candidate_vec)
-            #     if norm_f > 0 and norm_c > 0:
-            #         cosine = torch.dot(faulty_vec, candidate_vec) / (norm_f * norm_c)
-            #         return ((cosine + 1) / 2).item()
-            #     return 0.0
-
-            # if level1_cfg.get('enabled', True) and groups:
                 for faulty_ou in faulty_ous:
                     containing_group = None
 
@@ -633,64 +639,43 @@ class FaultToleranceSimulator:
                             containing_group = group
                             break
 
-                    if containing_group is None or containing_group.size() < 2:
+                    if containing_group is None:
+                        continue
+                    if containing_group.size() < 2:
+                        level1_failed_singleton += 1
                         continue
 
                     # 找到健康的OU
-                    healthy_ous = []
-                    for ou in containing_group.ou_indices:
-                        if ou != faulty_ou and ou not in faulty_set:
-                            healthy_ous.append(ou)
+                    healthy_ous = [ou for ou in containing_group.ou_indices if ou != faulty_ou and ou not in faulty_set]
 
                     if not healthy_ous:
                         continue
-                    replacement_ou = healthy_ous[0]
-                    # # ✅ Level 1核心逻辑：使用倍数关系进行智能替换（带相似度与mask门槛）
-                    # out_ch, in_ch = faulty_ou  # 故障OU的通道索引
-                    # faulty_weight = (original_layer_weights[out_ch, in_ch, :, :]
-                    #                  if layer_weights.dim() == 4
-                    #                  else original_layer_weights[out_ch, in_ch])
-                    # faulty_mask_key = get_mask_key(out_ch, in_ch) if level1_require_mask_match else None
+                    out_ch, in_ch = faulty_ou
+                    faulty_weight = self._extract_ou_weight(original_layer_weights, faulty_ou)
+                    faulty_mask_slice = layer_mask[out_ch, in_ch] if layer_mask is not None else None
 
-                    # replacement_ou = None
-                    # replacement_multiplier = None
-                    # faulty_idx = containing_group.ou_indices.index(faulty_ou)
-                    # faulty_multiplier = containing_group.multipliers[faulty_idx]
-                    # best_similarity = -1.0
-                    # best_scale_factor = 1.0
+                    replacement_ou = None
+                    replacement_origin = 'member'
+                    if containing_group.prototype_ou is not None and containing_group.prototype_ou in healthy_ous:
+                        replacement_ou = containing_group.prototype_ou
+                        replacement_origin = 'prototype'
+                    else:
+                        best_similarity = -1.0
+                        for candidate_ou in healthy_ous:
+                            candidate_weight = self._extract_ou_weight(original_layer_weights, candidate_ou)
+                            similarity = self._compute_ou_similarity(
+                                faulty_weight=faulty_weight,
+                                candidate_weight=candidate_weight,
+                                mask_slice=faulty_mask_slice,
+                            )
+                            if similarity > best_similarity:
+                                best_similarity = similarity
+                                replacement_ou = candidate_ou
 
-                    # for candidate_ou in healthy_ous:
-                    #     cand_out, cand_in = candidate_ou
-                    #     if level1_require_mask_match:
-                    #         candidate_mask_key = get_mask_key(cand_out, cand_in)
-                    #         if candidate_mask_key != faulty_mask_key:
-                    #             continue
+                    if replacement_ou is None:
+                        continue
 
-                    #     candidate_idx = containing_group.ou_indices.index(candidate_ou)
-                    #     candidate_multiplier = containing_group.multipliers[candidate_idx]
-                    #     if abs(candidate_multiplier) > 1e-6:
-                    #         scale_factor = faulty_multiplier / candidate_multiplier
-                    #     else:
-                    #         scale_factor = 1.0
-
-                    #     candidate_weight = (original_layer_weights[cand_out, cand_in, :, :]
-                    #                         if layer_weights.dim() == 4
-                    #                         else original_layer_weights[cand_out, cand_in])
-                    #     candidate_weight = candidate_weight * scale_factor
-                    #     similarity = compute_similarity(faulty_weight, candidate_weight, out_ch, in_ch)
-
-                    #     if similarity >= level1_similarity_threshold and similarity > best_similarity:
-                    #         best_similarity = similarity
-                    #         replacement_ou = candidate_ou
-                    #         replacement_multiplier = candidate_multiplier
-                    #         best_scale_factor = scale_factor
-
-                    # if replacement_ou is None:
-                    #     continue
-
-                    # 获取故障OU和替换OU的权重
-                    out_ch, in_ch = faulty_ou  # 故障OU的通道索引
-                    replacement_out_ch, replacement_in_ch = replacement_ou  # 替换OU的通道索引
+                    replacement_out_ch, replacement_in_ch = replacement_ou
 
                     # 获取故障OU和替换OU在组中的索引
                     fault_idx = containing_group.ou_indices.index(faulty_ou)
@@ -711,12 +696,10 @@ class FaultToleranceSimulator:
 
                     # 计算缩放因子
                     if abs(replacement_multiplier) > 1e-6:
-                        scale_factor = faulty_multiplier / replacement_multiplier
-                        corrected_weight = replacement_weight * scale_factor
+                        scale_factor = self.compute_member_to_member_scale(faulty_multiplier, replacement_multiplier)
                     else:
-                        # 如果倍数为0，直接使用替换权重
-                        corrected_weight = replacement_weight
                         scale_factor = 1.0
+                    corrected_weight = replacement_weight * scale_factor
 
                     # 应用替换
                     if layer_weights.dim() == 4:
@@ -726,10 +709,18 @@ class FaultToleranceSimulator:
 
                     if level1_count < 3:
                         print(f"  ✅ Level 1: {layer_name}[{faulty_ou}] ← OU[{replacement_ou}] "
-                              f"(组大小={containing_group.size()}, 缩放因子={scale_factor:.4f})")
+                              f"(组大小={containing_group.size()}, 来源={replacement_origin}, 缩放因子={scale_factor:.4f})")
 
                     layer_level1.append(faulty_ou)
                     level1_count += 1
+                    if replacement_origin == 'prototype':
+                        level1_prototype_repairs += 1
+                    else:
+                        level1_member_repairs += 1
+                    if containing_group.repair_mode == 'exact' and abs(scale_factor - 1.0) <= 1e-6:
+                        level1_exact_repairs += 1
+                    else:
+                        level1_scaled_repairs += 1
 
             level1_corrected_ous[layer_name] = layer_level1
 
@@ -959,6 +950,11 @@ class FaultToleranceSimulator:
             'level1_count': level1_count,
             'level2_count': level2_count,
             'level3_count': level3_count,
+            'level1_prototype_repairs': level1_prototype_repairs,
+            'level1_member_repairs': level1_member_repairs,
+            'level1_exact_repairs': level1_exact_repairs,
+            'level1_scaled_repairs': level1_scaled_repairs,
+            'level1_failed_singleton': level1_failed_singleton,
             'uncorrectable_count': uncorrectable_count,
             'total_correctable': total_corrected,
             'level1_corrected_ous': level1_corrected_ous,
@@ -1079,7 +1075,7 @@ def main():
     model = Vgg16(num_classes=10)
     
     # 加载训练好的模型参数
-    model_file = 'model_Vgg16_weight_pattern_shape_and_value_similar_translate_after_translate_parameters.pth'
+    model_file = 'model_Vgg16_ft_group_cluster_translate_after_translate_parameters.pth'
     
     try:
         model.load_state_dict(torch.load(model_file, map_location=device))
@@ -1108,7 +1104,7 @@ def main():
     simulator = FaultToleranceSimulator(
         model=model,
         model_name='Vgg16',
-        translate_name='weight_pattern_shape_and_value_similar_translate',
+        translate_name='ft_group_cluster_translate',
         data_dir='./'
     )
     

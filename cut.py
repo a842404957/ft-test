@@ -1,5 +1,8 @@
 import math
 import time
+import pickle as pkl
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import pandas as pd
 import torch.nn.functional as F
@@ -901,6 +904,618 @@ def pattern_shape_and_value_similar_translate(model, in_channel, out_channel, we
         # 计算该层weight-pattern重用率
         weight_pattern_reuse_ratio = total_translate_weight_pattern / (in_channel / channel_number * out_channel)
         return map_table, multiple_relationship_table, weight_pattern_reuse_ratio
+
+
+def extract_ou_patterns(model, weight_name, in_channel, out_channel, kernel_size, channel_number, mask=None):
+    """提取用于FT grouping的OU模式。第一轮按单个(out_ch, in_ch)粒度组织。"""
+    weight_tensor = model.state_dict()[weight_name].detach().cpu()
+    if mask is None:
+        mask_tensor = torch.ones_like(weight_tensor)
+    else:
+        mask_tensor = mask.detach().cpu()
+        if mask_tensor.shape != weight_tensor.shape:
+            mask_tensor = torch.ones_like(weight_tensor)
+
+    pattern_list = []
+    for out_ch in range(0, out_channel):
+        for in_ch_start in range(0, in_channel):
+            raw = weight_tensor[out_ch][in_ch_start].clone()
+            current_mask = mask_tensor[out_ch][in_ch_start].clone()
+            masked = raw * current_mask
+            mask_signature = current_mask.flatten().to(torch.uint8).numpy().tobytes()
+            pattern_list.append({
+                'out_ch': out_ch,
+                'in_ch_start': in_ch_start,
+                'channel_span': 1,
+                'raw': raw,
+                'masked': masked,
+                'norm1': masked.abs().sum().item(),
+                'norm2': torch.norm(masked.reshape(-1).float(), p=2).item(),
+                'mask_signature': mask_signature,
+            })
+    return pattern_list
+
+
+def search_best_power_of_two_scale(source_tensor, target_tensor, scale_candidates=None):
+    """在离散power-of-two候选中搜索最佳缩放关系。"""
+    if scale_candidates is None:
+        scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+
+    source = source_tensor.reshape(-1).float()
+    target = target_tensor.reshape(-1).float()
+    source_norm = source.abs().sum().item()
+    target_norm = target.abs().sum().item()
+
+    if target_norm <= 1e-8:
+        best_error = source.abs().sum().item()
+        best_similarity = 1.0 if source_norm <= 1e-8 else max(0.0, 1.0 - best_error / (source_norm + 1e-8))
+        return 0.0, best_error, best_similarity
+
+    best_scale = 1.0
+    best_error = None
+    best_similarity = -1.0
+
+    for scale in scale_candidates:
+        error = (source - scale * target).abs().sum().item()
+        similarity = max(0.0, 1.0 - error / (source_norm + 1e-8))
+        if best_error is None or error < best_error or (abs(error - best_error) <= 1e-8 and similarity > best_similarity):
+            best_scale = float(scale)
+            best_error = error
+            best_similarity = similarity
+
+    return best_scale, best_error, best_similarity
+
+
+def select_group_prototype(pattern_list, scale_candidates=None):
+    """选择组原型，优先选与其他成员总误差最小的medoid。"""
+    if not pattern_list:
+        return 0
+    if len(pattern_list) == 1:
+        return 0
+
+    best_index = 0
+    best_score = None
+    for i, candidate in enumerate(pattern_list):
+        total_error = 0.0
+        total_similarity = 0.0
+        for j, other in enumerate(pattern_list):
+            if i == j:
+                continue
+            _, error, similarity = search_best_power_of_two_scale(
+                other['masked'], candidate['masked'], scale_candidates
+            )
+            total_error += error
+            total_similarity += similarity
+        candidate_score = (total_error, -total_similarity, -candidate['norm1'])
+        if best_score is None or candidate_score < best_score:
+            best_score = candidate_score
+            best_index = i
+
+    return best_index
+
+
+def build_ft_groups_for_block(pattern_list, min_group_size, target_group_size, sim_threshold, exact_threshold, scale_candidates):
+    """在同一个输入通道block内按mask形状和缩放相似度构建FT groups。"""
+    if not pattern_list:
+        return []
+
+    buckets: Dict[bytes, List[Dict[str, Any]]] = {}
+    for pattern in pattern_list:
+        buckets.setdefault(pattern['mask_signature'], []).append(pattern)
+
+    block_groups: List[Dict[str, Any]] = []
+    for mask_signature, bucket_patterns in buckets.items():
+        unassigned = sorted(bucket_patterns, key=lambda item: item['norm1'], reverse=True)
+
+        while unassigned:
+            prototype_seed = unassigned.pop(0)
+            current_patterns = [prototype_seed]
+            candidates_kept = []
+
+            for candidate in unassigned:
+                _, _, similarity = search_best_power_of_two_scale(
+                    candidate['masked'], prototype_seed['masked'], scale_candidates
+                )
+                if similarity >= sim_threshold and len(current_patterns) < target_group_size:
+                    current_patterns.append(candidate)
+                else:
+                    candidates_kept.append(candidate)
+            unassigned = candidates_kept
+
+            prototype_index = select_group_prototype(current_patterns, scale_candidates)
+            prototype_pattern = current_patterns[prototype_index]
+
+            member_entries = []
+            exact_group = True
+            for member in current_patterns:
+                if member is prototype_pattern:
+                    scale = 1.0
+                    similarity = 1.0
+                    role = 'prototype'
+                else:
+                    scale, _, similarity = search_best_power_of_two_scale(
+                        member['masked'], prototype_pattern['masked'], scale_candidates
+                    )
+                    role = 'member'
+                    if abs(scale - 1.0) > 1e-6:
+                        exact_group = False
+                    if similarity < exact_threshold:
+                        exact_group = False
+
+                member_entries.append({
+                    'pattern': member,
+                    'multiplier': float(scale),
+                    'similarity': float(similarity),
+                    'role': role,
+                })
+
+            block_groups.append({
+                'mask_signature': mask_signature,
+                'prototype': prototype_pattern,
+                'members': member_entries,
+                'repair_mode': 'exact' if exact_group else 'scaled',
+            })
+
+    non_singleton_groups = [group for group in block_groups if len(group['members']) >= min_group_size]
+    singleton_groups = [group for group in block_groups if len(group['members']) < min_group_size]
+
+    for singleton in singleton_groups:
+        member = singleton['members'][0]
+        best_target = None
+        best_similarity = -1.0
+        for target_group in non_singleton_groups:
+            if len(target_group['members']) >= target_group_size:
+                continue
+            if target_group['mask_signature'] != singleton['mask_signature']:
+                continue
+
+            scale, _, similarity = search_best_power_of_two_scale(
+                member['pattern']['masked'],
+                target_group['prototype']['masked'],
+                scale_candidates,
+            )
+            if similarity >= sim_threshold and similarity > best_similarity:
+                best_target = (target_group, scale, similarity)
+                best_similarity = similarity
+
+        if best_target is not None:
+            target_group, scale, similarity = best_target
+            member['multiplier'] = float(scale)
+            member['similarity'] = float(similarity)
+            member['role'] = 'member'
+            target_group['members'].append(member)
+            if abs(scale - 1.0) > 1e-6 or similarity < exact_threshold:
+                target_group['repair_mode'] = 'scaled'
+
+    merged_singletons = {id(group) for group in singleton_groups if any(group['members'][0] is member['pattern'] for target in non_singleton_groups for member in target['members'])}
+    final_groups = non_singleton_groups + [group for group in singleton_groups if id(group) not in merged_singletons]
+    final_groups.sort(key=lambda item: (item['prototype']['in_ch_start'], item['prototype']['out_ch']))
+    return final_groups
+
+
+def _build_layer_ft_groups(pattern_list, min_group_size, target_group_size, sim_threshold, exact_threshold, scale_candidates):
+    block_map: Dict[int, List[Dict[str, Any]]] = {}
+    for pattern in pattern_list:
+        block_map.setdefault(pattern['in_ch_start'], []).append(pattern)
+
+    layer_groups = []
+    group_id = 0
+    repairable_ou_count = 0
+
+    for block_patterns in block_map.values():
+        for group in build_ft_groups_for_block(
+            block_patterns,
+            min_group_size=min_group_size,
+            target_group_size=target_group_size,
+            sim_threshold=sim_threshold,
+            exact_threshold=exact_threshold,
+            scale_candidates=scale_candidates,
+        ):
+            normalized_members = []
+            for member in group['members']:
+                pattern = member['pattern']
+                normalized_members.append({
+                    'out_ch': pattern['out_ch'],
+                    'in_ch_start': pattern['in_ch_start'],
+                    'channel_span': pattern['channel_span'],
+                    'multiplier': float(member['multiplier']),
+                    'similarity': float(member['similarity']),
+                    'role': member['role'],
+                })
+
+            layer_groups.append({
+                'group_id': group_id,
+                'prototype': {
+                    'out_ch': group['prototype']['out_ch'],
+                    'in_ch_start': group['prototype']['in_ch_start'],
+                    'channel_span': group['prototype']['channel_span'],
+                    'multiplier': 1.0,
+                },
+                'members': normalized_members,
+                'mask_signature': group['mask_signature'].hex(),
+                'group_size': len(normalized_members),
+                'repair_mode': group['repair_mode'],
+            })
+            if len(normalized_members) >= min_group_size:
+                repairable_ou_count += len(normalized_members)
+            group_id += 1
+
+    return layer_groups, repairable_ou_count
+
+
+def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size,
+                        channel_number, pattern_value_number, pattern_shape_number,
+                        OU_size, target_group_size=4, sim_threshold=0.85):
+    """第一轮FT mask：复用现有shape mask生成方式，并给出分组覆盖估计。"""
+    pattern_mask = get_shape_mask(
+        model=model,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        channel_number=channel_number,
+        pattern_value_number=pattern_value_number,
+        pattern_shape_number=pattern_shape_number,
+        OU_size=OU_size,
+    )
+
+    pattern_list = extract_ou_patterns(
+        model=model,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        channel_number=channel_number,
+        mask=pattern_mask,
+    )
+    estimated_groups, repairable_ou_count = _build_layer_ft_groups(
+        pattern_list=pattern_list,
+        min_group_size=2,
+        target_group_size=target_group_size,
+        sim_threshold=sim_threshold,
+        exact_threshold=0.98,
+        scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+    )
+
+    estimated_group_size = 0.0
+    if estimated_groups:
+        estimated_group_size = sum(group['group_size'] for group in estimated_groups) / len(estimated_groups)
+
+    group_seed_info = {
+        'selected_shape_ids': None,
+        'estimated_coverage': repairable_ou_count / max(len(pattern_list), 1),
+        'estimated_avg_group_size': estimated_group_size,
+    }
+    return pattern_mask, group_seed_info
+
+
+def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
+                               kernel_size, channel_number, mask,
+                               min_group_size=2, target_group_size=4,
+                               sim_threshold=0.85, exact_threshold=0.98,
+                               scale_candidates=None):
+    """构建FT-oriented group，并输出兼容旧接口的map/multiple文件。"""
+    if scale_candidates is None:
+        scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+
+    pattern_list = extract_ou_patterns(
+        model=model,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        channel_number=channel_number,
+        mask=mask,
+    )
+
+    layer_groups, repairable_ou_count = _build_layer_ft_groups(
+        pattern_list=pattern_list,
+        min_group_size=min_group_size,
+        target_group_size=target_group_size,
+        sim_threshold=sim_threshold,
+        exact_threshold=exact_threshold,
+        scale_candidates=scale_candidates,
+    )
+
+    map_table = torch.full((in_channel, out_channel, 2), -1, dtype=torch.long)
+    if 'fc' in weight_name:
+        multiple_relationship_table = torch.ones(out_channel, in_channel)
+    else:
+        multiple_relationship_table = torch.ones(out_channel, in_channel, kernel_size, kernel_size)
+
+    write_cursors = [0] * in_channel
+    for group in layer_groups:
+        prototype = group['prototype']
+        proto_out = int(prototype['out_ch'])
+        proto_in = int(prototype['in_ch_start'])
+        proto_span = int(prototype.get('channel_span', 1))
+
+        for offset in range(0, proto_span):
+            member_in = proto_in + offset
+            if 'fc' in weight_name:
+                multiple_relationship_table[proto_out][member_in] = 1.0
+            else:
+                multiple_relationship_table[proto_out][member_in] = torch.ones(kernel_size, kernel_size)
+
+        for member in group['members']:
+            member_out = int(member['out_ch'])
+            member_in = int(member['in_ch_start'])
+            member_span = int(member.get('channel_span', 1))
+            multiplier = float(member.get('multiplier', 1.0))
+
+            for offset in range(0, member_span):
+                target_in = member_in + offset
+                if 'fc' in weight_name:
+                    multiple_relationship_table[member_out][target_in] = multiplier
+                else:
+                    multiple_relationship_table[member_out][target_in] = torch.ones(kernel_size, kernel_size) * multiplier
+
+                if member.get('role') == 'prototype':
+                    continue
+
+                cursor = write_cursors[target_in]
+                if cursor < out_channel:
+                    map_table[target_in][cursor][0] = member_out
+                    map_table[target_in][cursor][1] = proto_out
+                    write_cursors[target_in] += 1
+
+    coverage_ratio = repairable_ou_count / max(len(pattern_list), 1)
+    layer_group_information = {
+        'layer_name': weight_name,
+        'group_count': len(layer_groups),
+        'ou_count': len(pattern_list),
+        'coverage_ratio': coverage_ratio,
+        'groups': layer_groups,
+    }
+    return map_table, multiple_relationship_table, coverage_ratio, layer_group_information
+
+
+def _get_group_member_entries(layer_group_information):
+    if not layer_group_information:
+        return []
+    return layer_group_information.get('groups', [])
+
+
+def _apply_ft_group_projection(model, weight_name, mask, group_information):
+    with torch.no_grad():
+        state_dict = model.state_dict()
+        for layer_name in weight_name:
+            if layer_name not in state_dict:
+                continue
+
+            layer_weight = state_dict[layer_name]
+            layer_mask = mask.get(layer_name)
+            if layer_mask is not None and layer_mask.shape == layer_weight.shape:
+                layer_weight.mul_(layer_mask.to(layer_weight.device))
+
+            layer_group_information = group_information.get(layer_name)
+            if not layer_group_information:
+                continue
+
+            for group in _get_group_member_entries(layer_group_information):
+                prototype = group['prototype']
+                proto_out = int(prototype['out_ch'])
+                proto_in = int(prototype['in_ch_start'])
+                proto_multiplier = float(prototype.get('multiplier', 1.0))
+                prototype_value = layer_weight[proto_out][proto_in].clone()
+
+                for member in group['members']:
+                    member_out = int(member['out_ch'])
+                    member_in = int(member['in_ch_start'])
+                    member_multiplier = float(member.get('multiplier', 1.0))
+                    if abs(proto_multiplier) > 1e-8:
+                        scale = member_multiplier / proto_multiplier
+                    else:
+                        scale = 1.0
+                    layer_weight[member_out][member_in] = prototype_value * scale
+
+
+def _compute_ft_regularization(model, weight_name, ft_layer_enabled, mask, group_information, device):
+    loss_mask = torch.zeros(1, device=device)
+    loss_proto = torch.zeros(1, device=device)
+    loss_balance = torch.zeros(1, device=device)
+    loss_sep = torch.zeros(1, device=device)
+
+    parameter_map = dict(model.named_parameters())
+    for layer_index, layer_name in enumerate(weight_name):
+        if not ft_layer_enabled[layer_index] or layer_name not in parameter_map:
+            continue
+
+        layer_param = parameter_map[layer_name]
+        layer_mask = mask.get(layer_name)
+        if layer_mask is not None and layer_mask.shape == layer_param.shape:
+            layer_mask = layer_mask.to(device)
+            projected = layer_param * layer_mask
+            loss_mask = loss_mask + 0.5 * torch.sum(torch.pow(layer_param - projected, 2))
+        else:
+            projected = layer_param
+
+        layer_group_information = group_information.get(layer_name)
+        if not layer_group_information:
+            continue
+
+        for group in _get_group_member_entries(layer_group_information):
+            group_size = int(group.get('group_size', len(group.get('members', []))))
+            if group_size < 2:
+                loss_balance = loss_balance + torch.tensor(float((2 - group_size) ** 2), device=device)
+                continue
+
+            prototype = group['prototype']
+            proto_out = int(prototype['out_ch'])
+            proto_in = int(prototype['in_ch_start'])
+            prototype_multiplier = float(prototype.get('multiplier', 1.0))
+            prototype_weight = projected[proto_out][proto_in]
+
+            for member in group['members']:
+                member_out = int(member['out_ch'])
+                member_in = int(member['in_ch_start'])
+                member_multiplier = float(member.get('multiplier', 1.0))
+                if abs(prototype_multiplier) > 1e-8:
+                    scale = member_multiplier / prototype_multiplier
+                else:
+                    scale = 1.0
+                member_weight = projected[member_out][member_in]
+                loss_proto = loss_proto + torch.sum(torch.pow(member_weight - prototype_weight * scale, 2))
+
+                proto_vec = prototype_weight.reshape(-1).float()
+                member_vec = member_weight.reshape(-1).float()
+                proto_norm = torch.norm(proto_vec, p=2)
+                member_norm = torch.norm(member_vec, p=2)
+                if proto_norm > 1e-8 and member_norm > 1e-8:
+                    cosine = torch.dot(member_vec, proto_vec) / (member_norm * proto_norm)
+                    loss_sep = loss_sep + (1.0 - cosine)
+
+    return loss_mask, loss_proto, loss_balance, loss_sep
+
+
+def ft_group_translate_train(model, model_name, translate_name,
+                             weight_name, in_channel, out_channel, kernel_size,
+                             ft_layer_enabled, mask, group_information,
+                             map_information, multiple_relationship_information,
+                             reuse_ratio_information,
+                             ft_mask_lambda, ft_proto_lambda,
+                             ft_balance_lambda, ft_sep_lambda,
+                             device, optimizer, scheduler,
+                             train_loader, test_loader,
+                             max_epoches, translate_epoch,
+                             group_refresh_epoch=None,
+                             min_group_size=2, target_group_size=4,
+                             sim_threshold=0.85, exact_threshold=0.98,
+                             scale_candidates=None, pattern_value_number=None,
+                             pattern_shape_number=8, OU_size=8):
+    """最小可运行FT训练器。保持旧训练器不动，新方法单独落盘。"""
+    if scale_candidates is None:
+        scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+    if group_refresh_epoch is None:
+        group_refresh_epoch = []
+    if pattern_value_number is None:
+        pattern_value_number = [OU_size] * len(weight_name)
+
+    result_all = pd.DataFrame()
+    before_translate_accuracy = [0.0] * len(translate_epoch)
+    before_translate_loss = [0.0] * len(translate_epoch)
+    after_translate_accuracy = [0.0] * len(translate_epoch)
+    after_translate_loss = [0.0] * len(translate_epoch)
+    model_accuracy_difference = [0.0] * len(translate_epoch)
+
+    result = pd.DataFrame()
+    train_accuracy_record = [0.0] * max_epoches
+    train_loss_record = [0.0] * max_epoches
+    test_accuracy_record = [0.0] * max_epoches
+    test_loss_record = [0.0] * max_epoches
+
+    current_iteration = 0
+    start_time = time.time()
+    checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(translate_epoch[0]) + '_ckpt.pth')
+
+    for epoch in range(checkpoint['epoch'], max_epoches):
+        if epoch == checkpoint['epoch']:
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['lr_schedule'])
+        else:
+            model.train()
+            total = 0
+            correct = 0
+            train_loss = 0.0
+
+            for batch_idx, (inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss_ce = F.cross_entropy(outputs, targets)
+                loss_mask, loss_proto, loss_balance, loss_sep = _compute_ft_regularization(
+                    model=model,
+                    weight_name=weight_name,
+                    ft_layer_enabled=ft_layer_enabled,
+                    mask=mask,
+                    group_information=group_information,
+                    device=device,
+                )
+                loss = (
+                    loss_ce
+                    + ft_mask_lambda * loss_mask
+                    + ft_proto_lambda * loss_proto
+                    + ft_balance_lambda * loss_balance
+                    + ft_sep_lambda * loss_sep
+                )
+                loss.backward()
+                optimizer.step()
+
+                train_loss = train_loss + loss.item()
+                _, predicted = outputs.max(1)
+                total = total + targets.size(0)
+                correct = correct + predicted.eq(targets).sum().item()
+
+            scheduler.step()
+            train_accuracy_record[epoch] = correct / total
+            train_loss_record[epoch] = train_loss
+            print('epoch: ' + str(epoch + 1) + '  train_loss: ' + str(train_loss_record[epoch]) + ';  train_accuracy: ' + str(train_accuracy_record[epoch] * 100) + '%')
+            test_accuracy_record[epoch], test_loss_record[epoch] = test(model, device, test_loader)
+            print('epoch: ' + str(epoch + 1) + '  test_loss: ' + str(test_loss_record[epoch]) + ';  test_accuracy: ' + str(test_accuracy_record[epoch] * 100) + '%')
+
+        if (epoch + 1) in group_refresh_epoch:
+            for i in range(0, len(weight_name)):
+                if not ft_layer_enabled[i]:
+                    continue
+                map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = ft_group_cluster_translate(
+                    model=model,
+                    in_channel=in_channel[i],
+                    out_channel=out_channel[i],
+                    weight_name=weight_name[i],
+                    kernel_size=kernel_size[i],
+                    channel_number=1,
+                    mask=mask[weight_name[i]],
+                    min_group_size=min_group_size,
+                    target_group_size=target_group_size,
+                    sim_threshold=sim_threshold,
+                    exact_threshold=exact_threshold,
+                    scale_candidates=scale_candidates,
+                )
+
+        if epoch + 1 in translate_epoch:
+            before_translate_accuracy[current_iteration], before_translate_loss[current_iteration] = test(model, device, test_loader)
+            print('Before_translate_accuracy: ' + str(before_translate_accuracy[current_iteration]) + ' Before_translate_loss: ' + str(before_translate_loss[current_iteration]))
+            _apply_ft_group_projection(model, weight_name, mask, group_information)
+            after_translate_accuracy[current_iteration], after_translate_loss[current_iteration] = test(model, device, test_loader)
+            print('After_translate_accuracy: ' + str(after_translate_accuracy[current_iteration]) + ' After_translate_loss: ' + str(after_translate_loss[current_iteration]))
+            model_accuracy_difference[current_iteration] = before_translate_accuracy[current_iteration] - after_translate_accuracy[current_iteration]
+            print('Model_accuracy_difference: ' + str(model_accuracy_difference[current_iteration]))
+            current_iteration = current_iteration + 1
+
+    _apply_ft_group_projection(model, weight_name, mask, group_information)
+
+    time_now = time.time() - start_time
+    print('Finished Training')
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_now // 60, time_now % 60))
+
+    torch.save(model.state_dict(), 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
+
+    with open('model_' + model_name + '_' + translate_name + '_mask.pkl', 'wb') as f_mask:
+        pkl.dump(mask, f_mask, pkl.HIGHEST_PROTOCOL)
+    with open('model_' + model_name + '_' + translate_name + '_map_information.pkl', 'wb') as f_map:
+        pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
+    with open('model_' + model_name + '_' + translate_name + '_multiple_relationship_information.pkl', 'wb') as f_mult:
+        pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
+    with open('model_' + model_name + '_' + translate_name + '_reuse_ratio_information.pkl', 'wb') as f_reuse:
+        pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
+    with open('model_' + model_name + '_' + translate_name + '_group_information.pkl', 'wb') as f_group:
+        pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
+
+    result_all['Before_Translate_Accuracy'] = before_translate_accuracy
+    result_all['Before_Translate_Loss'] = before_translate_loss
+    result_all['After_Translate_Accuracy'] = after_translate_accuracy
+    result_all['After_Translate_Loss'] = after_translate_loss
+    result_all['Model_Difference'] = model_accuracy_difference
+    result_all.to_csv('model_' + model_name + '_' + translate_name + '.csv')
+
+    result['Train_Accuracy'] = train_accuracy_record
+    result['Train_Loss'] = train_loss_record
+    result['Test_Accuracy'] = test_accuracy_record
+    result['Test_Loss'] = test_loss_record
+    result.to_csv('model_' + model_name + '_' + translate_name + '_train_info.csv')
+
+    parameters_to_txt(model, model_name, translate_name)
 
 
 # 多种模式转化迭代训练

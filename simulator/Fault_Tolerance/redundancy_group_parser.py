@@ -29,11 +29,18 @@ class RedundancyGroup:
         self.pattern_id = pattern_id
         self.ou_indices = []  # OU索引列表 [(out_ch, in_ch), ...]
         self.multipliers = []  # 对应的倍数关系
+        self.prototype_ou = None
+        self.repair_mode = 'scaled'
+        self.member_similarities = {}
         
     def add_ou(self, out_ch: int, in_ch: int, multiplier: float = 1.0):
         """添加OU到组"""
         self.ou_indices.append((out_ch, in_ch))
         self.multipliers.append(multiplier)
+
+    def set_prototype(self, out_ch: int, in_ch: int):
+        """设置组原型OU"""
+        self.prototype_ou = (out_ch, in_ch)
     
     def size(self) -> int:
         """返回组大小（OU数量）"""
@@ -115,6 +122,47 @@ class RedundancyGroupParser:
         Returns:
             该层的冗余组列表
         """
+        layer_group_info = self.data_loader.get_layer_group_info(layer_name)
+        if layer_group_info is not None:
+            return self._parse_layer_from_group_info(layer_name, layer_group_info)
+        return self._parse_layer_from_map_info(layer_name)
+
+    def _parse_layer_from_group_info(self, layer_name: str, layer_group_info: Dict) -> List[RedundancyGroup]:
+        """优先从显式group_information解析冗余组。"""
+        groups = []
+        for raw_group in layer_group_info.get('groups', []):
+            prototype = raw_group.get('prototype', {})
+            proto_out = int(prototype.get('out_ch', -1))
+            proto_in = int(prototype.get('in_ch_start', -1))
+            pattern_id = proto_out * 100000 + max(proto_in, 0)
+            group = RedundancyGroup(raw_group.get('group_id', len(groups)), layer_name, pattern_id)
+            if proto_out >= 0 and proto_in >= 0:
+                group.set_prototype(proto_out, proto_in)
+            group.repair_mode = raw_group.get('repair_mode', 'scaled')
+
+            for member in raw_group.get('members', []):
+                member_out = int(member.get('out_ch', -1))
+                member_in = int(member.get('in_ch_start', -1))
+                channel_span = int(member.get('channel_span', 1))
+                multiplier = float(member.get('multiplier', 1.0))
+                similarity = float(member.get('similarity', 1.0))
+                for offset in range(0, channel_span):
+                    ou = (member_out, member_in + offset)
+                    group.add_ou(ou[0], ou[1], multiplier)
+                    group.member_similarities[ou] = similarity
+                if member.get('role') == 'prototype' and member_out >= 0 and member_in >= 0:
+                    group.set_prototype(member_out, member_in)
+
+            if group.prototype_ou is None and group.ou_indices:
+                group.set_prototype(group.ou_indices[0][0], group.ou_indices[0][1])
+
+            groups.append(group)
+            self.pattern_to_groups[group.pattern_id].append(group.group_id)
+
+        return groups
+
+    def _parse_layer_from_map_info(self, layer_name: str) -> List[RedundancyGroup]:
+        """兼容旧PRAP路径：从map_information反推冗余组。"""
         # 获取映射信息
         map_table = self.data_loader.get_layer_map(layer_name)
         if map_table is None:
@@ -182,6 +230,10 @@ class RedundancyGroupParser:
                 
                 for (out_ch, in_ch), multiplier in sorted(ou_map.items()):
                     group.add_ou(out_ch, in_ch, multiplier)
+                    if out_ch == pattern_id and group.prototype_ou is None:
+                        group.set_prototype(out_ch, in_ch)
+                if group.prototype_ou is None and group.ou_indices:
+                    group.set_prototype(group.ou_indices[0][0], group.ou_indices[0][1])
                 
                 groups.append(group)
                 self.pattern_to_groups[pattern_id].append(group_id)
@@ -207,6 +259,9 @@ class RedundancyGroupParser:
         total_ous = 0
         group_sizes = []
         redundancy_ratios = []
+        singleton_groups = 0
+        repairable_ous = 0
+        total_layer_ous = 0
         
         for layer_name, groups in self.redundancy_groups.items():
             layer_total_ous = 0
@@ -218,12 +273,20 @@ class RedundancyGroupParser:
                 group_sizes.append(group_size)
                 total_ous += group_size
                 layer_redundant_ous += group_size
+                if group_size == 1:
+                    singleton_groups += 1
+                if group_size >= self.config['min_group_size']:
+                    repairable_ous += group_size
             
             # 计算该层的总OU数
             map_table = self.data_loader.get_layer_map(layer_name)
-            if map_table is not None:
+            layer_group_info = self.data_loader.get_layer_group_info(layer_name)
+            if layer_group_info is not None:
+                layer_total_ous = int(layer_group_info.get('ou_count', 0))
+            elif map_table is not None:
                 in_channels, out_channels, _ = map_table.shape
                 layer_total_ous = in_channels * out_channels
+            total_layer_ous += layer_total_ous
             
             # 冗余率 = 冗余OU数 / 总OU数
             if layer_total_ous > 0:
@@ -238,7 +301,9 @@ class RedundancyGroupParser:
             'max_group_size': max(group_sizes) if group_sizes else 0,
             'min_group_size': min(group_sizes) if group_sizes else 0,
             'avg_redundancy_ratio': np.mean(redundancy_ratios) if redundancy_ratios else 0,
-            'group_size_distribution': self._compute_distribution(group_sizes)
+            'group_size_distribution': self._compute_distribution(group_sizes),
+            'singleton_groups': singleton_groups,
+            'repairable_ou_ratio': repairable_ous / total_layer_ous if total_layer_ous > 0 else 0.0,
         }
     
     def _compute_distribution(self, sizes: List[int]) -> Dict[int, int]:
@@ -260,6 +325,8 @@ class RedundancyGroupParser:
         print(f"最大组大小: {self.statistics['max_group_size']}")
         print(f"最小组大小: {self.statistics['min_group_size']}")
         print(f"平均冗余率: {self.statistics['avg_redundancy_ratio']:.2%}")
+        print(f"单元素组数: {self.statistics['singleton_groups']}")
+        print(f"可修复OU占比: {self.statistics['repairable_ou_ratio']:.2%}")
         
         # print("\n组大小分布:")
         # for size, count in sorted(self.statistics['group_size_distribution'].items()):
@@ -284,7 +351,9 @@ class RedundancyGroupParser:
                     'pattern_id': group.pattern_id,
                     'size': group.size(),
                     'ou_indices': group.ou_indices,
-                    'multipliers': group.multipliers
+                    'multipliers': group.multipliers,
+                    'prototype_ou': group.prototype_ou,
+                    'repair_mode': group.repair_mode,
                 }
                 layer_groups.append(group_data)
             
@@ -324,7 +393,7 @@ def test_parser():
     # 创建数据加载器
     loader = PatternDataLoader(
         model_name='Vgg16',
-        translate_name='weight_pattern_shape_and_value_similar_translate',
+        translate_name='ft_group_cluster_translate',
         data_dir='./'
     )
     

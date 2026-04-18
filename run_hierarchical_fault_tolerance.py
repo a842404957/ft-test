@@ -20,7 +20,7 @@ from model import Vgg16, Res18, Res50
 from torchvision import transforms, datasets
 
 
-def load_model(model_name, translate_name='weight_pattern_shape_and_value_similar_translate', device='cuda', config_file=None):
+def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None):
     """加载训练好的模型"""
     # 如果提供了配置文件，尝试从中读取模型名称和类别数
     num_classes = 10  # 默认值
@@ -92,7 +92,8 @@ def load_test_data(batch_size=128, config_file=None):
 
 
 def run_simulation_with_config(model, test_loader, config_name, config_overrides=None,
-                                base_config_file=None, num_samples=1000, model_name=None):
+                                base_config_file=None, num_samples=1000, model_name=None,
+                                translate_name='ft_group_cluster_translate'):
     """运行带有特定配置的仿真"""
     print("=" * 80)
     print(f"🚀 运行仿真配置: {config_name}")
@@ -188,7 +189,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
     simulator = FaultToleranceSimulator(
         model=model,
         model_name=final_model_name,
-        translate_name='weight_pattern_shape_and_value_similar_translate',
+        translate_name=translate_name,
         config_file=config_file_path,
         data_dir='./'
     )
@@ -206,7 +207,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
     return results
 
 
-def compare_strategies(config_file=None, num_samples=1000):
+def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate'):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -238,7 +239,7 @@ def compare_strategies(config_file=None, num_samples=1000):
             print(f"  ⚠️ 读取模型名称失败: {e}，使用默认值")
 
     # 加载模型和数据（使用配置文件中的模型名称）
-    model = load_model(model_name=model_name_from_config, device=device, config_file=config_file)
+    model = load_model(model_name=model_name_from_config, translate_name=translate_name, device=device, config_file=config_file)
     if model is None:
         return
 
@@ -304,7 +305,8 @@ def compare_strategies(config_file=None, num_samples=1000):
             config_name=config['name'],
             config_overrides=config['overrides'],
             base_config_file=config_file,
-            num_samples=num_samples
+            num_samples=num_samples,
+            translate_name=translate_name,
         )
         
         all_results.append({
@@ -379,16 +381,18 @@ def main():
                        help='模型名称')
     parser.add_argument('--config', type=str, default='fault_tolerance_config_high_fault_rate.json',
                        help='配置文件路径 (JSON格式)')
+    parser.add_argument('--translate', type=str, default='ft_group_cluster_translate',
+                       help='转换方法名称')
     
     args = parser.parse_args()
     
     if args.mode == 'compare':
         # 运行对比实验
-        compare_strategies(config_file=args.config, num_samples=args.samples)
+        compare_strategies(config_file=args.config, num_samples=args.samples, translate_name=args.translate)
     else:
         # 单次运行
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = load_model(args.model, device=device, config_file=args.config)
+        model = load_model(args.model, translate_name=args.translate, device=device, config_file=args.config)
         if model is None:
             return
 
@@ -416,10 +420,10 @@ def main():
             },
             base_config_file=args.config,
             num_samples=args.samples,
-            model_name=model_name
+            model_name=model_name,
+            translate_name=args.translate,
         )
 
 
 if __name__ == "__main__":
     main()
-

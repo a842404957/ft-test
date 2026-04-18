@@ -17,7 +17,7 @@ class PatternDataLoader:
     """权重模式数据加载器"""
     
     def __init__(self, model_name: str = 'Vgg16', 
-                 translate_name: str = 'weight_pattern_shape_and_value_similar_translate',
+                 translate_name: str = 'ft_group_cluster_translate',
                  data_dir: str = './'):
         """
         初始化数据加载器
@@ -32,6 +32,7 @@ class PatternDataLoader:
         self.data_dir = Path(data_dir)
         
         # 存储加载的数据
+        self.group_information = None
         self.map_information = None
         self.multiple_relationship_information = None
         self.reuse_ratio_information = None
@@ -51,6 +52,11 @@ class PatternDataLoader:
         """
         try:
             print("📂 开始加载权重模式数据...")
+
+            # 0. 显式冗余组信息（FT主路径）
+            self.group_information = self._load_pkl_file(
+                f'model_{self.model_name}_{self.translate_name}_group_information.pkl'
+            )
             
             # 1. 加载映射信息 (核心数据)
             self.map_information = self._load_pkl_file(
@@ -72,7 +78,8 @@ class PatternDataLoader:
             
             # 4. 加载模式掩码
             self.pattern_mask = self._load_pkl_file(
-                f'model_{self.model_name}_pattern_mask.pkl'
+                f'model_{self.model_name}_{self.translate_name}_mask.pkl',
+                alternative_name=f'model_{self.model_name}_pattern_mask.pkl'
             )
             
             # 5. 构建层配置信息
@@ -147,8 +154,13 @@ class PatternDataLoader:
                 'num_layers': 21
             }
         else:
-            # 从map_information推断
-            if self.map_information:
+            # 从group_information或map_information推断
+            if self.group_information:
+                self.layer_config = {
+                    'weight_names': list(self.group_information.keys()),
+                    'num_layers': len(self.group_information)
+                }
+            elif self.map_information:
                 self.layer_config = {
                     'weight_names': list(self.map_information.keys()),
                     'num_layers': len(self.map_information)
@@ -158,16 +170,16 @@ class PatternDataLoader:
     
     def _validate_data(self) -> bool:
         """验证加载的数据完整性"""
-        if self.map_information is None:
-            print("  ❌ 缺少映射信息（核心数据）")
+        if self.map_information is None and self.group_information is None:
+            print("  ❌ 缺少映射信息/分组信息（至少需要一种核心数据）")
             return False
         
         # 检查数据一致性
-        if self.multiple_relationship_information:
+        if self.map_information and self.multiple_relationship_information:
             if len(self.map_information) != len(self.multiple_relationship_information):
                 print("  ⚠️ 映射信息和倍数关系信息层数不一致")
         
-        if self.reuse_ratio_information:
+        if self.map_information and self.reuse_ratio_information:
             if len(self.map_information) != len(self.reuse_ratio_information):
                 print("  ⚠️ 映射信息和重用率信息层数不一致")
         
@@ -178,6 +190,12 @@ class PatternDataLoader:
         print("\n" + "=" * 60)
         print("数据加载摘要")
         print("=" * 60)
+
+        if self.group_information:
+            print(f"✓ 分组信息: {len(self.group_information)} 层")
+            for layer_name, group_data in list(self.group_information.items())[:3]:
+                group_count = group_data.get('group_count', len(group_data.get('groups', []))) if isinstance(group_data, dict) else 0
+                print(f"  - {layer_name}: {group_count} groups")
         
         if self.map_information:
             print(f"✓ 映射信息: {len(self.map_information)} 层")
@@ -215,6 +233,12 @@ class PatternDataLoader:
         if self.map_information and layer_name in self.map_information:
             return self.map_information[layer_name]
         return None
+
+    def get_layer_group_info(self, layer_name: str) -> Optional[Dict]:
+        """获取指定层的显式冗余组信息"""
+        if self.group_information and layer_name in self.group_information:
+            return self.group_information[layer_name]
+        return None
     
     def get_layer_multiplier(self, layer_name: str) -> Optional[torch.Tensor]:
         """获取指定层的倍数关系"""
@@ -237,7 +261,9 @@ class PatternDataLoader:
     
     def get_all_layer_names(self) -> List[str]:
         """获取所有层名称"""
-        if self.map_information:
+        if self.group_information:
+            return list(self.group_information.keys())
+        elif self.map_information:
             return list(self.map_information.keys())
         elif self.layer_config:
             return self.layer_config['weight_names']
@@ -250,16 +276,18 @@ class PatternDataLoader:
         summary = {
             'model_name': self.model_name,
             'translate_name': self.translate_name,
-            'num_layers': len(self.map_information) if self.map_information else 0,
+            'num_layers': len(self.group_information) if self.group_information else (len(self.map_information) if self.map_information else 0),
             'layers': {}
         }
         
-        if self.map_information:
+        if self.group_information or self.map_information:
             for layer_name in self.get_all_layer_names():
                 layer_info = {
-                    'map_shape': list(self.get_layer_map(layer_name).shape),
+                    'map_shape': list(self.get_layer_map(layer_name).shape) if self.get_layer_map(layer_name) is not None else None,
                     'reuse_ratio': self.get_layer_reuse_ratio(layer_name),
                 }
+                if self.get_layer_group_info(layer_name) is not None:
+                    layer_info['group_count'] = self.get_layer_group_info(layer_name).get('group_count', 0)
                 
                 if self.get_layer_mask(layer_name) is not None:
                     layer_info['mask_shape'] = list(self.get_layer_mask(layer_name).shape)
@@ -278,7 +306,7 @@ def test_loader():
     
     loader = PatternDataLoader(
         model_name='Vgg16',
-        translate_name='weight_pattern_shape_and_value_similar_translate',
+        translate_name='ft_group_cluster_translate',
         data_dir='./'
     )
     
@@ -301,4 +329,3 @@ def test_loader():
 
 if __name__ == "__main__":
     test_loader()
-

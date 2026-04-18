@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PRAP-PIM 容错机制模块
-基于权重模式冗余的PIM硬件容错框架
+FT-Oriented 容错机制模块
+基于显式冗余组的PIM硬件容错框架
 """
 
 __version__ = "1.0.0"
-__author__ = "PRAP-PIM-FT Team"
+__author__ = "FT-Oriented Grouping Team"
 
 # 导出主要接口
 from .fault_tolerance_simulation import FaultToleranceSimulator
@@ -25,5 +25,4 @@ __all__ = [
     'MetricsCollector',
 ]
 
-print("🛡️ PRAP-PIM 容错机制模块已加载")
-
+print("🛡️ FT-Oriented 容错机制模块已加载")
