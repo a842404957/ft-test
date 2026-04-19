@@ -35,6 +35,7 @@ class PatternDataLoader:
         self.group_information = None
         self.map_information = None
         self.multiple_relationship_information = None
+        self.coverage_ratio_information = None
         self.reuse_ratio_information = None
         self.pattern_mask = None
         self.layer_config = None
@@ -70,11 +71,16 @@ class PatternDataLoader:
                 alternative_name=f'model_{self.model_name}_shape_and_value_multiple_relationship_information.pkl'
             )
             
-            # 3. 加载重用率信息
-            self.reuse_ratio_information = self._load_pkl_file(
-                f'model_{self.model_name}_{self.translate_name}_reuse_ratio_information.pkl',
-                alternative_name=f'model_{self.model_name}_shape_and_value_reuse_ratio_information.pkl'
+            # 3. 加载覆盖率信息（主命名）和旧重用率信息（兼容命名）
+            self.coverage_ratio_information = self._load_pkl_file(
+                f'model_{self.model_name}_{self.translate_name}_coverage_ratio_information.pkl'
             )
+            self.reuse_ratio_information = self.coverage_ratio_information
+            if self.reuse_ratio_information is None:
+                self.reuse_ratio_information = self._load_pkl_file(
+                    f'model_{self.model_name}_{self.translate_name}_reuse_ratio_information.pkl',
+                    alternative_name=f'model_{self.model_name}_shape_and_value_reuse_ratio_information.pkl'
+                )
             
             # 4. 加载模式掩码
             self.pattern_mask = self._load_pkl_file(
@@ -206,7 +212,8 @@ class PatternDataLoader:
             print(f"✓ 倍数关系信息: {len(self.multiple_relationship_information)} 层")
         
         if self.reuse_ratio_information:
-            print(f"✓ 重用率信息: {len(self.reuse_ratio_information)} 层")
+            label = "覆盖率信息" if self.coverage_ratio_information is not None else "重用率信息(兼容)"
+            print(f"✓ {label}: {len(self.reuse_ratio_information)} 层")
             # 处理可能是tensor或float的情况
             total_reuse = sum(
                 ratio.item() if torch.is_tensor(ratio) else ratio 
@@ -247,11 +254,15 @@ class PatternDataLoader:
         return None
     
     def get_layer_reuse_ratio(self, layer_name: str) -> float:
-        """获取指定层的重用率"""
+        """兼容接口：返回层覆盖率/旧重用率。"""
         if self.reuse_ratio_information and layer_name in self.reuse_ratio_information:
             ratio = self.reuse_ratio_information[layer_name]
             return ratio.item() if torch.is_tensor(ratio) else ratio
         return 0.0
+
+    def get_layer_coverage_ratio(self, layer_name: str) -> float:
+        """正式接口：返回层覆盖率。"""
+        return self.get_layer_reuse_ratio(layer_name)
     
     def get_layer_mask(self, layer_name: str) -> Optional[torch.Tensor]:
         """获取指定层的模式掩码"""
@@ -284,7 +295,7 @@ class PatternDataLoader:
             for layer_name in self.get_all_layer_names():
                 layer_info = {
                     'map_shape': list(self.get_layer_map(layer_name).shape) if self.get_layer_map(layer_name) is not None else None,
-                    'reuse_ratio': self.get_layer_reuse_ratio(layer_name),
+                    'coverage_ratio': self.get_layer_coverage_ratio(layer_name),
                 }
                 if self.get_layer_group_info(layer_name) is not None:
                     layer_info['group_count'] = self.get_layer_group_info(layer_name).get('group_count', 0)

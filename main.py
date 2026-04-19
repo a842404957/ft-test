@@ -87,11 +87,14 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     mask_file = f'model_{model_name}_{translate_name}_mask.pkl'
     map_file = f'model_{model_name}_{translate_name}_map_information.pkl'
     mult_file = f'model_{model_name}_{translate_name}_multiple_relationship_information.pkl'
+    coverage_file = f'model_{model_name}_{translate_name}_coverage_ratio_information.pkl'
     reuse_file = f'model_{model_name}_{translate_name}_reuse_ratio_information.pkl'
     group_file = f'model_{model_name}_{translate_name}_group_information.pkl'
 
-    cache_files = [mask_file, map_file, mult_file, reuse_file]
+    cache_files = [mask_file, map_file, mult_file, group_file]
     need_regenerate = any(not os.path.exists(file_path) for file_path in cache_files)
+    if not need_regenerate and not (os.path.exists(coverage_file) or os.path.exists(reuse_file)):
+        need_regenerate = True
 
     if need_regenerate:
         checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(translate_epoch[0]) + '_ckpt.pth')
@@ -164,6 +167,8 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
             pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
         with open(mult_file, 'wb') as f_mult:
             pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
+        with open(coverage_file, 'wb') as f_coverage:
+            pkl.dump(reuse_ratio_information, f_coverage, pkl.HIGHEST_PROTOCOL)
         with open(reuse_file, 'wb') as f_reuse:
             pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
         with open(group_file, 'wb') as f_group:
@@ -175,8 +180,14 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
             map_information = pkl.load(f_map)
         with open(mult_file, 'rb') as f_mult:
             multiple_relationship_information = pkl.load(f_mult)
-        with open(reuse_file, 'rb') as f_reuse:
-            reuse_ratio_information = pkl.load(f_reuse)
+        if os.path.exists(coverage_file):
+            with open(coverage_file, 'rb') as f_coverage:
+                reuse_ratio_information = pkl.load(f_coverage)
+        elif os.path.exists(reuse_file):
+            with open(reuse_file, 'rb') as f_reuse:
+                reuse_ratio_information = pkl.load(f_reuse)
+        else:
+            raise FileNotFoundError(f'missing both {coverage_file} and {reuse_file}')
         if os.path.exists(group_file):
             with open(group_file, 'rb') as f_group:
                 group_information = pkl.load(f_group)

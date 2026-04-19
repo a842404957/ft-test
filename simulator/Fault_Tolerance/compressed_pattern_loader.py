@@ -73,11 +73,16 @@ class CompressedPatternDataLoader(PatternDataLoader):
     def _load_fallback_data(self):
         """加载回退数据（仅加载必要的小文件）"""
         try:
-            # 只加载重用率信息（通常很小）
-            self.reuse_ratio_information = self._load_pkl_file(
-                f'model_{self.model_name}_{self.translate_name}_reuse_ratio_information.pkl',
-                alternative_name=f'model_{self.model_name}_shape_and_value_reuse_ratio_information.pkl'
+            # 优先加载覆盖率信息，旧重用率命名作为兼容层
+            self.coverage_ratio_information = self._load_pkl_file(
+                f'model_{self.model_name}_{self.translate_name}_coverage_ratio_information.pkl'
             )
+            self.reuse_ratio_information = self.coverage_ratio_information
+            if self.reuse_ratio_information is None:
+                self.reuse_ratio_information = self._load_pkl_file(
+                    f'model_{self.model_name}_{self.translate_name}_reuse_ratio_information.pkl',
+                    alternative_name=f'model_{self.model_name}_shape_and_value_reuse_ratio_information.pkl'
+                )
 
             # 构建层配置信息
             self._build_layer_config()

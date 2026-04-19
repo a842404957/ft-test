@@ -1,4 +1,15 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+*.zip
+test_reports/
 fault_tolerance_results/
+results/
+cifar10_data/
+model_*.pkl
+model_*.pth
+model_*.csv

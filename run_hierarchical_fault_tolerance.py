@@ -9,6 +9,8 @@ import os
 import sys
 import torch
 import argparse
+import csv
+import json
 from pathlib import Path
 
 # 添加项目路径
@@ -16,8 +18,12 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
-from model import Vgg16, Res18, Res50
+from simulator.Fault_Tolerance.report_generator import ReportGenerator
+from model import Vgg16, Res18, Res50, WRN
 from torchvision import transforms, datasets
+
+
+DEFAULT_CONFIG_FILE = 'fault_tolerance_config_high_fault_rate.json'
 
 
 def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None):
@@ -41,6 +47,8 @@ def load_model(model_name, translate_name='ft_group_cluster_translate', device='
         model = Res18(num_classes=num_classes)
     elif model_name == 'Res50':
         model = Res50(num_classes=num_classes)
+    elif model_name == 'WRN':
+        model = WRN(num_classes=num_classes)
     else:
         raise ValueError(f"不支持的模型: {model_name}")
 
@@ -91,91 +99,148 @@ def load_test_data(batch_size=128, config_file=None):
     return test_loader
 
 
-def run_simulation_with_config(model, test_loader, config_name, config_overrides=None,
-                                base_config_file=None, num_samples=1000, model_name=None,
-                                translate_name='ft_group_cluster_translate'):
-    """运行带有特定配置的仿真"""
-    print("=" * 80)
-    print(f"🚀 运行仿真配置: {config_name}")
-    print("=" * 80)
-
-    import json
-    import tempfile
-    # os 已经在文件顶部导入了，这里不需要再导入
-
-    # 加载基础配置（如果有）
+def _build_runtime_config(base_config_file=None, config_overrides=None, report_output_dir=None):
     base_config = {}
     if base_config_file and os.path.exists(base_config_file):
         with open(base_config_file, 'r', encoding='utf-8') as f:
             base_config = json.load(f)
 
+    if not base_config:
+        final_config = {
+            'model': {'name': 'Unknown', 'num_classes': 10},
+            'hierarchical_fault_tolerance': {
+                'enabled': True,
+                'level1': {
+                    'name': 'redundancy_group',
+                    'enabled': True,
+                    'description': '冗余组内替换（主策略）'
+                },
+                'level2': {
+                    'name': 'nearest_pattern',
+                    'enabled': True,
+                    'description': '相似模式近似替换',
+                    'similarity_threshold': 0.85,
+                    'k_nearest': 3,
+                    'use_weighted_average': True,
+                    'fallback_latency_ns': 15,
+                    'fallback_energy_pj': 75,
+                },
+                'level3': {
+                    'name': 'adaptive_masking',
+                    'enabled': True,
+                    'description': '自适应屏蔽策略',
+                    'masking_strategy': 'weighted_neighbors',
+                    'neighbor_radius': 2,
+                    'fallback_latency_ns': 20,
+                    'fallback_energy_pj': 100,
+                },
+            },
+            'report': {'output_dir': './fault_tolerance_results'}
+        }
+    else:
+        final_config = json.loads(json.dumps(base_config))
+
+    if config_overrides:
+        if 'hierarchical_fault_tolerance' not in final_config:
+            final_config['hierarchical_fault_tolerance'] = {}
+        for key, value in config_overrides.items():
+            parts = key.split('.')
+            current = final_config['hierarchical_fault_tolerance']
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = value
+
+    if report_output_dir:
+        final_config.setdefault('report', {})
+        final_config['report']['output_dir'] = report_output_dir
+
+    return final_config, base_config
+
+
+def _export_compare_summary(all_results, output_dir):
+    if not output_dir:
+        return []
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    summary_rows = []
+    for item in all_results:
+        metrics = item['results']
+        reliability = metrics.get('reliability', {})
+        accuracy = metrics.get('accuracy', {})
+        hierarchical = reliability.get('hierarchical_correction', {})
+        summary_rows.append({
+            'strategy': item['name'],
+            'fault_correction_rate': reliability.get('fault_correction_rate', 0.0),
+            'ft_accuracy': accuracy.get('ft_accuracy', 0.0),
+            'accuracy_recovery_rate': accuracy.get('accuracy_recovery_rate', 0.0),
+            'level1_corrections': hierarchical.get('level1_corrections', 0),
+            'level2_corrections': hierarchical.get('level2_corrections', 0),
+            'level3_corrections': hierarchical.get('level3_corrections', 0),
+        })
+
+    json_path = output_path / 'comparison_summary.json'
+    csv_path = output_path / 'comparison_summary.csv'
+    md_path = output_path / 'comparison_summary.md'
+
+    with open(json_path, 'w', encoding='utf-8') as handle:
+        json.dump(summary_rows, handle, indent=2, ensure_ascii=False)
+
+    with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    with open(md_path, 'w', encoding='utf-8') as handle:
+        handle.write('# Comparison Summary\n\n')
+        handle.write('| strategy | fault_correction_rate | ft_accuracy | accuracy_recovery_rate | level1 | level2 | level3 |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- |\n')
+        for row in summary_rows:
+            handle.write(
+                '| {strategy} | {fault_correction_rate:.6f} | {ft_accuracy:.6f} | '
+                '{accuracy_recovery_rate:.6f} | {level1_corrections} | '
+                '{level2_corrections} | {level3_corrections} |\n'.format(**row)
+            )
+
+    return [str(json_path), str(csv_path), str(md_path)]
+
+
+def run_simulation_with_config(model, test_loader, config_name, config_overrides=None,
+                                base_config_file=None, num_samples=1000, model_name=None,
+                                translate_name='ft_group_cluster_translate',
+                                report_output_dir=None):
+    """运行带有特定配置的仿真"""
+    print("=" * 80)
+    print(f"🚀 运行仿真配置: {config_name}")
+    print("=" * 80)
+
+    import tempfile
+    final_config, base_config = _build_runtime_config(
+        base_config_file=base_config_file,
+        config_overrides=config_overrides,
+        report_output_dir=report_output_dir,
+    )
+
     # 决定使用哪个配置文件
     config_file_path = None
     temp_file_path = None  # 临时文件路径（需要清理）
-    final_config = {}  # 最终使用的配置
 
-    # 如果有覆盖配置，需要创建临时文件（合并基础配置和覆盖配置）
-    if config_overrides:
-        # 从基础配置开始，如果没有基础配置则使用默认配置
-        if not base_config:
-            final_config = {
-                'model': {'name': 'Unknown', 'num_classes': 10},
-                'hierarchical_fault_tolerance': {
-                    'enabled': True,
-                    'level1': {
-                        'name': 'redundancy_group',
-                        'enabled': True,
-                        'description': '冗余组内替换（主策略）'
-                    },
-                    'level2': {
-                        'name': 'nearest_pattern',
-                        'enabled': True,
-                        'description': '相似模式近似替换',
-                        'similarity_threshold': 0.85,
-                        'k_nearest': 3,
-                        'use_weighted_average': True,
-                        'fallback_latency_ns': 15,
-                        'fallback_energy_pj': 75,
-                    },
-                    'level3': {
-                        'name': 'adaptive_masking',
-                        'enabled': True,
-                        'description': '自适应屏蔽策略',
-                        'masking_strategy': 'weighted_neighbors',
-                        'neighbor_radius': 2,
-                        'fallback_latency_ns': 20,
-                        'fallback_energy_pj': 100,
-                    },
-                }
-            }
-        else:
-            # 使用基础配置作为起点
-            final_config = json.loads(json.dumps(base_config))  # 深拷贝
-
-        # 应用覆盖配置
-        if config_overrides:
-            # 确保 hierarchical_fault_tolerance 存在
-            if 'hierarchical_fault_tolerance' not in final_config:
-                final_config['hierarchical_fault_tolerance'] = {}
-
-            for key, value in config_overrides.items():
-                parts = key.split('.')
-                current = final_config['hierarchical_fault_tolerance']
-                for part in parts[:-1]:
-                    if part not in current:
-                        current[part] = {}
-                    current = current[part]
-                current[parts[-1]] = value
-
+    if config_overrides or report_output_dir or not (base_config_file and os.path.exists(base_config_file)):
         # 写入临时文件
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(final_config, f, indent=2)
             config_file_path = f.name
             temp_file_path = config_file_path  # 标记这是临时文件
 
-        print(f"📝 应用配置覆盖:")
-        for key, value in config_overrides.items():
-            print(f"  {key}: {value}")
+        if config_overrides:
+            print(f"📝 应用配置覆盖:")
+            for key, value in config_overrides.items():
+                print(f"  {key}: {value}")
+        if report_output_dir:
+            print(f"🗂️  输出目录覆盖: {report_output_dir}")
         print()
     elif base_config_file and os.path.exists(base_config_file):
         # 如果没有覆盖配置，直接使用原始配置文件
@@ -207,7 +272,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
     return results
 
 
-def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate'):
+def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate', model_name='Vgg16', report_output_dir=None):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -227,13 +292,13 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             config_file = None
     
     # 🔧 从配置文件读取模型名称（或使用默认值）
-    model_name_from_config = 'unknown'  # 默认值
+    model_name_from_config = model_name
     if config_file:
         try:
             import json
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                model_name_from_config = config.get('model', {}).get('name', 'Res18')
+                model_name_from_config = config.get('model', {}).get('name', model_name)
                 print(f"  📄 从配置文件读取模型名称: {model_name_from_config}")
         except Exception as e:
             print(f"  ⚠️ 读取模型名称失败: {e}，使用默认值")
@@ -307,6 +372,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             base_config_file=config_file,
             num_samples=num_samples,
             translate_name=translate_name,
+            report_output_dir=report_output_dir,
         )
         
         all_results.append({
@@ -368,6 +434,20 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
     print("✅ 对比实验完成")
     print("=" * 80 + "\n")
 
+    generated_files = []
+    if report_output_dir:
+        report_generator = ReportGenerator(output_dir=report_output_dir)
+        generated_files.append(
+            report_generator.generate_comparison_report(
+                [item['results'] for item in all_results],
+                [item['name'] for item in all_results],
+            )
+        )
+        generated_files.extend(_export_compare_summary(all_results, report_output_dir))
+        print("🗂️ compare 汇总文件:")
+        for path in generated_files:
+            print(f"  - {path}")
+
 
 def main():
     """主函数"""
@@ -378,17 +458,26 @@ def main():
     parser.add_argument('--samples', type=int, default=1000,
                        help='测试样本数量')
     parser.add_argument('--model', type=str, default='Vgg16',
+                       choices=['Vgg16', 'Res18', 'Res50', 'WRN'],
                        help='模型名称')
-    parser.add_argument('--config', type=str, default='fault_tolerance_config_high_fault_rate.json',
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_FILE,
                        help='配置文件路径 (JSON格式)')
     parser.add_argument('--translate', type=str, default='ft_group_cluster_translate',
                        help='转换方法名称')
+    parser.add_argument('--output-dir', type=str, default='',
+                       help='可选：覆盖仿真报告输出目录')
     
     args = parser.parse_args()
     
     if args.mode == 'compare':
         # 运行对比实验
-        compare_strategies(config_file=args.config, num_samples=args.samples, translate_name=args.translate)
+        compare_strategies(
+            config_file=args.config,
+            num_samples=args.samples,
+            translate_name=args.translate,
+            model_name=args.model,
+            report_output_dir=args.output_dir or None,
+        )
     else:
         # 单次运行
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -422,6 +511,7 @@ def main():
             num_samples=args.samples,
             model_name=model_name,
             translate_name=args.translate,
+            report_output_dir=args.output_dir or None,
         )
 
 

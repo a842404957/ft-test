@@ -1,0 +1,30 @@
+{
+  "model": {
+    "name": "Vgg16",
+    "num_classes": 10
+  },
+  "fault_injection": {
+    "enabled": true,
+    "fault_rate": 0.01,
+    "fault_models": [
+      "bit_flip"
+    ],
+    "target_layers": "all",
+    "random_seed": 42,
+    "bit_flip_positions": "random"
+  },
+  "simulation": {
+    "batch_size": 128,
+    "num_test_samples": 1000,
+    "device": "cuda",
+    "verbose": true
+  },
+  "report": {
+    "output_dir": "./fault_tolerance_results/high_fault_rate",
+    "formats": [
+      "json",
+      "csv",
+      "md"
+    ]
+  }
+}

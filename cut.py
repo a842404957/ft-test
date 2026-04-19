@@ -1893,6 +1893,8 @@ def ft_group_translate_train(model, model_name, translate_name,
         pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
     with open('model_' + model_name + '_' + translate_name + '_multiple_relationship_information.pkl', 'wb') as f_mult:
         pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
+    with open('model_' + model_name + '_' + translate_name + '_coverage_ratio_information.pkl', 'wb') as f_coverage:
+        pkl.dump(reuse_ratio_information, f_coverage, pkl.HIGHEST_PROTOCOL)
     with open('model_' + model_name + '_' + translate_name + '_reuse_ratio_information.pkl', 'wb') as f_reuse:
         pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
     with open('model_' + model_name + '_' + translate_name + '_group_information.pkl', 'wb') as f_group:
