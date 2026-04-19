@@ -465,7 +465,7 @@ def main():
     parser.add_argument('--translate', type=str, default='ft_group_cluster_translate',
                        help='转换方法名称')
     parser.add_argument('--output-dir', type=str, default='',
-                       help='可选：覆盖仿真报告输出目录')
+                       help='可选：覆盖仿真报告输出目录；建议同一轮 single/compare 使用同一个目录')
     
     args = parser.parse_args()
     

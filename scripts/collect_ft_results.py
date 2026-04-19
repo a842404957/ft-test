@@ -4,8 +4,13 @@ import argparse
 import csv
 import json
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fault_tolerance_analyse import analyse
 
@@ -36,6 +41,10 @@ def resolve_report_dir(config_path: Path, override_report_dir: str):
     return Path(report_dir).resolve()
 
 
+def build_run_dir(results_root: Path, model: str, translate: str, tag: str) -> Path:
+    return (results_root / model / translate / tag).resolve()
+
+
 def collect_artifact_paths(repo_root: Path, model: str, translate: str):
     artifact_paths = {}
     for suffix in ARTIFACT_SUFFIXES:
@@ -48,6 +57,9 @@ def copy_latest_reports(report_dir: Path, run_dir: Path):
     copied_paths = []
     if not report_dir.exists():
         return copied_paths
+
+    reports_dir = run_dir / 'reports'
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
     patterns = [
         'fault_tolerance_report_*.json',
@@ -63,10 +75,39 @@ def copy_latest_reports(report_dir: Path, run_dir: Path):
         if not candidates:
             continue
         source = candidates[-1]
-        target = run_dir / source.name
+        target = reports_dir / source.name
         shutil.copy2(source, target)
         copied_paths.append(str(target.resolve()))
     return copied_paths
+
+
+def classify_report_paths(copied_paths):
+    manifest = {
+        'simulation_report_json': '',
+        'simulation_report_md': '',
+        'simulation_summary_csv': '',
+        'comparison_report_md': '',
+        'comparison_summary_json': '',
+        'comparison_summary_csv': '',
+        'comparison_summary_md': '',
+    }
+    for raw_path in copied_paths:
+        name = Path(raw_path).name
+        if name.startswith('fault_tolerance_report_') and name.endswith('.json'):
+            manifest['simulation_report_json'] = raw_path
+        elif name.startswith('fault_tolerance_report_') and name.endswith('.md'):
+            manifest['simulation_report_md'] = raw_path
+        elif name.startswith('fault_tolerance_summary_') and name.endswith('.csv'):
+            manifest['simulation_summary_csv'] = raw_path
+        elif name == 'comparison_report.md' or name.startswith('comparison_report_'):
+            manifest['comparison_report_md'] = raw_path
+        elif name == 'comparison_summary.json':
+            manifest['comparison_summary_json'] = raw_path
+        elif name == 'comparison_summary.csv':
+            manifest['comparison_summary_csv'] = raw_path
+        elif name == 'comparison_summary.md':
+            manifest['comparison_summary_md'] = raw_path
+    return manifest
 
 
 def write_summary(run_dir: Path, report: dict, metadata: dict):
@@ -89,6 +130,10 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
             'singleton_ratio',
             'avg_group_size',
             'level1_potential_recovery_ratio',
+            'analysis_json',
+            'analysis_csv',
+            'simulation_summary_csv',
+            'comparison_summary_csv',
             'report_dir',
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -105,6 +150,10 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
             'singleton_ratio': global_stats.get('singleton_ratio', 0.0),
             'avg_group_size': global_stats.get('avg_group_size', 0.0),
             'level1_potential_recovery_ratio': global_stats.get('level1_potential_recovery_ratio', 0.0),
+            'analysis_json': metadata['analysis_json'],
+            'analysis_csv': metadata['analysis_csv'],
+            'simulation_summary_csv': metadata['report_manifest'].get('simulation_summary_csv', ''),
+            'comparison_summary_csv': metadata['report_manifest'].get('comparison_summary_csv', ''),
             'report_dir': metadata['report_dir'],
         })
 
@@ -120,6 +169,8 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
         '',
         '## Analysis',
         '',
+        f"- analysis_json: `{metadata['analysis_json']}`",
+        f"- analysis_csv: `{metadata['analysis_csv']}`",
         f"- group_coverage_ratio: `{global_stats.get('group_coverage_ratio', 0.0):.6f}`",
         f"- exact_repairable_ratio: `{global_stats.get('exact_repairable_ratio', 0.0):.6f}`",
         f"- scaled_repairable_ratio: `{global_stats.get('scaled_repairable_ratio', 0.0):.6f}`",
@@ -127,9 +178,16 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
         f"- avg_group_size: `{global_stats.get('avg_group_size', 0.0):.6f}`",
         f"- level1_potential_recovery_ratio: `{global_stats.get('level1_potential_recovery_ratio', 0.0):.6f}`",
         '',
-        '## Artifacts',
+        '## Simulation Reports',
         '',
     ]
+    for name, path in metadata['report_manifest'].items():
+        lines.append(f"- {name}: `{path or 'missing'}`")
+    lines.extend([
+        '',
+        '## Artifacts',
+        '',
+    ])
     for name, path in metadata['artifact_paths'].items():
         lines.append(f"- {name}: `{path or 'missing'}`")
     lines.extend(['', '## Copied Reports', ''])
@@ -144,21 +202,23 @@ def main():
     parser.add_argument('--translate', default='ft_group_cluster_translate', help='translate method name')
     parser.add_argument('--config', default='fault_tolerance_config_high_fault_rate.json', help='config file path')
     parser.add_argument('--samples', type=int, default=256, help='simulation sample count')
-    parser.add_argument('--results-root', default='results/ft_runs', help='root directory for collected summaries')
-    parser.add_argument('--tag', default='', help='optional run tag; defaults to timestamp')
+    parser.add_argument('--results-root', default='results/ft_runs', help='root directory; final path is <results-root>/<model>/<translate>/<tag>/')
+    parser.add_argument('--tag', default='', help='optional run tag; defaults to timestamp and becomes the last path component')
     parser.add_argument('--data-dir', default='.', help='artifact directory for fault_tolerance_analyse')
     parser.add_argument('--report-dir', default='', help='optional report output directory override')
     args = parser.parse_args()
 
-    repo_root = Path.cwd()
+    repo_root = Path.cwd().resolve()
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_tag = args.tag or timestamp
-    run_dir = (repo_root / args.results_root / f'{args.model}_{args.translate}_{run_tag}').resolve()
+    run_dir = build_run_dir(Path(args.results_root).resolve() if Path(args.results_root).is_absolute() else (repo_root / args.results_root), args.model, args.translate, run_tag)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     report = analyse(args.model, args.translate, args.data_dir)
-    analysis_json = run_dir / 'analysis.json'
-    analysis_csv = run_dir / 'analysis_layers.csv'
+    analysis_dir = run_dir / 'analysis'
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    analysis_json = analysis_dir / 'ft_report.json'
+    analysis_csv = analysis_dir / 'ft_layers.csv'
     analysis_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
 
     with open(analysis_csv, 'w', newline='', encoding='utf-8') as handle:
@@ -170,6 +230,7 @@ def main():
     config_path = (repo_root / args.config).resolve()
     report_dir = resolve_report_dir(config_path, args.report_dir)
     copied_report_paths = copy_latest_reports(report_dir, run_dir)
+    report_manifest = classify_report_paths(copied_report_paths)
     artifact_paths = collect_artifact_paths(repo_root, args.model, args.translate)
 
     metadata = {
@@ -182,6 +243,7 @@ def main():
         'report_dir': str(report_dir),
         'artifact_paths': artifact_paths,
         'copied_report_paths': copied_report_paths,
+        'report_manifest': report_manifest,
         'analysis_json': str(analysis_json.resolve()),
         'analysis_csv': str(analysis_csv.resolve()),
     }

@@ -210,11 +210,13 @@ def main():
 
     if args.output_json:
         output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
         output_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
         print('saved json -> {}'.format(output_json))
 
     if args.output_csv:
         output_csv = Path(args.output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(report['layers']).to_csv(output_csv, index=False)
         print('saved csv -> {}'.format(output_csv))
 
