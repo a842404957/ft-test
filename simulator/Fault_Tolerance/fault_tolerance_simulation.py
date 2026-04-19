@@ -646,22 +646,59 @@ class FaultToleranceSimulator:
                         continue
 
                     # 找到健康的OU
-                    healthy_ous = [ou for ou in containing_group.ou_indices if ou != faulty_ou and ou not in faulty_set]
-
-                    if not healthy_ous:
-                        continue
                     out_ch, in_ch = faulty_ou
                     faulty_weight = self._extract_ou_weight(original_layer_weights, faulty_ou)
                     faulty_mask_slice = layer_mask[out_ch, in_ch] if layer_mask is not None else None
+                    faulty_block_entry = containing_group.ou_to_block.get(faulty_ou)
+                    faulty_block = None
+                    block_offset = 0
+                    if faulty_block_entry is not None and faulty_block_entry['member_index'] < len(containing_group.block_members):
+                        faulty_block = containing_group.block_members[faulty_block_entry['member_index']]
+                        block_offset = int(faulty_block_entry['offset'])
+
+                    healthy_candidates = []
+                    if faulty_block is not None:
+                        for candidate_block in containing_group.block_members:
+                            if block_offset >= int(candidate_block.get('channel_span', 1)):
+                                continue
+                            candidate_ou = (int(candidate_block['out_ch']), int(candidate_block['in_ch_start']) + block_offset)
+                            if candidate_ou == faulty_ou or candidate_ou in faulty_set:
+                                continue
+                            healthy_candidates.append((candidate_block, candidate_ou))
+                    else:
+                        healthy_ous = [ou for ou in containing_group.ou_indices if ou != faulty_ou and ou not in faulty_set]
+                        for candidate_ou in healthy_ous:
+                            healthy_candidates.append((
+                                {'out_ch': candidate_ou[0], 'in_ch_start': candidate_ou[1], 'channel_span': 1, 'multiplier': 1.0, 'role': 'member'},
+                                candidate_ou,
+                            ))
+
+                    if not healthy_candidates:
+                        continue
 
                     replacement_ou = None
+                    replacement_block = None
                     replacement_origin = 'member'
-                    if containing_group.prototype_ou is not None and containing_group.prototype_ou in healthy_ous:
-                        replacement_ou = containing_group.prototype_ou
-                        replacement_origin = 'prototype'
-                    else:
+                    if containing_group.prototype_block is not None:
+                        prototype_candidate_ou = (
+                            int(containing_group.prototype_block['out_ch']),
+                            int(containing_group.prototype_block['in_ch_start']) + block_offset,
+                        )
+                        if prototype_candidate_ou != faulty_ou and prototype_candidate_ou not in faulty_set:
+                            replacement_ou = prototype_candidate_ou
+                            replacement_block = containing_group.prototype_block
+                            replacement_origin = 'prototype'
+                    elif containing_group.prototype_ou is not None:
+                        for candidate_block, candidate_ou in healthy_candidates:
+                            if candidate_ou == containing_group.prototype_ou:
+                                replacement_ou = candidate_ou
+                                replacement_block = candidate_block
+                                replacement_origin = 'prototype'
+                                break
+
+                    if replacement_ou is None:
                         best_similarity = -1.0
-                        for candidate_ou in healthy_ous:
+                        for candidate_block, candidate_ou in healthy_candidates:
                             candidate_weight = self._extract_ou_weight(original_layer_weights, candidate_ou)
                             similarity = self._compute_ou_similarity(
                                 faulty_weight=faulty_weight,
@@ -671,19 +708,24 @@ class FaultToleranceSimulator:
                             if similarity > best_similarity:
                                 best_similarity = similarity
                                 replacement_ou = candidate_ou
+                                replacement_block = candidate_block
+                                replacement_origin = 'prototype' if candidate_block.get('role') == 'prototype' else 'member'
 
                     if replacement_ou is None:
                         continue
 
                     replacement_out_ch, replacement_in_ch = replacement_ou
 
-                    # 获取故障OU和替换OU在组中的索引
-                    fault_idx = containing_group.ou_indices.index(faulty_ou)
-                    replacement_idx = containing_group.ou_indices.index(replacement_ou)
-
-                    # 获取对应的倍数关系
-                    faulty_multiplier = containing_group.multipliers[fault_idx]
-                    replacement_multiplier = containing_group.multipliers[replacement_idx]
+                    if faulty_block is not None:
+                        faulty_multiplier = float(faulty_block.get('multiplier', 1.0))
+                    else:
+                        fault_idx = containing_group.ou_indices.index(faulty_ou)
+                        faulty_multiplier = containing_group.multipliers[fault_idx]
+                    if replacement_block is not None:
+                        replacement_multiplier = float(replacement_block.get('multiplier', 1.0))
+                    else:
+                        replacement_idx = containing_group.ou_indices.index(replacement_ou)
+                        replacement_multiplier = containing_group.multipliers[replacement_idx]
 
                     # 使用倍数关系计算修正后的权重
                     # weight_faulty = weight_replacement * (faulty_multiplier / replacement_multiplier)
@@ -709,7 +751,7 @@ class FaultToleranceSimulator:
 
                     if level1_count < 3:
                         print(f"  ✅ Level 1: {layer_name}[{faulty_ou}] ← OU[{replacement_ou}] "
-                              f"(组大小={containing_group.size()}, 来源={replacement_origin}, 缩放因子={scale_factor:.4f})")
+                              f"(组大小={containing_group.size()}, 来源={replacement_origin}, block_offset={block_offset}, 缩放因子={scale_factor:.4f})")
 
                     layer_level1.append(faulty_ou)
                     level1_count += 1

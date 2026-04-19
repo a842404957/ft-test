@@ -29,14 +29,41 @@ class RedundancyGroup:
         self.pattern_id = pattern_id
         self.ou_indices = []  # OU索引列表 [(out_ch, in_ch), ...]
         self.multipliers = []  # 对应的倍数关系
+        self.block_members = []  # block-aware成员信息
+        self.ou_to_block = {}  # {(out_ch, in_ch): {'member_index': int, 'offset': int}}
         self.prototype_ou = None
+        self.prototype_block = None
         self.repair_mode = 'scaled'
         self.member_similarities = {}
         
     def add_ou(self, out_ch: int, in_ch: int, multiplier: float = 1.0):
         """添加OU到组"""
-        self.ou_indices.append((out_ch, in_ch))
-        self.multipliers.append(multiplier)
+        self.add_block_member(out_ch, in_ch, 1, multiplier=multiplier)
+
+    def add_block_member(self, out_ch: int, in_ch_start: int, channel_span: int,
+                         multiplier: float = 1.0, role: str = 'member',
+                         mask_signature: Optional[str] = None, similarity: float = 1.0):
+        """添加block-aware成员，并为每个block元素保留偏移映射。"""
+        member_info = {
+            'out_ch': out_ch,
+            'in_ch_start': in_ch_start,
+            'channel_span': channel_span,
+            'multiplier': multiplier,
+            'role': role,
+            'mask_signature': mask_signature,
+            'similarity': similarity,
+        }
+        member_index = len(self.block_members)
+        self.block_members.append(member_info)
+        for offset in range(0, channel_span):
+            ou = (out_ch, in_ch_start + offset)
+            self.ou_indices.append(ou)
+            self.multipliers.append(multiplier)
+            self.ou_to_block[ou] = {'member_index': member_index, 'offset': offset}
+            self.member_similarities[ou] = similarity
+        if role == 'prototype':
+            self.prototype_block = member_info
+            self.prototype_ou = (out_ch, in_ch_start)
 
     def set_prototype(self, out_ch: int, in_ch: int):
         """设置组原型OU"""
@@ -146,15 +173,22 @@ class RedundancyGroupParser:
                 channel_span = int(member.get('channel_span', 1))
                 multiplier = float(member.get('multiplier', 1.0))
                 similarity = float(member.get('similarity', 1.0))
-                for offset in range(0, channel_span):
-                    ou = (member_out, member_in + offset)
-                    group.add_ou(ou[0], ou[1], multiplier)
-                    group.member_similarities[ou] = similarity
+                group.add_block_member(
+                    member_out,
+                    member_in,
+                    channel_span,
+                    multiplier=multiplier,
+                    role=member.get('role', 'member'),
+                    mask_signature=member.get('mask_signature'),
+                    similarity=similarity,
+                )
                 if member.get('role') == 'prototype' and member_out >= 0 and member_in >= 0:
                     group.set_prototype(member_out, member_in)
 
             if group.prototype_ou is None and group.ou_indices:
                 group.set_prototype(group.ou_indices[0][0], group.ou_indices[0][1])
+            if group.prototype_block is None and group.block_members:
+                group.prototype_block = group.block_members[0]
 
             groups.append(group)
             self.pattern_to_groups[group.pattern_id].append(group.group_id)
@@ -229,7 +263,7 @@ class RedundancyGroupParser:
                 group = RedundancyGroup(group_id, layer_name, pattern_id)
                 
                 for (out_ch, in_ch), multiplier in sorted(ou_map.items()):
-                    group.add_ou(out_ch, in_ch, multiplier)
+                    group.add_block_member(out_ch, in_ch, 1, multiplier=multiplier)
                     if out_ch == pattern_id and group.prototype_ou is None:
                         group.set_prototype(out_ch, in_ch)
                 if group.prototype_ou is None and group.ou_indices:
@@ -351,6 +385,7 @@ class RedundancyGroupParser:
                     'pattern_id': group.pattern_id,
                     'size': group.size(),
                     'ou_indices': group.ou_indices,
+                    'block_members': group.block_members,
                     'multipliers': group.multipliers,
                     'prototype_ou': group.prototype_ou,
                     'repair_mode': group.repair_mode,

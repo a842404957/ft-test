@@ -1,3 +1,4 @@
+import copy
 import math
 import time
 import pickle as pkl
@@ -906,8 +907,79 @@ def pattern_shape_and_value_similar_translate(model, in_channel, out_channel, we
         return map_table, multiple_relationship_table, weight_pattern_reuse_ratio
 
 
+def _get_block_step(channel_number: int) -> int:
+    return max(int(channel_number) if channel_number is not None else 1, 1)
+
+
+def _get_channel_span(in_channel: int, in_ch_start: int, channel_number: int) -> int:
+    return max(1, min(_get_block_step(channel_number), in_channel - in_ch_start))
+
+
+def _extract_block_tensor(weight_tensor: torch.Tensor, out_ch: int, in_ch_start: int, channel_span: int) -> torch.Tensor:
+    if weight_tensor.dim() == 4:
+        return weight_tensor[out_ch, in_ch_start:in_ch_start + channel_span, :, :].clone()
+    return weight_tensor[out_ch, in_ch_start:in_ch_start + channel_span].clone()
+
+
+def _assign_block_tensor(weight_tensor: torch.Tensor, out_ch: int, in_ch_start: int, channel_span: int, block_value: torch.Tensor):
+    if weight_tensor.dim() == 4:
+        weight_tensor[out_ch, in_ch_start:in_ch_start + channel_span, :, :] = block_value
+    else:
+        weight_tensor[out_ch, in_ch_start:in_ch_start + channel_span] = block_value
+
+
+def _tensor_mask_signature(mask_tensor: torch.Tensor) -> bytes:
+    return mask_tensor.flatten().to(torch.uint8).cpu().numpy().tobytes()
+
+
+def _mean_or_zero(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _build_shared_topk_mask(model, weight_name, in_channel, out_channel, channel_number, keep_ratio):
+    weight_tensor = model.state_dict()[weight_name].detach().cpu()
+    pattern_mask = torch.zeros_like(weight_tensor)
+    block_step = _get_block_step(channel_number)
+
+    for in_ch_start in range(0, in_channel, block_step):
+        channel_span = _get_channel_span(in_channel, in_ch_start, channel_number)
+        block_weight = weight_tensor[:, in_ch_start:in_ch_start + channel_span].abs().sum(dim=0)
+        flat_block = block_weight.reshape(-1)
+        keep_count = max(1, min(flat_block.numel(), int(round(flat_block.numel() * keep_ratio))))
+        keep_indices = torch.topk(flat_block, keep_count).indices
+        block_mask = torch.zeros_like(flat_block)
+        block_mask[keep_indices] = 1.0
+        block_mask = block_mask.reshape(block_weight.shape)
+        for out_ch in range(0, out_channel):
+            _assign_block_tensor(pattern_mask, out_ch, in_ch_start, channel_span, block_mask)
+
+    return pattern_mask
+
+
+def _build_per_out_topk_mask(model, weight_name, in_channel, out_channel, channel_number, keep_ratio):
+    weight_tensor = model.state_dict()[weight_name].detach().cpu()
+    pattern_mask = torch.zeros_like(weight_tensor)
+    block_step = _get_block_step(channel_number)
+
+    for out_ch in range(0, out_channel):
+        for in_ch_start in range(0, in_channel, block_step):
+            channel_span = _get_channel_span(in_channel, in_ch_start, channel_number)
+            block_weight = _extract_block_tensor(weight_tensor, out_ch, in_ch_start, channel_span).abs()
+            flat_block = block_weight.reshape(-1)
+            keep_count = max(1, min(flat_block.numel(), int(round(flat_block.numel() * keep_ratio))))
+            keep_indices = torch.topk(flat_block, keep_count).indices
+            block_mask = torch.zeros_like(flat_block)
+            block_mask[keep_indices] = 1.0
+            block_mask = block_mask.reshape(block_weight.shape)
+            _assign_block_tensor(pattern_mask, out_ch, in_ch_start, channel_span, block_mask)
+
+    return pattern_mask
+
+
 def extract_ou_patterns(model, weight_name, in_channel, out_channel, kernel_size, channel_number, mask=None):
-    """提取用于FT grouping的OU模式。第一轮按单个(out_ch, in_ch)粒度组织。"""
+    """按真实OU/block边界提取模式，保留成员的block元数据。"""
     weight_tensor = model.state_dict()[weight_name].detach().cpu()
     if mask is None:
         mask_tensor = torch.ones_like(weight_tensor)
@@ -916,22 +988,26 @@ def extract_ou_patterns(model, weight_name, in_channel, out_channel, kernel_size
         if mask_tensor.shape != weight_tensor.shape:
             mask_tensor = torch.ones_like(weight_tensor)
 
+    block_step = _get_block_step(channel_number)
     pattern_list = []
     for out_ch in range(0, out_channel):
-        for in_ch_start in range(0, in_channel):
-            raw = weight_tensor[out_ch][in_ch_start].clone()
-            current_mask = mask_tensor[out_ch][in_ch_start].clone()
+        for in_ch_start in range(0, in_channel, block_step):
+            channel_span = _get_channel_span(in_channel, in_ch_start, channel_number)
+            raw = _extract_block_tensor(weight_tensor, out_ch, in_ch_start, channel_span)
+            current_mask = _extract_block_tensor(mask_tensor, out_ch, in_ch_start, channel_span)
             masked = raw * current_mask
-            mask_signature = current_mask.flatten().to(torch.uint8).numpy().tobytes()
             pattern_list.append({
                 'out_ch': out_ch,
                 'in_ch_start': in_ch_start,
-                'channel_span': 1,
+                'channel_span': channel_span,
                 'raw': raw,
                 'masked': masked,
                 'norm1': masked.abs().sum().item(),
                 'norm2': torch.norm(masked.reshape(-1).float(), p=2).item(),
-                'mask_signature': mask_signature,
+                'mask_signature': _tensor_mask_signature(current_mask),
+                'multiplier': 1.0,
+                'block_kind': 'fc' if 'fc' in weight_name else ('conv1x1' if kernel_size == 1 else 'conv3x3'),
+                'block_index': in_ch_start // block_step,
             })
     return pattern_list
 
@@ -1100,9 +1176,14 @@ def _build_layer_ft_groups(pattern_list, min_group_size, target_group_size, sim_
 
     layer_groups = []
     group_id = 0
+    repairable_block_count = 0
     repairable_ou_count = 0
+    singleton_group_count = 0
+    exact_group_count = 0
+    scaled_group_count = 0
 
-    for block_patterns in block_map.values():
+    for block_start in sorted(block_map.keys()):
+        block_patterns = block_map[block_start]
         for group in build_ft_groups_for_block(
             block_patterns,
             min_group_size=min_group_size,
@@ -1118,75 +1199,275 @@ def _build_layer_ft_groups(pattern_list, min_group_size, target_group_size, sim_
                     'out_ch': pattern['out_ch'],
                     'in_ch_start': pattern['in_ch_start'],
                     'channel_span': pattern['channel_span'],
+                    'mask_signature': pattern['mask_signature'].hex(),
                     'multiplier': float(member['multiplier']),
                     'similarity': float(member['similarity']),
                     'role': member['role'],
                 })
 
+            member_count = len(normalized_members)
+            covered_ou_count = int(sum(member['channel_span'] for member in normalized_members))
             layer_groups.append({
                 'group_id': group_id,
                 'prototype': {
                     'out_ch': group['prototype']['out_ch'],
                     'in_ch_start': group['prototype']['in_ch_start'],
                     'channel_span': group['prototype']['channel_span'],
+                    'mask_signature': group['prototype']['mask_signature'].hex(),
                     'multiplier': 1.0,
                 },
                 'members': normalized_members,
                 'mask_signature': group['mask_signature'].hex(),
-                'group_size': len(normalized_members),
+                'group_size': member_count,
+                'member_count': member_count,
+                'covered_ou_count': covered_ou_count,
                 'repair_mode': group['repair_mode'],
             })
-            if len(normalized_members) >= min_group_size:
-                repairable_ou_count += len(normalized_members)
+            if member_count >= min_group_size:
+                repairable_block_count += member_count
+                repairable_ou_count += covered_ou_count
+                if group['repair_mode'] == 'exact':
+                    exact_group_count += 1
+                else:
+                    scaled_group_count += 1
+            else:
+                singleton_group_count += 1
             group_id += 1
 
-    return layer_groups, repairable_ou_count
+    total_block_count = len(pattern_list)
+    total_ou_count = int(sum(pattern['channel_span'] for pattern in pattern_list))
+    layer_summary = {
+        'group_count': len(layer_groups),
+        'block_count': total_block_count,
+        'ou_count': total_ou_count,
+        'repairable_block_count': repairable_block_count,
+        'repairable_ou_count': repairable_ou_count,
+        'coverage_ratio': repairable_ou_count / max(total_ou_count, 1),
+        'block_coverage_ratio': repairable_block_count / max(total_block_count, 1),
+        'singleton_group_count': singleton_group_count,
+        'singleton_ratio': singleton_group_count / max(len(layer_groups), 1),
+        'avg_group_size': _mean_or_zero([group['group_size'] for group in layer_groups]),
+        'exact_group_count': exact_group_count,
+        'scaled_group_count': scaled_group_count,
+        'exact_group_ratio': exact_group_count / max(len(layer_groups), 1),
+        'scaled_group_ratio': scaled_group_count / max(len(layer_groups), 1),
+    }
+    return layer_groups, layer_summary
+
+
+def summarize_group_information(group_information, layer_names=None, ft_layer_enabled=None):
+    if not group_information:
+        return {
+            'coverage_ratio': 0.0,
+            'block_coverage_ratio': 0.0,
+            'group_count': 0,
+            'singleton_ratio': 0.0,
+            'avg_group_size': 0.0,
+            'exact_group_proportion': 0.0,
+            'scaled_group_proportion': 0.0,
+            'repairable_ou_count': 0,
+            'total_ou_count': 0,
+            'repairable_block_count': 0,
+            'total_block_count': 0,
+        }
+
+    total_ou_count = 0
+    total_block_count = 0
+    repairable_ou_count = 0
+    repairable_block_count = 0
+    total_groups = 0
+    singleton_groups = 0
+    exact_groups = 0
+    scaled_groups = 0
+    group_sizes = []
+
+    target_layers = layer_names if layer_names is not None else list(group_information.keys())
+    for layer_idx, layer_name in enumerate(target_layers):
+        if ft_layer_enabled is not None and layer_idx < len(ft_layer_enabled) and not ft_layer_enabled[layer_idx]:
+            continue
+        layer_group_info = group_information.get(layer_name)
+        if not layer_group_info:
+            continue
+
+        total_ou_count += int(layer_group_info.get('ou_count', 0))
+        total_block_count += int(layer_group_info.get('block_count', layer_group_info.get('ou_count', 0)))
+        repairable_ou_count += int(layer_group_info.get('repairable_ou_count', 0))
+        repairable_block_count += int(layer_group_info.get('repairable_block_count', 0))
+        layer_groups = layer_group_info.get('groups', [])
+        total_groups += len(layer_groups)
+
+        for group in layer_groups:
+            group_size = int(group.get('group_size', len(group.get('members', []))))
+            group_sizes.append(group_size)
+            if group_size < 2:
+                singleton_groups += 1
+            elif group.get('repair_mode', 'scaled') == 'exact':
+                exact_groups += 1
+            else:
+                scaled_groups += 1
+
+    return {
+        'coverage_ratio': repairable_ou_count / max(total_ou_count, 1),
+        'block_coverage_ratio': repairable_block_count / max(total_block_count, 1),
+        'group_count': total_groups,
+        'singleton_ratio': singleton_groups / max(total_groups, 1),
+        'avg_group_size': _mean_or_zero(group_sizes),
+        'exact_group_proportion': exact_groups / max(total_groups, 1),
+        'scaled_group_proportion': scaled_groups / max(total_groups, 1),
+        'repairable_ou_count': repairable_ou_count,
+        'total_ou_count': total_ou_count,
+        'repairable_block_count': repairable_block_count,
+        'total_block_count': total_block_count,
+    }
 
 
 def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size,
                         channel_number, pattern_value_number, pattern_shape_number,
                         OU_size, target_group_size=4, sim_threshold=0.85):
-    """第一轮FT mask：复用现有shape mask生成方式，并给出分组覆盖估计。"""
-    pattern_mask = get_shape_mask(
-        model=model,
-        weight_name=weight_name,
-        in_channel=in_channel,
-        out_channel=out_channel,
-        kernel_size=kernel_size,
-        channel_number=channel_number,
-        pattern_value_number=pattern_value_number,
-        pattern_shape_number=pattern_shape_number,
-        OU_size=OU_size,
-    )
+    """用FTScore在多个mask候选间搜索最适合冗余组构建的shape/mask。"""
+    try:
+        shape_seed_mask = get_shape_mask(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            kernel_size=kernel_size,
+            channel_number=channel_number,
+            pattern_value_number=pattern_value_number,
+            pattern_shape_number=pattern_shape_number,
+            OU_size=OU_size,
+        )
+    except Exception:
+        shape_seed_mask = torch.ones_like(model.state_dict()[weight_name].detach().cpu())
 
-    pattern_list = extract_ou_patterns(
-        model=model,
-        weight_name=weight_name,
-        in_channel=in_channel,
-        out_channel=out_channel,
-        kernel_size=kernel_size,
-        channel_number=channel_number,
-        mask=pattern_mask,
-    )
-    estimated_groups, repairable_ou_count = _build_layer_ft_groups(
-        pattern_list=pattern_list,
-        min_group_size=2,
-        target_group_size=target_group_size,
-        sim_threshold=sim_threshold,
-        exact_threshold=0.98,
-        scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
-    )
+    raw_weight = model.state_dict()[weight_name].detach().cpu()
+    seed_density = float(shape_seed_mask.sum().item() / max(shape_seed_mask.numel(), 1))
+    keep_ratios = sorted({
+        max(0.15, min(1.0, round(seed_density * 0.75, 4))),
+        max(0.15, min(1.0, round(seed_density, 4))),
+        max(0.15, min(1.0, round(seed_density * 1.2 + 0.02, 4))),
+    })
 
-    estimated_group_size = 0.0
-    if estimated_groups:
-        estimated_group_size = sum(group['group_size'] for group in estimated_groups) / len(estimated_groups)
+    candidate_masks = [('shape_seed', shape_seed_mask)]
+    for keep_ratio in keep_ratios:
+        candidate_masks.append((f'shared_topk_{keep_ratio:.4f}', _build_shared_topk_mask(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            channel_number=channel_number,
+            keep_ratio=keep_ratio,
+        )))
+        candidate_masks.append((f'per_out_topk_{keep_ratio:.4f}', _build_per_out_topk_mask(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            channel_number=channel_number,
+            keep_ratio=keep_ratio,
+        )))
+    candidate_masks.append(('dense_mask', torch.ones_like(raw_weight)))
+
+    valid_candidates = []
+    candidate_summaries = []
+    for strategy_name, candidate_mask in candidate_masks:
+        pattern_list = extract_ou_patterns(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            kernel_size=kernel_size,
+            channel_number=channel_number,
+            mask=candidate_mask,
+        )
+        estimated_groups, estimated_summary = _build_layer_ft_groups(
+            pattern_list=pattern_list,
+            min_group_size=2,
+            target_group_size=target_group_size,
+            sim_threshold=sim_threshold,
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+        )
+
+        member_similarities = []
+        for group in estimated_groups:
+            for member in group.get('members', []):
+                if member.get('role') != 'prototype':
+                    member_similarities.append(float(member.get('similarity', 1.0)))
+
+        pruning_distortion = (raw_weight - raw_weight * candidate_mask).abs().sum().item() / (raw_weight.abs().sum().item() + 1e-8)
+        avg_similarity = _mean_or_zero(member_similarities) if member_similarities else (1.0 if estimated_groups else 0.0)
+        avg_group_size = float(estimated_summary.get('avg_group_size', 0.0))
+        normalized_group_size = min(avg_group_size / max(float(target_group_size), 1.0), 1.0)
+        ft_score = (
+            0.42 * estimated_summary['coverage_ratio']
+            + 0.22 * avg_similarity
+            + 0.18 * normalized_group_size
+            + 0.08 * estimated_summary['exact_group_ratio']
+            - 0.18 * pruning_distortion
+        )
+
+        candidate_summary = {
+            'strategy': strategy_name,
+            'score': float(ft_score),
+            'estimated_coverage': float(estimated_summary['coverage_ratio']),
+            'estimated_block_coverage': float(estimated_summary['block_coverage_ratio']),
+            'estimated_avg_group_size': avg_group_size,
+            'estimated_group_count': int(estimated_summary['group_count']),
+            'estimated_singleton_ratio': float(estimated_summary['singleton_ratio']),
+            'avg_intra_group_similarity': float(avg_similarity),
+            'pruning_distortion': float(pruning_distortion),
+            'selected': False,
+        }
+        candidate_summaries.append(candidate_summary)
+        valid_candidates.append((candidate_summary, candidate_mask))
+
+    fallback_used = False
+    if valid_candidates:
+        best_summary, best_mask = max(
+            valid_candidates,
+            key=lambda item: (
+                item[0]['score'],
+                item[0]['estimated_coverage'],
+                item[0]['avg_intra_group_similarity'],
+                item[0]['estimated_avg_group_size'],
+                1 if item[0]['strategy'] != 'shape_seed' else 0,
+            ),
+        )
+    else:
+        best_summary = {
+            'strategy': 'shape_seed',
+            'score': 0.0,
+            'estimated_coverage': 0.0,
+            'estimated_block_coverage': 0.0,
+            'estimated_avg_group_size': 0.0,
+            'estimated_group_count': 0,
+            'estimated_singleton_ratio': 1.0,
+            'avg_intra_group_similarity': 0.0,
+            'pruning_distortion': 0.0,
+            'selected': True,
+        }
+        best_mask = shape_seed_mask
+        fallback_used = True
+
+    for summary in candidate_summaries:
+        if summary['strategy'] == best_summary['strategy']:
+            summary['selected'] = True
 
     group_seed_info = {
-        'selected_shape_ids': None,
-        'estimated_coverage': repairable_ou_count / max(len(pattern_list), 1),
-        'estimated_avg_group_size': estimated_group_size,
+        'selected_strategy': best_summary['strategy'],
+        'estimated_coverage': best_summary['estimated_coverage'],
+        'estimated_block_coverage': best_summary['estimated_block_coverage'],
+        'estimated_avg_group_size': best_summary['estimated_avg_group_size'],
+        'estimated_group_count': best_summary['estimated_group_count'],
+        'estimated_singleton_ratio': best_summary['estimated_singleton_ratio'],
+        'avg_intra_group_similarity': best_summary['avg_intra_group_similarity'],
+        'pruning_distortion': best_summary['pruning_distortion'],
+        'candidate_count': len(candidate_summaries),
+        'fallback_used': fallback_used,
+        'candidate_summaries': candidate_summaries,
     }
-    return pattern_mask, group_seed_info
+    return best_mask, group_seed_info
 
 
 def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
@@ -1208,7 +1489,7 @@ def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
         mask=mask,
     )
 
-    layer_groups, repairable_ou_count = _build_layer_ft_groups(
+    layer_groups, layer_summary = _build_layer_ft_groups(
         pattern_list=pattern_list,
         min_group_size=min_group_size,
         target_group_size=target_group_size,
@@ -1259,15 +1540,25 @@ def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
                     map_table[target_in][cursor][1] = proto_out
                     write_cursors[target_in] += 1
 
-    coverage_ratio = repairable_ou_count / max(len(pattern_list), 1)
     layer_group_information = {
         'layer_name': weight_name,
-        'group_count': len(layer_groups),
-        'ou_count': len(pattern_list),
-        'coverage_ratio': coverage_ratio,
+        'group_count': layer_summary['group_count'],
+        'block_count': layer_summary['block_count'],
+        'ou_count': layer_summary['ou_count'],
+        'repairable_block_count': layer_summary['repairable_block_count'],
+        'repairable_ou_count': layer_summary['repairable_ou_count'],
+        'coverage_ratio': layer_summary['coverage_ratio'],
+        'block_coverage_ratio': layer_summary['block_coverage_ratio'],
+        'singleton_group_count': layer_summary['singleton_group_count'],
+        'singleton_ratio': layer_summary['singleton_ratio'],
+        'avg_group_size': layer_summary['avg_group_size'],
+        'exact_group_count': layer_summary['exact_group_count'],
+        'scaled_group_count': layer_summary['scaled_group_count'],
+        'exact_group_ratio': layer_summary['exact_group_ratio'],
+        'scaled_group_ratio': layer_summary['scaled_group_ratio'],
         'groups': layer_groups,
     }
-    return map_table, multiple_relationship_table, coverage_ratio, layer_group_information
+    return map_table, multiple_relationship_table, layer_summary['coverage_ratio'], layer_group_information
 
 
 def _get_group_member_entries(layer_group_information):
@@ -1296,18 +1587,22 @@ def _apply_ft_group_projection(model, weight_name, mask, group_information):
                 prototype = group['prototype']
                 proto_out = int(prototype['out_ch'])
                 proto_in = int(prototype['in_ch_start'])
+                proto_span = int(prototype.get('channel_span', 1))
                 proto_multiplier = float(prototype.get('multiplier', 1.0))
-                prototype_value = layer_weight[proto_out][proto_in].clone()
+                prototype_value = _extract_block_tensor(layer_weight, proto_out, proto_in, proto_span)
 
                 for member in group['members']:
                     member_out = int(member['out_ch'])
                     member_in = int(member['in_ch_start'])
+                    member_span = int(member.get('channel_span', 1))
                     member_multiplier = float(member.get('multiplier', 1.0))
+                    if member_span != proto_span:
+                        continue
                     if abs(proto_multiplier) > 1e-8:
                         scale = member_multiplier / proto_multiplier
                     else:
                         scale = 1.0
-                    layer_weight[member_out][member_in] = prototype_value * scale
+                    _assign_block_tensor(layer_weight, member_out, member_in, member_span, prototype_value * scale)
 
 
 def _compute_ft_regularization(model, weight_name, ft_layer_enabled, mask, group_information, device):
@@ -1343,18 +1638,22 @@ def _compute_ft_regularization(model, weight_name, ft_layer_enabled, mask, group
             prototype = group['prototype']
             proto_out = int(prototype['out_ch'])
             proto_in = int(prototype['in_ch_start'])
+            proto_span = int(prototype.get('channel_span', 1))
             prototype_multiplier = float(prototype.get('multiplier', 1.0))
-            prototype_weight = projected[proto_out][proto_in]
+            prototype_weight = _extract_block_tensor(projected, proto_out, proto_in, proto_span)
 
             for member in group['members']:
                 member_out = int(member['out_ch'])
                 member_in = int(member['in_ch_start'])
+                member_span = int(member.get('channel_span', 1))
                 member_multiplier = float(member.get('multiplier', 1.0))
+                if member_span != proto_span:
+                    continue
                 if abs(prototype_multiplier) > 1e-8:
                     scale = member_multiplier / prototype_multiplier
                 else:
                     scale = 1.0
-                member_weight = projected[member_out][member_in]
+                member_weight = _extract_block_tensor(projected, member_out, member_in, member_span)
                 loss_proto = loss_proto + torch.sum(torch.pow(member_weight - prototype_weight * scale, 2))
 
                 proto_vec = prototype_weight.reshape(-1).float()
@@ -1368,8 +1667,18 @@ def _compute_ft_regularization(model, weight_name, ft_layer_enabled, mask, group
     return loss_mask, loss_proto, loss_balance, loss_sep
 
 
+def _refresh_acceptance_score(summary: Dict[str, float]) -> float:
+    normalized_group_size = min(float(summary.get('avg_group_size', 0.0)) / 4.0, 1.0)
+    return (
+        float(summary.get('coverage_ratio', 0.0))
+        + 0.12 * normalized_group_size
+        - 0.15 * float(summary.get('singleton_ratio', 0.0))
+        + 0.05 * float(summary.get('exact_group_proportion', 0.0))
+    )
+
+
 def ft_group_translate_train(model, model_name, translate_name,
-                             weight_name, in_channel, out_channel, kernel_size,
+                             weight_name, in_channel, out_channel, kernel_size, channel_number,
                              ft_layer_enabled, mask, group_information,
                              map_information, multiple_relationship_information,
                              reuse_ratio_information,
@@ -1390,6 +1699,14 @@ def ft_group_translate_train(model, model_name, translate_name,
         group_refresh_epoch = []
     if pattern_value_number is None:
         pattern_value_number = [OU_size] * len(weight_name)
+    if isinstance(target_group_size, list):
+        target_group_size_list = target_group_size
+    else:
+        target_group_size_list = [target_group_size] * len(weight_name)
+    if isinstance(sim_threshold, list):
+        sim_threshold_list = sim_threshold
+    else:
+        sim_threshold_list = [sim_threshold] * len(weight_name)
 
     result_all = pd.DataFrame()
     before_translate_accuracy = [0.0] * len(translate_epoch)
@@ -1407,6 +1724,8 @@ def ft_group_translate_train(model, model_name, translate_name,
     current_iteration = 0
     start_time = time.time()
     checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(translate_epoch[0]) + '_ckpt.pth')
+    refresh_records = []
+    refresh_log_path = 'model_' + model_name + '_' + translate_name + '_refresh_log.csv'
 
     for epoch in range(checkpoint['epoch'], max_epoches):
         if epoch == checkpoint['epoch']:
@@ -1455,23 +1774,94 @@ def ft_group_translate_train(model, model_name, translate_name,
             print('epoch: ' + str(epoch + 1) + '  test_loss: ' + str(test_loss_record[epoch]) + ';  test_accuracy: ' + str(test_accuracy_record[epoch] * 100) + '%')
 
         if (epoch + 1) in group_refresh_epoch:
-            for i in range(0, len(weight_name)):
-                if not ft_layer_enabled[i]:
-                    continue
-                map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = ft_group_cluster_translate(
-                    model=model,
-                    in_channel=in_channel[i],
-                    out_channel=out_channel[i],
-                    weight_name=weight_name[i],
-                    kernel_size=kernel_size[i],
-                    channel_number=1,
-                    mask=mask[weight_name[i]],
-                    min_group_size=min_group_size,
-                    target_group_size=target_group_size,
-                    sim_threshold=sim_threshold,
-                    exact_threshold=exact_threshold,
-                    scale_candidates=scale_candidates,
-                )
+            with torch.no_grad():
+                before_summary = summarize_group_information(group_information, weight_name, ft_layer_enabled)
+                candidate_mask = copy.deepcopy(mask)
+                candidate_group_information = copy.deepcopy(group_information)
+                candidate_map_information = copy.deepcopy(map_information)
+                candidate_multiple_relationship_information = copy.deepcopy(multiple_relationship_information)
+                candidate_reuse_ratio_information = copy.deepcopy(reuse_ratio_information)
+                print('[FT refresh] epoch {} start rebuild'.format(epoch + 1))
+
+                for i in range(0, len(weight_name)):
+                    if not ft_layer_enabled[i]:
+                        continue
+                    print('[FT refresh] epoch {} layer {} seed search'.format(epoch + 1, weight_name[i]))
+                    candidate_mask[weight_name[i]], group_seed_info = ft_group_score_mask(
+                        model=model,
+                        weight_name=weight_name[i],
+                        in_channel=in_channel[i],
+                        out_channel=out_channel[i],
+                        kernel_size=kernel_size[i],
+                        channel_number=channel_number[i],
+                        pattern_value_number=pattern_value_number[i],
+                        pattern_shape_number=pattern_shape_number,
+                        OU_size=OU_size,
+                        target_group_size=target_group_size_list[i],
+                        sim_threshold=sim_threshold_list[i],
+                    )
+                    print('[FT refresh] epoch {} layer {} regroup'.format(epoch + 1, weight_name[i]))
+                    candidate_map_information[weight_name[i]], candidate_multiple_relationship_information[weight_name[i]], candidate_reuse_ratio_information[weight_name[i]], candidate_group_information[weight_name[i]] = ft_group_cluster_translate(
+                        model=model,
+                        in_channel=in_channel[i],
+                        out_channel=out_channel[i],
+                        weight_name=weight_name[i],
+                        kernel_size=kernel_size[i],
+                        channel_number=channel_number[i],
+                        mask=candidate_mask[weight_name[i]],
+                        min_group_size=min_group_size,
+                        target_group_size=target_group_size_list[i],
+                        sim_threshold=sim_threshold_list[i],
+                        exact_threshold=exact_threshold,
+                        scale_candidates=scale_candidates,
+                    )
+                    candidate_group_information[weight_name[i]]['seed_info'] = group_seed_info
+
+                after_summary = summarize_group_information(candidate_group_information, weight_name, ft_layer_enabled)
+                accepted = _refresh_acceptance_score(after_summary) + 1e-8 >= _refresh_acceptance_score(before_summary)
+                if accepted:
+                    mask = candidate_mask
+                    group_information = candidate_group_information
+                    map_information = candidate_map_information
+                    multiple_relationship_information = candidate_multiple_relationship_information
+                    reuse_ratio_information = candidate_reuse_ratio_information
+                else:
+                    print('[FT refresh warning] epoch {} refresh rejected: coverage {:.4f}->{:.4f}, singleton {:.4f}->{:.4f}'.format(
+                        epoch + 1,
+                        before_summary['coverage_ratio'],
+                        after_summary['coverage_ratio'],
+                        before_summary['singleton_ratio'],
+                        after_summary['singleton_ratio'],
+                    ))
+
+                refresh_record = {
+                    'epoch': epoch + 1,
+                    'accepted': int(accepted),
+                    'before_coverage': before_summary['coverage_ratio'],
+                    'after_coverage': after_summary['coverage_ratio'],
+                    'before_block_coverage': before_summary['block_coverage_ratio'],
+                    'after_block_coverage': after_summary['block_coverage_ratio'],
+                    'before_group_count': before_summary['group_count'],
+                    'after_group_count': after_summary['group_count'],
+                    'before_singleton_ratio': before_summary['singleton_ratio'],
+                    'after_singleton_ratio': after_summary['singleton_ratio'],
+                    'before_avg_group_size': before_summary['avg_group_size'],
+                    'after_avg_group_size': after_summary['avg_group_size'],
+                    'before_exact_group_proportion': before_summary['exact_group_proportion'],
+                    'after_exact_group_proportion': after_summary['exact_group_proportion'],
+                }
+                refresh_records.append(refresh_record)
+                pd.DataFrame(refresh_records).to_csv(refresh_log_path, index=False)
+                print('[FT refresh] epoch {} accepted={} coverage {:.4f}->{:.4f} group_count {}->{} singleton {:.4f}->{:.4f}'.format(
+                    epoch + 1,
+                    accepted,
+                    before_summary['coverage_ratio'],
+                    after_summary['coverage_ratio'],
+                    before_summary['group_count'],
+                    after_summary['group_count'],
+                    before_summary['singleton_ratio'],
+                    after_summary['singleton_ratio'],
+                ))
 
         if epoch + 1 in translate_epoch:
             before_translate_accuracy[current_iteration], before_translate_loss[current_iteration] = test(model, device, test_loader)
@@ -1488,6 +1878,12 @@ def ft_group_translate_train(model, model_name, translate_name,
     time_now = time.time() - start_time
     print('Finished Training')
     print('Training complete in {:.0f}m {:.0f}s'.format(time_now // 60, time_now % 60))
+    final_summary = summarize_group_information(group_information, weight_name, ft_layer_enabled)
+    print('Final coverage: {:.4f}'.format(final_summary['coverage_ratio']))
+    print('Final group_count: {}'.format(final_summary['group_count']))
+    print('Final singleton_ratio: {:.4f}'.format(final_summary['singleton_ratio']))
+    print('Final exact_group_proportion: {:.4f}'.format(final_summary['exact_group_proportion']))
+    print('Final scaled_group_proportion: {:.4f}'.format(final_summary['scaled_group_proportion']))
 
     torch.save(model.state_dict(), 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
 
