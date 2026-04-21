@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import torch
 import torch.utils.data
@@ -54,6 +55,29 @@ ft_reg_interval_default = 1
 ft_reg_min_coverage_default = 0.0
 ft_reg_min_groups_default = 1
 ft_low_cost_end_epoch = 160
+ft_cost_presets = {
+    'fast': {
+        'end_epoch': 160,
+        'reg_interval': 10,
+        'reg_min_coverage': 0.1,
+        'reg_min_groups': 64,
+        'refresh_epochs': [156, 160],
+    },
+    'balanced': {
+        'end_epoch': 180,
+        'reg_interval': 5,
+        'reg_min_coverage': 0.05,
+        'reg_min_groups': 32,
+        'refresh_epochs': [160, 170, 180],
+    },
+    'full': {
+        'end_epoch': 200,
+        'reg_interval': 5,
+        'reg_min_coverage': 0.0,
+        'reg_min_groups': 1,
+        'refresh_epochs': [170, 185, 200],
+    },
+}
 
 
 def get_dataloader(data_name):
@@ -85,11 +109,13 @@ def parse_args():
     parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
     parser.add_argument('--build-only', action='store_true', help='only build FT grouping artifacts and projected parameters; skip FT fine-tuning')
     parser.add_argument('--force-rebuild', action='store_true', help='ignore cached FT artifacts and rebuild them from the base checkpoint')
+    parser.add_argument('--ft-cost-preset', type=str, default='none', choices=['none', 'fast', 'balanced', 'full'], help='cost preset for FT training schedule and regularization')
     parser.add_argument('--ft-low-cost', action='store_true', help='use a lower-cost FT training preset with sparse FT regularization and a shorter FT fine-tuning window')
     parser.add_argument('--ft-end-epoch', type=int, default=None, help='final epoch for FT fine-tuning; default keeps 200, ft-low-cost defaults to 160')
     parser.add_argument('--ft-reg-interval', type=int, default=None, help='apply FT regularization every N batches; default 1, ft-low-cost defaults to 10')
     parser.add_argument('--ft-reg-min-coverage', type=float, default=None, help='minimum layer coverage ratio required for FT regularization; default 0.0, ft-low-cost defaults to 0.1')
     parser.add_argument('--ft-reg-min-groups', type=int, default=None, help='minimum repairable group count required for FT regularization on a layer; default 1, ft-low-cost defaults to 64')
+    parser.add_argument('--ft-reg-boost-after-refresh', action='store_true', help='halve the effective FT regularization interval during refresh epochs and the following epoch')
     parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
     parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
     parser.add_argument('--refresh-epochs', type=str, default=','.join(str(epoch) for epoch in ft_group_refresh_epoch), help='comma-separated group refresh epochs; empty disables refresh')
@@ -122,6 +148,89 @@ def normalize_schedule_epochs(epoch_values, checkpoint_epoch, end_epoch, ensure_
     if ensure_final and end_epoch > checkpoint_epoch and end_epoch not in filtered_epochs:
         filtered_epochs.append(end_epoch)
     return filtered_epochs
+
+
+def _flag_present(argv, flag_name):
+    return any(token == flag_name or token.startswith(flag_name + '=') for token in argv)
+
+
+def resolve_ft_training_config(args, argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    refresh_explicit = _flag_present(argv, '--refresh-epochs')
+
+    selected_preset = args.ft_cost_preset
+    if selected_preset == 'none' and args.ft_low_cost:
+        selected_preset = 'fast'
+    preset_config = ft_cost_presets.get(selected_preset, {})
+
+    if args.ft_end_epoch is not None:
+        ft_end_epoch = args.ft_end_epoch
+    elif preset_config:
+        ft_end_epoch = preset_config['end_epoch']
+    else:
+        ft_end_epoch = epoches
+
+    if args.ft_reg_interval is not None:
+        ft_reg_interval = args.ft_reg_interval
+    elif preset_config:
+        ft_reg_interval = preset_config['reg_interval']
+    else:
+        ft_reg_interval = ft_reg_interval_default
+
+    if args.ft_reg_min_coverage is not None:
+        ft_reg_min_coverage = args.ft_reg_min_coverage
+    elif preset_config:
+        ft_reg_min_coverage = preset_config['reg_min_coverage']
+    else:
+        ft_reg_min_coverage = ft_reg_min_coverage_default
+
+    if args.ft_reg_min_groups is not None:
+        ft_reg_min_groups = args.ft_reg_min_groups
+    elif preset_config:
+        ft_reg_min_groups = preset_config['reg_min_groups']
+    else:
+        ft_reg_min_groups = ft_reg_min_groups_default
+
+    if refresh_explicit:
+        refresh_epoch_values = parse_epoch_list(args.refresh_epochs, allow_empty=True)
+    elif preset_config:
+        refresh_epoch_values = list(preset_config['refresh_epochs'])
+    else:
+        refresh_epoch_values = list(ft_group_refresh_epoch)
+
+    if ft_end_epoch <= args.base_checkpoint_epoch:
+        raise ValueError('--ft-end-epoch must be greater than --base-checkpoint-epoch')
+    if ft_reg_interval <= 0:
+        raise ValueError('--ft-reg-interval must be positive')
+    if ft_reg_min_coverage < 0.0 or ft_reg_min_coverage > 1.0:
+        raise ValueError('--ft-reg-min-coverage must be within [0, 1]')
+    if ft_reg_min_groups <= 0:
+        raise ValueError('--ft-reg-min-groups must be positive')
+
+    translate_epoch_values = normalize_schedule_epochs(
+        parse_epoch_list(args.translate_epochs, allow_empty=False),
+        checkpoint_epoch=args.base_checkpoint_epoch,
+        end_epoch=ft_end_epoch,
+        ensure_final=True,
+    )
+    refresh_epoch_values = normalize_schedule_epochs(
+        refresh_epoch_values,
+        checkpoint_epoch=args.base_checkpoint_epoch,
+        end_epoch=ft_end_epoch,
+        ensure_final=bool(preset_config) and not refresh_explicit,
+    )
+
+    return {
+        'selected_preset': selected_preset,
+        'ft_low_cost': args.ft_low_cost,
+        'ft_end_epoch': ft_end_epoch,
+        'ft_reg_interval': ft_reg_interval,
+        'ft_reg_min_coverage': ft_reg_min_coverage,
+        'ft_reg_min_groups': ft_reg_min_groups,
+        'ft_translate_epoch': translate_epoch_values,
+        'ft_group_refresh_epoch': refresh_epoch_values,
+        'ft_reg_boost_after_refresh': args.ft_reg_boost_after_refresh,
+    }
 
 
 def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel,
@@ -262,34 +371,18 @@ if __name__ == '__main__':
     translate_name = args.translate
     build_only = args.build_only
     force_rebuild = args.force_rebuild
-    ft_low_cost = args.ft_low_cost
     base_checkpoint_epoch = args.base_checkpoint_epoch
-    ft_end_epoch = args.ft_end_epoch if args.ft_end_epoch is not None else (min(epoches, ft_low_cost_end_epoch) if ft_low_cost else epoches)
-    ft_reg_interval = args.ft_reg_interval if args.ft_reg_interval is not None else (10 if ft_low_cost else ft_reg_interval_default)
-    ft_reg_min_coverage = args.ft_reg_min_coverage if args.ft_reg_min_coverage is not None else (0.1 if ft_low_cost else ft_reg_min_coverage_default)
-    ft_reg_min_groups = args.ft_reg_min_groups if args.ft_reg_min_groups is not None else (64 if ft_low_cost else ft_reg_min_groups_default)
-    if ft_end_epoch <= base_checkpoint_epoch:
-        raise ValueError('--ft-end-epoch must be greater than --base-checkpoint-epoch')
-    if ft_reg_interval <= 0:
-        raise ValueError('--ft-reg-interval must be positive')
-    if ft_reg_min_coverage < 0.0 or ft_reg_min_coverage > 1.0:
-        raise ValueError('--ft-reg-min-coverage must be within [0, 1]')
-    if ft_reg_min_groups <= 0:
-        raise ValueError('--ft-reg-min-groups must be positive')
-
-    ft_translate_epoch = normalize_schedule_epochs(
-        parse_epoch_list(args.translate_epochs, allow_empty=False),
-        checkpoint_epoch=base_checkpoint_epoch,
-        end_epoch=ft_end_epoch,
-        ensure_final=True,
-    )
-    ft_group_refresh_epoch = normalize_schedule_epochs(
-        parse_epoch_list(args.refresh_epochs, allow_empty=True),
-        checkpoint_epoch=base_checkpoint_epoch,
-        end_epoch=ft_end_epoch,
-        ensure_final=ft_low_cost,
-    )
-    print('[FT schedule] low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={}'.format(
+    ft_config = resolve_ft_training_config(args)
+    ft_low_cost = ft_config['ft_low_cost']
+    ft_end_epoch = ft_config['ft_end_epoch']
+    ft_reg_interval = ft_config['ft_reg_interval']
+    ft_reg_min_coverage = ft_config['ft_reg_min_coverage']
+    ft_reg_min_groups = ft_config['ft_reg_min_groups']
+    ft_translate_epoch = ft_config['ft_translate_epoch']
+    ft_group_refresh_epoch = ft_config['ft_group_refresh_epoch']
+    ft_reg_boost_after_refresh = ft_config['ft_reg_boost_after_refresh']
+    print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={}'.format(
+        ft_config['selected_preset'],
         ft_low_cost,
         ft_end_epoch,
         ft_translate_epoch,
@@ -297,6 +390,7 @@ if __name__ == '__main__':
         ft_reg_interval,
         ft_reg_min_coverage,
         ft_reg_min_groups,
+        ft_reg_boost_after_refresh,
     ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -639,6 +733,7 @@ if __name__ == '__main__':
                 ft_reg_interval=ft_reg_interval,
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
+                ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1004,6 +1099,7 @@ if __name__ == '__main__':
                 ft_reg_interval=ft_reg_interval,
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
+                ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1407,6 +1503,7 @@ if __name__ == '__main__':
                 ft_reg_interval=ft_reg_interval,
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
+                ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1758,6 +1855,7 @@ if __name__ == '__main__':
                 ft_reg_interval=ft_reg_interval,
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
+                ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)

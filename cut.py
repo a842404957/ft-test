@@ -1726,18 +1726,40 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
         'singleton_group_count': 0,
         'skipped_low_coverage_layers': 0,
         'skipped_small_group_layers': 0,
+        'skipped_no_repairable_group_layers': 0,
+        'disabled_layer_count': 0,
     }
+    layer_rows = []
 
     for layer_index, layer_name in enumerate(weight_name):
-        if not ft_layer_enabled[layer_index]:
+        layer_enabled = bool(ft_layer_enabled[layer_index])
+        row = {
+            'layer': layer_name,
+            'ft_layer_enabled': int(layer_enabled),
+            'coverage_ratio': 0.0,
+            'repairable_groups': 0,
+            'member_links': 0,
+            'reg_enabled': 0,
+            'skip_reason': 'disabled_layer',
+        }
+
+        if not layer_enabled:
+            summary['disabled_layer_count'] += 1
+            layer_rows.append(row)
             continue
 
         layer_group_information = group_information.get(layer_name)
         if not layer_group_information:
+            summary['skipped_no_repairable_group_layers'] += 1
+            row['skip_reason'] = 'no_repairable_group'
+            layer_rows.append(row)
             continue
         layer_coverage = float(layer_group_information.get('coverage_ratio', 0.0))
+        row['coverage_ratio'] = layer_coverage
         if layer_coverage < float(min_coverage):
             summary['skipped_low_coverage_layers'] += 1
+            row['skip_reason'] = 'low_coverage'
+            layer_rows.append(row)
             continue
 
         compiled_groups = []
@@ -1777,9 +1799,21 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
                 'members': compiled_members,
             })
 
+        row['repairable_groups'] = len(compiled_groups)
+        row['member_links'] = sum(len(group['members']) for group in compiled_groups)
+
+        if len(compiled_groups) == 0:
+            summary['skipped_no_repairable_group_layers'] += 1
+            summary['singleton_group_count'] += singleton_group_count
+            row['skip_reason'] = 'no_repairable_group'
+            layer_rows.append(row)
+            continue
+
         if len(compiled_groups) < int(min_repairable_groups):
             summary['skipped_small_group_layers'] += 1
             summary['singleton_group_count'] += singleton_group_count
+            row['skip_reason'] = 'small_group_count'
+            layer_rows.append(row)
             continue
 
         compiled_layers[layer_name] = compiled_groups
@@ -1787,11 +1821,35 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
         summary['repairable_group_count'] += len(compiled_groups)
         summary['member_link_count'] += sum(len(group['members']) for group in compiled_groups)
         summary['singleton_group_count'] += singleton_group_count
+        row['reg_enabled'] = 1
+        row['skip_reason'] = 'enabled'
+        layer_rows.append(row)
 
     return {
         'layers': compiled_layers,
         'summary': summary,
+        'layer_rows': layer_rows,
     }
+
+
+def _write_regularization_layers_report(model_name, translate_name, regularization_state):
+    report_path = 'model_' + model_name + '_' + translate_name + '_regularization_layers.csv'
+    pd.DataFrame(regularization_state.get('layer_rows', [])).to_csv(report_path, index=False)
+    return report_path
+
+
+def _write_training_profile(profile_records, profile_path):
+    pd.DataFrame(profile_records).to_csv(profile_path, index=False)
+
+
+def _effective_ft_reg_interval(epoch_number, base_interval, refresh_epochs, boost_after_refresh):
+    if base_interval <= 1 or not boost_after_refresh:
+        return max(int(base_interval), 1)
+
+    refresh_set = set(int(epoch) for epoch in refresh_epochs)
+    if epoch_number in refresh_set or (epoch_number - 1) in refresh_set:
+        return max(1, int(base_interval) // 2)
+    return max(int(base_interval), 1)
 
 
 def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size,
@@ -2226,7 +2284,8 @@ def ft_group_translate_train(model, model_name, translate_name,
                              pattern_shape_number=8, OU_size=8,
                              ft_reg_interval=1,
                              ft_reg_min_coverage=0.0,
-                             ft_reg_min_groups=1):
+                             ft_reg_min_groups=1,
+                             ft_reg_boost_after_refresh=False):
     """最小可运行FT训练器。保持旧训练器不动，新方法单独落盘。"""
     if scale_candidates is None:
         scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -2261,6 +2320,8 @@ def ft_group_translate_train(model, model_name, translate_name,
     checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth')
     refresh_records = []
     refresh_log_path = 'model_' + model_name + '_' + translate_name + '_refresh_log.csv'
+    training_profile_records = []
+    training_profile_path = 'model_' + model_name + '_' + translate_name + '_training_profile.csv'
     regularization_state = _compile_ft_regularization_state(
         weight_name,
         ft_layer_enabled,
@@ -2268,7 +2329,8 @@ def ft_group_translate_train(model, model_name, translate_name,
         min_coverage=ft_reg_min_coverage,
         min_repairable_groups=ft_reg_min_groups,
     )
-    print('[FT regularization] layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={} reg_interval={}'.format(
+    regularization_report_path = _write_regularization_layers_report(model_name, translate_name, regularization_state)
+    print('[FT regularization] layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={} reg_interval={} report={}'.format(
         regularization_state['summary']['layer_count'],
         regularization_state['summary']['repairable_group_count'],
         regularization_state['summary']['member_link_count'],
@@ -2276,9 +2338,29 @@ def ft_group_translate_train(model, model_name, translate_name,
         regularization_state['summary']['skipped_low_coverage_layers'],
         regularization_state['summary']['skipped_small_group_layers'],
         ft_reg_interval,
+        regularization_report_path,
     ))
 
     for epoch in range(checkpoint['epoch'], max_epoches):
+        epoch_start_time = time.time()
+        batch_count = 0
+        reg_batch_count = 0
+        ce_loss_sum = 0.0
+        ft_reg_loss_sum = 0.0
+        mask_loss_sum = 0.0
+        proto_loss_sum = 0.0
+        balance_loss_sum = 0.0
+        sep_loss_sum = 0.0
+        reg_time_sec = 0.0
+        refresh_time_sec = 0.0
+        projection_time_sec = 0.0
+        effective_reg_interval = _effective_ft_reg_interval(
+            epoch_number=epoch + 1,
+            base_interval=ft_reg_interval,
+            refresh_epochs=group_refresh_epoch,
+            boost_after_refresh=ft_reg_boost_after_refresh,
+        )
+
         if epoch == checkpoint['epoch']:
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -2290,12 +2372,15 @@ def ft_group_translate_train(model, model_name, translate_name,
             train_loss = 0.0
 
             for batch_idx, (inputs, targets) in enumerate(train_loader):
+                batch_count += 1
                 inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss_ce = F.cross_entropy(outputs, targets)
-                apply_ft_reg = ((batch_idx % ft_reg_interval) == 0) or ((batch_idx + 1) == len(train_loader))
+                ce_loss_sum += float(loss_ce.item())
+                apply_ft_reg = ((batch_idx % effective_reg_interval) == 0) or ((batch_idx + 1) == len(train_loader))
                 if apply_ft_reg:
+                    reg_start_time = time.time()
                     loss_mask, loss_proto, loss_balance, loss_sep = _compute_ft_regularization(
                         model=model,
                         weight_name=weight_name,
@@ -2305,11 +2390,20 @@ def ft_group_translate_train(model, model_name, translate_name,
                         device=device,
                         regularization_state=regularization_state,
                     )
+                    reg_time_sec += time.time() - reg_start_time
+                    reg_batch_count += 1
                 else:
                     loss_mask = torch.zeros(1, device=device)
                     loss_proto = torch.zeros(1, device=device)
                     loss_balance = torch.zeros(1, device=device)
                     loss_sep = torch.zeros(1, device=device)
+                mask_loss_sum += float(loss_mask.item())
+                proto_loss_sum += float(loss_proto.item())
+                balance_loss_sum += float(loss_balance.item())
+                sep_loss_sum += float(loss_sep.item())
+                ft_reg_loss_sum += float(
+                    (ft_mask_lambda * loss_mask + ft_proto_lambda * loss_proto + ft_balance_lambda * loss_balance + ft_sep_lambda * loss_sep).item()
+                )
                 loss = (
                     loss_ce
                     + ft_mask_lambda * loss_mask
@@ -2326,11 +2420,12 @@ def ft_group_translate_train(model, model_name, translate_name,
                 correct = correct + predicted.eq(targets).sum().item()
 
                 if batch_idx == 0 or (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == len(train_loader):
-                    print('[FT train] epoch {} batch {}/{} reg={} ce={:.4f} mask={:.4f} proto={:.4f} sep={:.4f}'.format(
+                    print('[FT train] epoch {} batch {}/{} reg={} interval={} ce={:.4f} mask={:.4f} proto={:.4f} sep={:.4f}'.format(
                         epoch + 1,
                         batch_idx + 1,
                         len(train_loader),
                         int(apply_ft_reg),
+                        effective_reg_interval,
                         float(loss_ce.item()),
                         float(loss_mask.item()),
                         float(loss_proto.item()),
@@ -2345,6 +2440,7 @@ def ft_group_translate_train(model, model_name, translate_name,
             print('epoch: ' + str(epoch + 1) + '  test_loss: ' + str(test_loss_record[epoch]) + ';  test_accuracy: ' + str(test_accuracy_record[epoch] * 100) + '%')
 
         if (epoch + 1) in group_refresh_epoch:
+            refresh_start_time = time.time()
             with torch.no_grad():
                 before_summary = summarize_group_information(group_information, weight_name, ft_layer_enabled)
                 candidate_mask = copy.deepcopy(mask)
@@ -2403,6 +2499,7 @@ def ft_group_translate_train(model, model_name, translate_name,
                         min_coverage=ft_reg_min_coverage,
                         min_repairable_groups=ft_reg_min_groups,
                     )
+                    _write_regularization_layers_report(model_name, translate_name, regularization_state)
                     print('[FT regularization] epoch {} cache layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={}'.format(
                         epoch + 1,
                         regularization_state['summary']['layer_count'],
@@ -2449,18 +2546,49 @@ def ft_group_translate_train(model, model_name, translate_name,
                     before_summary['singleton_ratio'],
                     after_summary['singleton_ratio'],
                 ))
+            refresh_time_sec += time.time() - refresh_start_time
 
         if epoch + 1 in translate_epoch:
             before_translate_accuracy[current_iteration], before_translate_loss[current_iteration] = test(model, device, test_loader)
             print('Before_translate_accuracy: ' + str(before_translate_accuracy[current_iteration]) + ' Before_translate_loss: ' + str(before_translate_loss[current_iteration]))
+            projection_start_time = time.time()
             _apply_ft_group_projection(model, weight_name, mask, group_information)
+            projection_time_sec += time.time() - projection_start_time
             after_translate_accuracy[current_iteration], after_translate_loss[current_iteration] = test(model, device, test_loader)
             print('After_translate_accuracy: ' + str(after_translate_accuracy[current_iteration]) + ' After_translate_loss: ' + str(after_translate_loss[current_iteration]))
             model_accuracy_difference[current_iteration] = before_translate_accuracy[current_iteration] - after_translate_accuracy[current_iteration]
             print('Model_accuracy_difference: ' + str(model_accuracy_difference[current_iteration]))
             current_iteration = current_iteration + 1
 
+        epoch_time_sec = time.time() - epoch_start_time
+        average_denominator = max(batch_count, 1)
+        training_profile_records.append({
+            'epoch': epoch + 1,
+            'batch_count': batch_count,
+            'reg_batch_count': reg_batch_count,
+            'effective_reg_interval': effective_reg_interval,
+            'active_reg_layers': regularization_state['summary']['layer_count'],
+            'skipped_low_coverage_layers': regularization_state['summary']['skipped_low_coverage_layers'],
+            'skipped_small_group_layers': regularization_state['summary']['skipped_small_group_layers'],
+            'ce_loss_avg': ce_loss_sum / average_denominator,
+            'ft_reg_loss_avg': ft_reg_loss_sum / average_denominator,
+            'mask_loss_avg': mask_loss_sum / average_denominator,
+            'proto_loss_avg': proto_loss_sum / average_denominator,
+            'balance_loss_avg': balance_loss_sum / average_denominator,
+            'sep_loss_avg': sep_loss_sum / average_denominator,
+            'epoch_time_sec': epoch_time_sec,
+            'reg_time_sec': reg_time_sec,
+            'refresh_time_sec': refresh_time_sec,
+            'projection_time_sec': projection_time_sec,
+        })
+        _write_training_profile(training_profile_records, training_profile_path)
+
+    final_projection_start_time = time.time()
     _apply_ft_group_projection(model, weight_name, mask, group_information)
+    final_projection_time_sec = time.time() - final_projection_start_time
+    if training_profile_records:
+        training_profile_records[-1]['projection_time_sec'] = training_profile_records[-1].get('projection_time_sec', 0.0) + final_projection_time_sec
+        _write_training_profile(training_profile_records, training_profile_path)
 
     time_now = time.time() - start_time
     print('Finished Training')

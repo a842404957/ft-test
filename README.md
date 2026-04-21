@@ -1,6 +1,6 @@
-# ft-test V1.3.1
+# ft-test V1.3.3
 
-V1.3.1 是收口版：当前推荐主路径是 `ft_group_cluster_translate`，目标是把 FT-oriented 训练、三级容错仿真、分析和结果收集收成一个稳定、可复现的研究原型。
+V1.3.3 是 low-cost FT profiling 版：当前推荐主路径是 `ft_group_cluster_translate`，目标是把低成本 FT 训练做成可量化、可比较、可调参、可复现的研究原型。
 
 ## 环境前提
 
@@ -47,22 +47,39 @@ FT 主路径现在支持：
 
 - `--build-only`：只构建 FT grouping artifacts 和投影后的 `after_translate_parameters.pth`
 - `--force-rebuild`：忽略已有 FT artifacts 缓存，强制从 `--base-checkpoint-epoch` 对应 checkpoint 重新构建
+- `--ft-cost-preset {none,fast,balanced,full}`：低成本训练 preset
 - `--ft-low-cost`：启用低成本 FT 训练 preset；默认会把 FT 训练终点压到 `160`，并保持至少一次 refresh
 - `--ft-end-epoch`：控制 FT 训练终点；默认 `200`，`--ft-low-cost` 默认 `160`
 - `--ft-reg-interval`：每 N 个 batch 才计算一次 FT 正则；默认 `1`，`--ft-low-cost` 默认 `10`
 - `--ft-reg-min-coverage`：只对 coverage 不低于该阈值的层计算 FT 正则；默认 `0.0`，`--ft-low-cost` 默认 `0.1`
 - `--ft-reg-min-groups`：只对 repairable group 数不少于该阈值的层计算 FT 正则；默认 `1`，`--ft-low-cost` 默认 `64`
+- `--ft-reg-boost-after-refresh`：refresh epoch 和 refresh 后 1 个 epoch 内，把有效正则间隔减半
 - `--translate-epochs`：控制 FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
 - `--refresh-epochs`：控制动态重分组 refresh 节点，默认 `190,200`
 - `--base-checkpoint-epoch`：控制 FT 构建/训练的起始原始 checkpoint，默认 `150`
 
-探索性 FT 训练建议先用低成本模式：
+cost preset 建议：
+
+- `fast`：探索性验证，默认等价于 `--ft-low-cost`
+- `balanced`：适合 `Res18` / `WRN` 的初步真实实验
+- `full`：保留更多正则和 refresh，适合最终实验前复核
+
+探索性 FT 训练建议先用 `fast`：
 
 ```bash
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
   --ft-low-cost
+```
+
+`balanced` 示例：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --ft-cost-preset balanced
 ```
 
 3. 单次三级容错
@@ -115,6 +132,7 @@ python scripts/collect_ft_results.py \
 ## 本地 smoke 与真实实验
 
 - `python scripts/regression_check.py` 是本地 smoke，用 synthetic case 验证 block-aware 提取、parser、simulator、analyse 和 PRAP fallback。
+- `python scripts/regression_check.py` 现在也覆盖 low-cost FT 的 preset、regularization layer report、training profile 和 refresh cache rebuild smoke。
 - `python main.py ...` 之后的训练 / single / compare / analyse / collect 是真实实验闭环。
 - 如果先做探索性实验，建议先执行 `python main.py --model Res18 --translate ft_group_cluster_translate --build-only`，确认 artifacts、仿真和分析链都通，再决定是否跑完整 FT 微调。
 - 若在远端 GPU 上运行，只需要在远端仓库根目录执行同一套命令；`collect` 也应在同一仓库根目录执行。
@@ -174,6 +192,26 @@ results/ft_runs/<model>/<translate>/<tag>/
 - `.../analysis/` 保存 `fault_tolerance_analyse.py` 输出
 - `.../summary.*` 和 `run_metadata.json` 由 `scripts/collect_ft_results.py` 生成
 
+## Low-cost FT 报告
+
+FT 训练现在会额外生成：
+
+- `model_{model}_{translate}_training_profile.csv`
+- `model_{model}_{translate}_regularization_layers.csv`
+
+其中：
+
+- `training_profile.csv` 用来看每个 epoch 的训练代价、正则代价、refresh 代价和 projection 代价
+- `regularization_layers.csv` 用来看哪些层真正参与了 FT 正则，哪些层因为 coverage 太低或 repairable group 太少而被跳过
+
+建议优先查看：
+
+- `reg_batch_count` / `effective_reg_interval`
+- `active_reg_layers`
+- `skipped_low_coverage_layers`
+- `skipped_small_group_layers`
+- `epoch_time_sec` / `reg_time_sec` / `refresh_time_sec`
+
 ## 产物协议
 
 `ft_group_cluster_translate` 主路径会生成以下产物：
@@ -186,6 +224,8 @@ results/ft_runs/<model>/<translate>/<tag>/
 - `model_{model_name}_{translate_name}_reuse_ratio_information.pkl`
 - `model_{model_name}_{translate_name}_after_translate_parameters.pth`
 - `model_{model_name}_{translate_name}_refresh_log.csv`
+- `model_{model_name}_{translate_name}_training_profile.csv`
+- `model_{model_name}_{translate_name}_regularization_layers.csv`
 
 其中：
 
@@ -205,6 +245,36 @@ results/ft_runs/<model>/<translate>/<tag>/
 
 - 旧 PRAP 路径和 `weight_pattern_shape_and_value_similar_translate` 仍保留在代码里，用于兼容旧产物。
 - 新文档、脚本和推荐命令统一以 `ft_group_cluster_translate` 为主路径。
+
+## 推荐命令
+
+1. build-only
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --build-only
+```
+
+2. fast
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --ft-low-cost
+```
+
+3. balanced
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --ft-cost-preset balanced \
+  --ft-reg-boost-after-refresh
+```
 
 ## 相关文档
 

@@ -1,14 +1,22 @@
+import csv
 import json
+import os
 import pickle
 import tempfile
 import unittest
+from argparse import Namespace
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
-from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask
+from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask, ft_group_translate_train
 from fault_tolerance_analyse import analyse
+from main import resolve_ft_training_config
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
 from simulator.Fault_Tolerance.pattern_data_loader import PatternDataLoader
 from simulator.Fault_Tolerance.redundancy_group_parser import RedundancyGroupParser
@@ -24,6 +32,16 @@ class TinyFCModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.fc = nn.Linear(8, 8, bias=False)
+
+
+class TinyTrainModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(4, 2, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x.mean(dim=(2, 3))
 
 
 def _write_pkl(path: Path, payload):
@@ -110,6 +128,101 @@ def _build_prap_fallback_artifacts(temp_dir: Path, model_name: str = 'ToyOld'):
     _write_pkl(temp_dir / f'model_{model_name}_pattern_mask.pkl', mask)
 
 
+@contextmanager
+def _working_directory(path: Path):
+    previous_cwd = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous_cwd)
+
+
+def _read_csv_rows(path: Path):
+    with open(path, 'r', encoding='utf-8') as handle:
+        return list(csv.DictReader(handle))
+
+
+def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_name: str = 'ft_group_cluster_translate',
+                       ft_reg_interval: int = 2, group_refresh_epoch=None, translate_epoch=None,
+                       ft_reg_min_coverage: float = 0.0, ft_reg_min_groups: int = 1,
+                       ft_reg_boost_after_refresh: bool = False):
+    if group_refresh_epoch is None:
+        group_refresh_epoch = [2]
+    if translate_epoch is None:
+        translate_epoch = [3]
+
+    model = TinyTrainModel()
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'lr_schedule': scheduler.state_dict(),
+        'epoch': 0,
+    }
+
+    torch.save(checkpoint, temp_dir / f'model_{model_name}_original_parameter_epoch0_ckpt.pth')
+    _build_ft_group_artifacts(temp_dir, model_name=model_name)
+
+    inputs = torch.randn(8, 4, 4, 4)
+    targets = torch.randint(0, 2, (8,))
+    train_loader = DataLoader(TensorDataset(inputs, targets), batch_size=2, shuffle=False)
+    test_loader = DataLoader(TensorDataset(inputs, targets), batch_size=2, shuffle=False)
+
+    with open(temp_dir / f'model_{model_name}_{translate_name}_group_information.pkl', 'rb') as handle:
+        group_information = pickle.load(handle)
+    with open(temp_dir / f'model_{model_name}_{translate_name}_mask.pkl', 'rb') as handle:
+        mask = pickle.load(handle)
+
+    map_information = {'conv.weight': torch.full((4, 2, 2), -1, dtype=torch.int64)}
+    multiple_relationship_information = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+    reuse_ratio_information = {'conv.weight': 0.5}
+
+    with _working_directory(temp_dir):
+        ft_group_translate_train(
+            model=model,
+            model_name=model_name,
+            translate_name=translate_name,
+            weight_name=['conv.weight'],
+            in_channel=[4],
+            out_channel=[2],
+            kernel_size=[1],
+            channel_number=[2],
+            ft_layer_enabled=[True],
+            mask=mask,
+            group_information=group_information,
+            map_information=map_information,
+            multiple_relationship_information=multiple_relationship_information,
+            reuse_ratio_information=reuse_ratio_information,
+            ft_mask_lambda=1e-3,
+            ft_proto_lambda=1e-3,
+            ft_balance_lambda=1e-4,
+            ft_sep_lambda=5e-5,
+            device='cpu',
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            max_epoches=3,
+            translate_epoch=translate_epoch,
+            checkpoint_epoch=0,
+            group_refresh_epoch=group_refresh_epoch,
+            min_group_size=2,
+            target_group_size=[2],
+            sim_threshold=[0.85],
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            pattern_value_number=[1],
+            pattern_shape_number=8,
+            OU_size=2,
+            ft_reg_interval=ft_reg_interval,
+            ft_reg_min_coverage=ft_reg_min_coverage,
+            ft_reg_min_groups=ft_reg_min_groups,
+            ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+        )
+
+
 class TestFTRegression(unittest.TestCase):
     def test_extract_ou_patterns_respects_block_span(self):
         model = TinyConvModel()
@@ -194,6 +307,88 @@ class TestFTRegression(unittest.TestCase):
         self.assertNotIn('low.weight', state['layers'])
         self.assertEqual(state['summary']['layer_count'], 1)
         self.assertEqual(state['summary']['skipped_low_coverage_layers'], 1)
+
+    def test_cost_preset_resolution_and_override(self):
+        args = Namespace(
+            ft_cost_preset='balanced',
+            ft_low_cost=False,
+            ft_end_epoch=None,
+            ft_reg_interval=None,
+            ft_reg_min_coverage=None,
+            ft_reg_min_groups=None,
+            ft_reg_boost_after_refresh=False,
+            base_checkpoint_epoch=150,
+            translate_epochs='200',
+            refresh_epochs='190,200',
+        )
+        config = resolve_ft_training_config(args, argv=['--ft-cost-preset', 'balanced'])
+        self.assertEqual(config['selected_preset'], 'balanced')
+        self.assertEqual(config['ft_end_epoch'], 180)
+        self.assertEqual(config['ft_reg_interval'], 5)
+        self.assertEqual(config['ft_group_refresh_epoch'], [160, 170, 180])
+
+        args.ft_cost_preset = 'none'
+        args.ft_low_cost = True
+        args.ft_reg_interval = 7
+        config = resolve_ft_training_config(args, argv=['--ft-low-cost', '--ft-reg-interval', '7'])
+        self.assertEqual(config['selected_preset'], 'fast')
+        self.assertEqual(config['ft_reg_interval'], 7)
+        self.assertEqual(config['ft_end_epoch'], 160)
+
+        args.ft_cost_preset = 'fast'
+        args.ft_low_cost = False
+        args.ft_reg_interval = None
+        args.refresh_epochs = '158'
+        config = resolve_ft_training_config(args, argv=['--ft-cost-preset', 'fast', '--refresh-epochs', '158'])
+        self.assertEqual(config['ft_group_refresh_epoch'], [158])
+
+    def test_training_profile_and_regularization_reports_are_written(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _run_tiny_ft_train(temp_dir, ft_reg_interval=2, group_refresh_epoch=[2], translate_epoch=[3])
+
+            profile_path = temp_dir / 'model_ToyTrain_ft_group_cluster_translate_training_profile.csv'
+            report_path = temp_dir / 'model_ToyTrain_ft_group_cluster_translate_regularization_layers.csv'
+            self.assertTrue(profile_path.exists())
+            self.assertTrue(report_path.exists())
+
+            profile_rows = _read_csv_rows(profile_path)
+            report_rows = _read_csv_rows(report_path)
+            self.assertGreaterEqual(len(profile_rows), 3)
+            train_rows = [row for row in profile_rows if int(row['batch_count']) > 0]
+            self.assertTrue(train_rows)
+            self.assertIn('reg_batch_count', train_rows[0])
+            self.assertIn('epoch_time_sec', train_rows[0])
+            self.assertIn('projection_time_sec', train_rows[-1])
+            self.assertLess(int(train_rows[0]['reg_batch_count']), int(train_rows[0]['batch_count']))
+
+            self.assertEqual(len(report_rows), 1)
+            self.assertEqual(report_rows[0]['layer'], 'conv.weight')
+            self.assertIn('skip_reason', report_rows[0])
+            self.assertEqual(report_rows[0]['reg_enabled'], '1')
+
+    def test_refresh_rebuilds_regularization_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            with mock.patch('cut._refresh_acceptance_score', return_value=0.0), \
+                    mock.patch('cut._compile_ft_regularization_state', wraps=_compile_ft_regularization_state) as compile_mock:
+                _run_tiny_ft_train(temp_dir, ft_reg_interval=2, group_refresh_epoch=[2], translate_epoch=[3])
+            self.assertGreaterEqual(compile_mock.call_count, 2)
+
+    def test_reg_boost_after_refresh_increases_reg_batch_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _run_tiny_ft_train(
+                temp_dir,
+                ft_reg_interval=4,
+                group_refresh_epoch=[2],
+                translate_epoch=[3],
+                ft_reg_boost_after_refresh=True,
+            )
+            profile_rows = _read_csv_rows(temp_dir / 'model_ToyTrain_ft_group_cluster_translate_training_profile.csv')
+            by_epoch = {int(row['epoch']): row for row in profile_rows}
+            self.assertEqual(by_epoch[2]['effective_reg_interval'], '2')
+            self.assertEqual(by_epoch[3]['effective_reg_interval'], '2')
 
     def test_group_information_parser_and_level1_scale_are_block_aware(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
