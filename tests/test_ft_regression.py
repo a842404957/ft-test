@@ -146,7 +146,7 @@ def _read_csv_rows(path: Path):
 def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_name: str = 'ft_group_cluster_translate',
                        ft_reg_interval: int = 2, group_refresh_epoch=None, translate_epoch=None,
                        ft_reg_min_coverage: float = 0.0, ft_reg_min_groups: int = 1,
-                       ft_reg_boost_after_refresh: bool = False):
+                       ft_reg_boost_after_refresh: bool = False, output_dir: str = '.'):
     if group_refresh_epoch is None:
         group_refresh_epoch = [2]
     if translate_epoch is None:
@@ -220,6 +220,7 @@ def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_n
             ft_reg_min_coverage=ft_reg_min_coverage,
             ft_reg_min_groups=ft_reg_min_groups,
             ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+            output_dir=output_dir,
         )
 
 
@@ -360,12 +361,70 @@ class TestFTRegression(unittest.TestCase):
             self.assertIn('reg_batch_count', train_rows[0])
             self.assertIn('epoch_time_sec', train_rows[0])
             self.assertIn('projection_time_sec', train_rows[-1])
+            self.assertIn('mask_loss_reg_batch_avg', train_rows[0])
+            self.assertIn('proto_loss_reg_batch_avg', train_rows[0])
+            self.assertIn('sep_loss_reg_batch_avg', train_rows[0])
             self.assertLess(int(train_rows[0]['reg_batch_count']), int(train_rows[0]['batch_count']))
 
             self.assertEqual(len(report_rows), 1)
             self.assertEqual(report_rows[0]['layer'], 'conv.weight')
             self.assertIn('skip_reason', report_rows[0])
             self.assertEqual(report_rows[0]['reg_enabled'], '1')
+            self.assertEqual(report_rows[0]['mask_reg_enabled'], '1')
+            self.assertEqual(report_rows[0]['group_reg_enabled'], '1')
+
+    def test_custom_output_dir_writes_artifacts_and_reports(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            _run_tiny_ft_train(temp_dir, output_dir=str(artifact_dir))
+
+            self.assertTrue((artifact_dir / 'model_ToyTrain_ft_group_cluster_translate_training_profile.csv').exists())
+            self.assertTrue((artifact_dir / 'model_ToyTrain_ft_group_cluster_translate_regularization_layers.csv').exists())
+            self.assertTrue((artifact_dir / 'model_ToyTrain_ft_group_cluster_translate_after_translate_parameters.pth').exists())
+
+    def test_layer_report_distinguishes_mask_and_group_regularization(self):
+        group_information = {
+            'high.weight': {
+                'coverage_ratio': 0.5,
+                'groups': [
+                    {
+                        'group_size': 2,
+                        'prototype': {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0},
+                        'members': [
+                            {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'prototype'},
+                            {'out_ch': 1, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 2.0, 'role': 'member'},
+                        ],
+                    }
+                ],
+            },
+            'low.weight': {
+                'coverage_ratio': 0.01,
+                'groups': [
+                    {
+                        'group_size': 2,
+                        'prototype': {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0},
+                        'members': [
+                            {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'prototype'},
+                            {'out_ch': 1, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'member'},
+                        ],
+                    }
+                ],
+            },
+        }
+        state = _compile_ft_regularization_state(
+            weight_name=['high.weight', 'low.weight'],
+            ft_layer_enabled=[True, True],
+            group_information=group_information,
+            min_coverage=0.1,
+            min_repairable_groups=1,
+        )
+        rows = {row['layer']: row for row in state['layer_rows']}
+        self.assertEqual(rows['high.weight']['mask_reg_enabled'], 1)
+        self.assertEqual(rows['high.weight']['group_reg_enabled'], 1)
+        self.assertEqual(rows['low.weight']['mask_reg_enabled'], 1)
+        self.assertEqual(rows['low.weight']['group_reg_enabled'], 0)
+        self.assertEqual(rows['low.weight']['skip_reason'], 'low_coverage')
 
     def test_refresh_rebuilds_regularization_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:

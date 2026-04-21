@@ -24,6 +24,8 @@ ARTIFACT_SUFFIXES = [
     'reuse_ratio_information.pkl',
     'after_translate_parameters.pth',
     'refresh_log.csv',
+    'training_profile.csv',
+    'regularization_layers.csv',
 ]
 
 
@@ -45,12 +47,28 @@ def build_run_dir(results_root: Path, model: str, translate: str, tag: str) -> P
     return (results_root / model / translate / tag).resolve()
 
 
-def collect_artifact_paths(repo_root: Path, model: str, translate: str):
+def collect_artifact_paths(artifact_dir: Path, model: str, translate: str):
     artifact_paths = {}
     for suffix in ARTIFACT_SUFFIXES:
-        path = repo_root / f'model_{model}_{translate}_{suffix}'
+        path = artifact_dir / f'model_{model}_{translate}_{suffix}'
         artifact_paths[suffix] = str(path.resolve()) if path.exists() else ''
     return artifact_paths
+
+
+def copy_artifacts(artifact_dir: Path, run_dir: Path, model: str, translate: str):
+    copied_paths = {}
+    artifacts_dir = run_dir / 'artifacts'
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in ARTIFACT_SUFFIXES:
+        source = artifact_dir / f'model_{model}_{translate}_{suffix}'
+        if not source.exists():
+            copied_paths[suffix] = ''
+            continue
+        target = artifacts_dir / source.name
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        copied_paths[suffix] = str(target.resolve())
+    return copied_paths
 
 
 def copy_latest_reports(report_dir: Path, run_dir: Path):
@@ -132,8 +150,11 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
             'level1_potential_recovery_ratio',
             'analysis_json',
             'analysis_csv',
+            'training_profile_csv',
+            'regularization_layers_csv',
             'simulation_summary_csv',
             'comparison_summary_csv',
+            'artifact_dir',
             'report_dir',
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -152,8 +173,11 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
             'level1_potential_recovery_ratio': global_stats.get('level1_potential_recovery_ratio', 0.0),
             'analysis_json': metadata['analysis_json'],
             'analysis_csv': metadata['analysis_csv'],
+            'training_profile_csv': metadata['copied_artifact_paths'].get('training_profile.csv', ''),
+            'regularization_layers_csv': metadata['copied_artifact_paths'].get('regularization_layers.csv', ''),
             'simulation_summary_csv': metadata['report_manifest'].get('simulation_summary_csv', ''),
             'comparison_summary_csv': metadata['report_manifest'].get('comparison_summary_csv', ''),
+            'artifact_dir': metadata['artifact_dir'],
             'report_dir': metadata['report_dir'],
         })
 
@@ -171,6 +195,7 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
         '',
         f"- analysis_json: `{metadata['analysis_json']}`",
         f"- analysis_csv: `{metadata['analysis_csv']}`",
+        f"- artifact_dir: `{metadata['artifact_dir']}`",
         f"- group_coverage_ratio: `{global_stats.get('group_coverage_ratio', 0.0):.6f}`",
         f"- exact_repairable_ratio: `{global_stats.get('exact_repairable_ratio', 0.0):.6f}`",
         f"- scaled_repairable_ratio: `{global_stats.get('scaled_repairable_ratio', 0.0):.6f}`",
@@ -190,6 +215,9 @@ def write_summary(run_dir: Path, report: dict, metadata: dict):
     ])
     for name, path in metadata['artifact_paths'].items():
         lines.append(f"- {name}: `{path or 'missing'}`")
+    lines.extend(['', '## Copied Artifacts', ''])
+    for name, path in metadata['copied_artifact_paths'].items():
+        lines.append(f"- {name}: `{path or 'missing'}`")
     lines.extend(['', '## Copied Reports', ''])
     for path in metadata['copied_report_paths']:
         lines.append(f"- `{path}`")
@@ -204,7 +232,8 @@ def main():
     parser.add_argument('--samples', type=int, default=256, help='simulation sample count')
     parser.add_argument('--results-root', default='results/ft_runs', help='root directory; final path is <results-root>/<model>/<translate>/<tag>/')
     parser.add_argument('--tag', default='', help='optional run tag; defaults to timestamp and becomes the last path component')
-    parser.add_argument('--data-dir', default='.', help='artifact directory for fault_tolerance_analyse')
+    parser.add_argument('--data-dir', default='.', help='deprecated alias for artifact directory; kept for compatibility')
+    parser.add_argument('--artifact-dir', default='', help='artifact directory for analysis and artifact collection')
     parser.add_argument('--report-dir', default='', help='optional report output directory override')
     args = parser.parse_args()
 
@@ -213,8 +242,9 @@ def main():
     run_tag = args.tag or timestamp
     run_dir = build_run_dir(Path(args.results_root).resolve() if Path(args.results_root).is_absolute() else (repo_root / args.results_root), args.model, args.translate, run_tag)
     run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = Path(args.artifact_dir or args.data_dir).resolve()
 
-    report = analyse(args.model, args.translate, args.data_dir)
+    report = analyse(args.model, args.translate, str(artifact_dir))
     analysis_dir = run_dir / 'analysis'
     analysis_dir.mkdir(parents=True, exist_ok=True)
     analysis_json = analysis_dir / 'ft_report.json'
@@ -231,7 +261,8 @@ def main():
     report_dir = resolve_report_dir(config_path, args.report_dir)
     copied_report_paths = copy_latest_reports(report_dir, run_dir)
     report_manifest = classify_report_paths(copied_report_paths)
-    artifact_paths = collect_artifact_paths(repo_root, args.model, args.translate)
+    artifact_paths = collect_artifact_paths(artifact_dir, args.model, args.translate)
+    copied_artifact_paths = copy_artifacts(artifact_dir, run_dir, args.model, args.translate)
 
     metadata = {
         'timestamp': timestamp,
@@ -239,9 +270,11 @@ def main():
         'translate': args.translate,
         'config': str(config_path),
         'samples': args.samples,
-        'data_dir': str(Path(args.data_dir).resolve()),
+        'data_dir': str(artifact_dir),
+        'artifact_dir': str(artifact_dir),
         'report_dir': str(report_dir),
         'artifact_paths': artifact_paths,
+        'copied_artifact_paths': copied_artifact_paths,
         'copied_report_paths': copied_report_paths,
         'report_manifest': report_manifest,
         'analysis_json': str(analysis_json.resolve()),

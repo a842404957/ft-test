@@ -26,7 +26,7 @@ from torchvision import transforms, datasets
 DEFAULT_CONFIG_FILE = 'fault_tolerance_config_high_fault_rate.json'
 
 
-def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None):
+def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None, data_dir='.'):
     """加载训练好的模型"""
     # 如果提供了配置文件，尝试从中读取模型名称和类别数
     num_classes = 10  # 默认值
@@ -53,9 +53,9 @@ def load_model(model_name, translate_name='ft_group_cluster_translate', device='
         raise ValueError(f"不支持的模型: {model_name}")
 
     # 加载模型参数
-    model_file = f'model_{model_name}_{translate_name}_after_translate_parameters.pth'
+    model_file = Path(data_dir) / f'model_{model_name}_{translate_name}_after_translate_parameters.pth'
 
-    if not os.path.exists(model_file):
+    if not model_file.exists():
         print(f"❌ 模型文件未找到: {model_file}")
         print("  请先运行 main.py 进行模型训练")
         return None
@@ -211,7 +211,7 @@ def _export_compare_summary(all_results, output_dir):
 def run_simulation_with_config(model, test_loader, config_name, config_overrides=None,
                                 base_config_file=None, num_samples=1000, model_name=None,
                                 translate_name='ft_group_cluster_translate',
-                                report_output_dir=None):
+                                report_output_dir=None, data_dir='.'):
     """运行带有特定配置的仿真"""
     print("=" * 80)
     print(f"🚀 运行仿真配置: {config_name}")
@@ -256,7 +256,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
         model_name=final_model_name,
         translate_name=translate_name,
         config_file=config_file_path,
-        data_dir='./'
+        data_dir=data_dir
     )
     
     # 只清理临时配置文件（不删除用户提供的配置文件）
@@ -272,7 +272,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
     return results
 
 
-def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate', model_name='Vgg16', report_output_dir=None):
+def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate', model_name='Vgg16', report_output_dir=None, data_dir='.'):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -304,7 +304,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             print(f"  ⚠️ 读取模型名称失败: {e}，使用默认值")
 
     # 加载模型和数据（使用配置文件中的模型名称）
-    model = load_model(model_name=model_name_from_config, translate_name=translate_name, device=device, config_file=config_file)
+    model = load_model(model_name=model_name_from_config, translate_name=translate_name, device=device, config_file=config_file, data_dir=data_dir)
     if model is None:
         return
 
@@ -373,6 +373,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             num_samples=num_samples,
             translate_name=translate_name,
             report_output_dir=report_output_dir,
+            data_dir=data_dir,
         )
         
         all_results.append({
@@ -466,6 +467,8 @@ def main():
                        help='转换方法名称')
     parser.add_argument('--output-dir', type=str, default='',
                        help='可选：覆盖仿真报告输出目录；建议同一轮 single/compare 使用同一个目录')
+    parser.add_argument('--artifact-dir', type=str, default='.',
+                       help='artifact 目录；默认当前目录，可指向 results/ft_runs/<model>/<translate>/<tag>/artifacts')
     
     args = parser.parse_args()
     
@@ -477,11 +480,12 @@ def main():
             translate_name=args.translate,
             model_name=args.model,
             report_output_dir=args.output_dir or None,
+            data_dir=args.artifact_dir,
         )
     else:
         # 单次运行
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = load_model(args.model, translate_name=args.translate, device=device, config_file=args.config)
+        model = load_model(args.model, translate_name=args.translate, device=device, config_file=args.config, data_dir=args.artifact_dir)
         if model is None:
             return
 
@@ -512,6 +516,7 @@ def main():
             model_name=model_name,
             translate_name=args.translate,
             report_output_dir=args.output_dir or None,
+            data_dir=args.artifact_dir,
         )
 
 

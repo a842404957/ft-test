@@ -1,6 +1,6 @@
-# ft-test V1.3.3
+# ft-test V1.3.4
 
-V1.3.3 是 low-cost FT profiling 版：当前推荐主路径是 `ft_group_cluster_translate`，目标是把低成本 FT 训练做成可量化、可比较、可调参、可复现的研究原型。
+V1.3.4 是 low-cost FT validation patch：当前推荐主路径是 `ft_group_cluster_translate`，重点是让低成本 FT 训练和实验收集更稳、更可比、更不容易互相覆盖。
 
 ## 环境前提
 
@@ -21,7 +21,7 @@ python scripts/regression_check.py
 2. 训练 / 转换
 
 ```bash
-python main.py --model Vgg16 --translate ft_group_cluster_translate
+python main.py --model Vgg16 --translate ft_group_cluster_translate --run-tag vgg16_demo
 ```
 
 如果只是做快速探索，优先用 build-only：
@@ -30,7 +30,8 @@ python main.py --model Vgg16 --translate ft_group_cluster_translate
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
-  --build-only
+  --build-only \
+  --run-tag res18_build_only
 ```
 
 如果要忽略已有缓存、强制重新构建 artifacts：
@@ -40,13 +41,16 @@ python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
   --build-only \
-  --force-rebuild
+  --force-rebuild \
+  --run-tag res18_build_rebuild
 ```
 
 FT 主路径现在支持：
 
 - `--build-only`：只构建 FT grouping artifacts 和投影后的 `after_translate_parameters.pth`
 - `--force-rebuild`：忽略已有 FT artifacts 缓存，强制从 `--base-checkpoint-epoch` 对应 checkpoint 重新构建
+- `--run-tag`：给本次实验分配独立 tag；若未显式传 `--artifact-dir`，则 artifacts 会写到 `results/ft_runs/<model>/<translate>/<run-tag>/artifacts`
+- `--artifact-dir`：显式指定 artifact 输出目录；适合把 `fast / balanced / full` 分开保存
 - `--ft-cost-preset {none,fast,balanced,full}`：低成本训练 preset
 - `--ft-low-cost`：启用低成本 FT 训练 preset；默认会把 FT 训练终点压到 `160`，并保持至少一次 refresh
 - `--ft-end-epoch`：控制 FT 训练终点；默认 `200`，`--ft-low-cost` 默认 `160`
@@ -63,6 +67,7 @@ cost preset 建议：
 - `fast`：探索性验证，默认等价于 `--ft-low-cost`
 - `balanced`：适合 `Res18` / `WRN` 的初步真实实验
 - `full`：保留更多正则和 refresh，适合最终实验前复核
+- 建议每个 preset 使用不同的 `--run-tag` 或独立 `--artifact-dir`，避免产物互相覆盖
 
 探索性 FT 训练建议先用 `fast`：
 
@@ -70,7 +75,8 @@ cost preset 建议：
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
-  --ft-low-cost
+  --ft-low-cost \
+  --run-tag res18_fast
 ```
 
 `balanced` 示例：
@@ -79,7 +85,8 @@ python main.py \
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
-  --ft-cost-preset balanced
+  --ft-cost-preset balanced \
+  --run-tag res18_balanced
 ```
 
 3. 单次三级容错
@@ -91,6 +98,7 @@ python run_hierarchical_fault_tolerance.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_low_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
 ```
 
@@ -103,6 +111,7 @@ python run_hierarchical_fault_tolerance.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
 ```
 
@@ -112,6 +121,7 @@ python run_hierarchical_fault_tolerance.py \
 python fault_tolerance_analyse.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
+  --data-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-json results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/analysis/ft_report.json \
   --output-csv results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/analysis/ft_layers.csv
 ```
@@ -124,6 +134,7 @@ python scripts/collect_ft_results.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --report-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim \
   --results-root results/ft_runs \
   --tag vgg16_demo
@@ -142,7 +153,7 @@ python scripts/collect_ft_results.py \
 下面给出一个可直接照搬的 `Vgg16` 闭环命令序列。假设本轮实验 tag 是 `vgg16_real`：
 
 ```bash
-python main.py --model Vgg16 --translate ft_group_cluster_translate
+python main.py --model Vgg16 --translate ft_group_cluster_translate --run-tag vgg16_real
 
 python run_hierarchical_fault_tolerance.py \
   --mode single \
@@ -150,6 +161,7 @@ python run_hierarchical_fault_tolerance.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_low_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/sim
 
 python run_hierarchical_fault_tolerance.py \
@@ -158,11 +170,13 @@ python run_hierarchical_fault_tolerance.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/sim
 
 python fault_tolerance_analyse.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
+  --data-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/artifacts \
   --output-json results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/analysis/ft_report.json \
   --output-csv results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/analysis/ft_layers.csv
 
@@ -171,6 +185,7 @@ python scripts/collect_ft_results.py \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
   --samples 256 \
+  --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/artifacts \
   --report-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_real/sim \
   --results-root results/ft_runs \
   --tag vgg16_real
@@ -190,6 +205,7 @@ results/ft_runs/<model>/<translate>/<tag>/
 
 - `.../sim/` 保存 single / compare 的仿真报告
 - `.../analysis/` 保存 `fault_tolerance_analyse.py` 输出
+- `.../artifacts/` 保存 `main.py` 生成的 FT 构组/训练产物
 - `.../summary.*` 和 `run_metadata.json` 由 `scripts/collect_ft_results.py` 生成
 
 ## Low-cost FT 报告
@@ -202,7 +218,9 @@ FT 训练现在会额外生成：
 其中：
 
 - `training_profile.csv` 用来看每个 epoch 的训练代价、正则代价、refresh 代价和 projection 代价
-- `regularization_layers.csv` 用来看哪些层真正参与了 FT 正则，哪些层因为 coverage 太低或 repairable group 太少而被跳过
+- `training_profile.csv` 现在还包含 `*_reg_batch_avg`，可以把“所有 batch 均值”和“只在 reg batch 上的均值”分开看
+- `regularization_layers.csv` 现在会区分 `mask_reg_enabled` 和 `group_reg_enabled`，可以看出哪些层只参与 mask regularization、哪些层真正参与 group regularization
+- `scripts/collect_ft_results.py` 会把 `training_profile.csv` 和 `regularization_layers.csv` 一并复制到 run 目录下的 `artifacts/`
 
 建议优先查看：
 
@@ -254,7 +272,8 @@ FT 训练现在会额外生成：
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
-  --build-only
+  --build-only \
+  --run-tag res18_build_only
 ```
 
 2. fast
@@ -263,7 +282,8 @@ python main.py \
 python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
-  --ft-low-cost
+  --ft-low-cost \
+  --run-tag res18_fast
 ```
 
 3. balanced
@@ -273,10 +293,11 @@ python main.py \
   --model Res18 \
   --translate ft_group_cluster_translate \
   --ft-cost-preset balanced \
+  --run-tag res18_balanced \
   --ft-reg-boost-after-refresh
 ```
 
 ## 相关文档
 
-- 协议说明：[docs/ft_artifact_protocol.md](/Volumes/980PRO/ft-test/docs/ft_artifact_protocol.md)
-- V1.4 预案：[docs/v1_4_algorithm_notes.md](/Volumes/980PRO/ft-test/docs/v1_4_algorithm_notes.md)
+- 协议说明：[docs/ft_artifact_protocol.md](docs/ft_artifact_protocol.md)
+- V1.4 预案：[docs/v1_4_algorithm_notes.md](docs/v1_4_algorithm_notes.md)

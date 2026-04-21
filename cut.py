@@ -2,6 +2,7 @@ import copy
 import math
 import time
 import pickle as pkl
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -10,11 +11,17 @@ import torch.nn.functional as F
 
 
 # 将模型参数以txt形式存储
-def parameters_to_txt(model, model_name, translate_name):
+def _artifact_output_path(output_dir, filename):
+    output_root = Path(output_dir or '.')
+    output_root.mkdir(parents=True, exist_ok=True)
+    return output_root / filename
+
+
+def parameters_to_txt(model, model_name, translate_name, output_dir='.'):
     str_parameters = ''
     for parameters in model.parameters():
         str_parameters = str_parameters + str(parameters) + str('\n')
-    f_parameters = open('parameters_' + model_name + '_' + translate_name + '.txt', 'w', encoding='utf-8')
+    f_parameters = open(_artifact_output_path(output_dir, 'parameters_' + model_name + '_' + translate_name + '.txt'), 'w', encoding='utf-8')
     f_parameters.write(str_parameters)
     f_parameters.close()
 
@@ -1739,6 +1746,8 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
             'coverage_ratio': 0.0,
             'repairable_groups': 0,
             'member_links': 0,
+            'mask_reg_enabled': 0,
+            'group_reg_enabled': 0,
             'reg_enabled': 0,
             'skip_reason': 'disabled_layer',
         }
@@ -1747,6 +1756,8 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
             summary['disabled_layer_count'] += 1
             layer_rows.append(row)
             continue
+
+        row['mask_reg_enabled'] = 1
 
         layer_group_information = group_information.get(layer_name)
         if not layer_group_information:
@@ -1821,6 +1832,7 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
         summary['repairable_group_count'] += len(compiled_groups)
         summary['member_link_count'] += sum(len(group['members']) for group in compiled_groups)
         summary['singleton_group_count'] += singleton_group_count
+        row['group_reg_enabled'] = 1
         row['reg_enabled'] = 1
         row['skip_reason'] = 'enabled'
         layer_rows.append(row)
@@ -1832,10 +1844,10 @@ def _compile_ft_regularization_state(weight_name, ft_layer_enabled, group_inform
     }
 
 
-def _write_regularization_layers_report(model_name, translate_name, regularization_state):
-    report_path = 'model_' + model_name + '_' + translate_name + '_regularization_layers.csv'
+def _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir='.'):
+    report_path = _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_regularization_layers.csv')
     pd.DataFrame(regularization_state.get('layer_rows', [])).to_csv(report_path, index=False)
-    return report_path
+    return str(report_path)
 
 
 def _write_training_profile(profile_records, profile_path):
@@ -2285,7 +2297,8 @@ def ft_group_translate_train(model, model_name, translate_name,
                              ft_reg_interval=1,
                              ft_reg_min_coverage=0.0,
                              ft_reg_min_groups=1,
-                             ft_reg_boost_after_refresh=False):
+                             ft_reg_boost_after_refresh=False,
+                             output_dir='.'):
     """最小可运行FT训练器。保持旧训练器不动，新方法单独落盘。"""
     if scale_candidates is None:
         scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -2319,9 +2332,9 @@ def ft_group_translate_train(model, model_name, translate_name,
     start_time = time.time()
     checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth')
     refresh_records = []
-    refresh_log_path = 'model_' + model_name + '_' + translate_name + '_refresh_log.csv'
+    refresh_log_path = _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_refresh_log.csv')
     training_profile_records = []
-    training_profile_path = 'model_' + model_name + '_' + translate_name + '_training_profile.csv'
+    training_profile_path = _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_training_profile.csv')
     regularization_state = _compile_ft_regularization_state(
         weight_name,
         ft_layer_enabled,
@@ -2329,7 +2342,7 @@ def ft_group_translate_train(model, model_name, translate_name,
         min_coverage=ft_reg_min_coverage,
         min_repairable_groups=ft_reg_min_groups,
     )
-    regularization_report_path = _write_regularization_layers_report(model_name, translate_name, regularization_state)
+    regularization_report_path = _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
     print('[FT regularization] layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={} reg_interval={} report={}'.format(
         regularization_state['summary']['layer_count'],
         regularization_state['summary']['repairable_group_count'],
@@ -2351,6 +2364,11 @@ def ft_group_translate_train(model, model_name, translate_name,
         proto_loss_sum = 0.0
         balance_loss_sum = 0.0
         sep_loss_sum = 0.0
+        reg_batch_mask_loss_sum = 0.0
+        reg_batch_proto_loss_sum = 0.0
+        reg_batch_balance_loss_sum = 0.0
+        reg_batch_sep_loss_sum = 0.0
+        reg_batch_ft_reg_loss_sum = 0.0
         reg_time_sec = 0.0
         refresh_time_sec = 0.0
         projection_time_sec = 0.0
@@ -2401,9 +2419,16 @@ def ft_group_translate_train(model, model_name, translate_name,
                 proto_loss_sum += float(loss_proto.item())
                 balance_loss_sum += float(loss_balance.item())
                 sep_loss_sum += float(loss_sep.item())
-                ft_reg_loss_sum += float(
+                ft_reg_loss_value = float(
                     (ft_mask_lambda * loss_mask + ft_proto_lambda * loss_proto + ft_balance_lambda * loss_balance + ft_sep_lambda * loss_sep).item()
                 )
+                ft_reg_loss_sum += ft_reg_loss_value
+                if apply_ft_reg:
+                    reg_batch_mask_loss_sum += float(loss_mask.item())
+                    reg_batch_proto_loss_sum += float(loss_proto.item())
+                    reg_batch_balance_loss_sum += float(loss_balance.item())
+                    reg_batch_sep_loss_sum += float(loss_sep.item())
+                    reg_batch_ft_reg_loss_sum += ft_reg_loss_value
                 loss = (
                     loss_ce
                     + ft_mask_lambda * loss_mask
@@ -2499,7 +2524,7 @@ def ft_group_translate_train(model, model_name, translate_name,
                         min_coverage=ft_reg_min_coverage,
                         min_repairable_groups=ft_reg_min_groups,
                     )
-                    _write_regularization_layers_report(model_name, translate_name, regularization_state)
+                    _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
                     print('[FT regularization] epoch {} cache layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={}'.format(
                         epoch + 1,
                         regularization_state['summary']['layer_count'],
@@ -2562,6 +2587,7 @@ def ft_group_translate_train(model, model_name, translate_name,
 
         epoch_time_sec = time.time() - epoch_start_time
         average_denominator = max(batch_count, 1)
+        reg_average_denominator = max(reg_batch_count, 1)
         training_profile_records.append({
             'epoch': epoch + 1,
             'batch_count': batch_count,
@@ -2572,10 +2598,15 @@ def ft_group_translate_train(model, model_name, translate_name,
             'skipped_small_group_layers': regularization_state['summary']['skipped_small_group_layers'],
             'ce_loss_avg': ce_loss_sum / average_denominator,
             'ft_reg_loss_avg': ft_reg_loss_sum / average_denominator,
+            'ft_reg_loss_reg_batch_avg': reg_batch_ft_reg_loss_sum / reg_average_denominator,
             'mask_loss_avg': mask_loss_sum / average_denominator,
+            'mask_loss_reg_batch_avg': reg_batch_mask_loss_sum / reg_average_denominator,
             'proto_loss_avg': proto_loss_sum / average_denominator,
+            'proto_loss_reg_batch_avg': reg_batch_proto_loss_sum / reg_average_denominator,
             'balance_loss_avg': balance_loss_sum / average_denominator,
+            'balance_loss_reg_batch_avg': reg_batch_balance_loss_sum / reg_average_denominator,
             'sep_loss_avg': sep_loss_sum / average_denominator,
+            'sep_loss_reg_batch_avg': reg_batch_sep_loss_sum / reg_average_denominator,
             'epoch_time_sec': epoch_time_sec,
             'reg_time_sec': reg_time_sec,
             'refresh_time_sec': refresh_time_sec,
@@ -2600,19 +2631,19 @@ def ft_group_translate_train(model, model_name, translate_name,
     print('Final exact_group_proportion: {:.4f}'.format(final_summary['exact_group_proportion']))
     print('Final scaled_group_proportion: {:.4f}'.format(final_summary['scaled_group_proportion']))
 
-    torch.save(model.state_dict(), 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
+    torch.save(model.state_dict(), _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth'))
 
-    with open('model_' + model_name + '_' + translate_name + '_mask.pkl', 'wb') as f_mask:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_mask.pkl'), 'wb') as f_mask:
         pkl.dump(mask, f_mask, pkl.HIGHEST_PROTOCOL)
-    with open('model_' + model_name + '_' + translate_name + '_map_information.pkl', 'wb') as f_map:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_map_information.pkl'), 'wb') as f_map:
         pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
-    with open('model_' + model_name + '_' + translate_name + '_multiple_relationship_information.pkl', 'wb') as f_mult:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_multiple_relationship_information.pkl'), 'wb') as f_mult:
         pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
-    with open('model_' + model_name + '_' + translate_name + '_coverage_ratio_information.pkl', 'wb') as f_coverage:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_coverage_ratio_information.pkl'), 'wb') as f_coverage:
         pkl.dump(reuse_ratio_information, f_coverage, pkl.HIGHEST_PROTOCOL)
-    with open('model_' + model_name + '_' + translate_name + '_reuse_ratio_information.pkl', 'wb') as f_reuse:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_reuse_ratio_information.pkl'), 'wb') as f_reuse:
         pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
-    with open('model_' + model_name + '_' + translate_name + '_group_information.pkl', 'wb') as f_group:
+    with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_group_information.pkl'), 'wb') as f_group:
         pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
 
     result_all['Before_Translate_Accuracy'] = before_translate_accuracy
@@ -2620,15 +2651,15 @@ def ft_group_translate_train(model, model_name, translate_name,
     result_all['After_Translate_Accuracy'] = after_translate_accuracy
     result_all['After_Translate_Loss'] = after_translate_loss
     result_all['Model_Difference'] = model_accuracy_difference
-    result_all.to_csv('model_' + model_name + '_' + translate_name + '.csv')
+    result_all.to_csv(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '.csv'))
 
     result['Train_Accuracy'] = train_accuracy_record
     result['Train_Loss'] = train_loss_record
     result['Test_Accuracy'] = test_accuracy_record
     result['Test_Loss'] = test_loss_record
-    result.to_csv('model_' + model_name + '_' + translate_name + '_train_info.csv')
+    result.to_csv(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_train_info.csv'))
 
-    parameters_to_txt(model, model_name, translate_name)
+    parameters_to_txt(model, model_name, translate_name, output_dir=output_dir)
 
 
 # 多种模式转化迭代训练

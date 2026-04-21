@@ -107,6 +107,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='FT-oriented grouping training entry')
     parser.add_argument('--model', type=str, default=model_name, choices=['Vgg16', 'Res18', 'Res50', 'WRN'], help='model name')
     parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
+    parser.add_argument('--run-tag', type=str, default='', help='optional run tag; when set without --artifact-dir, artifacts are written to results/ft_runs/<model>/<translate>/<run-tag>/artifacts')
+    parser.add_argument('--artifact-dir', type=str, default='', help='optional artifact directory for FT outputs; overrides the default run-tag-derived artifact location')
     parser.add_argument('--build-only', action='store_true', help='only build FT grouping artifacts and projected parameters; skip FT fine-tuning')
     parser.add_argument('--force-rebuild', action='store_true', help='ignore cached FT artifacts and rebuild them from the base checkpoint')
     parser.add_argument('--ft-cost-preset', type=str, default='none', choices=['none', 'fast', 'balanced', 'full'], help='cost preset for FT training schedule and regularization')
@@ -233,19 +235,31 @@ def resolve_ft_training_config(args, argv=None):
     }
 
 
+def resolve_artifact_dir(args):
+    if args.artifact_dir:
+        artifact_dir = os.path.abspath(args.artifact_dir)
+    elif args.run_tag:
+        artifact_dir = os.path.abspath(os.path.join('results', 'ft_runs', args.model, args.translate, args.run_tag, 'artifacts'))
+    else:
+        artifact_dir = os.path.abspath('.')
+    os.makedirs(artifact_dir, exist_ok=True)
+    return artifact_dir
+
+
 def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel,
                          kernel_size, channel_number, pattern_value_number, mask, map_information,
                          multiple_relationship_information, reuse_ratio_information, ft_layer_enabled,
                          ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold,
-                         checkpoint_epoch, force_rebuild=False):
+                         checkpoint_epoch, force_rebuild=False, artifact_dir='.'):
     group_information = {layer: None for layer in weight_name}
+    os.makedirs(artifact_dir, exist_ok=True)
 
-    mask_file = f'model_{model_name}_{translate_name}_mask.pkl'
-    map_file = f'model_{model_name}_{translate_name}_map_information.pkl'
-    mult_file = f'model_{model_name}_{translate_name}_multiple_relationship_information.pkl'
-    coverage_file = f'model_{model_name}_{translate_name}_coverage_ratio_information.pkl'
-    reuse_file = f'model_{model_name}_{translate_name}_reuse_ratio_information.pkl'
-    group_file = f'model_{model_name}_{translate_name}_group_information.pkl'
+    mask_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_mask.pkl')
+    map_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_map_information.pkl')
+    mult_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_multiple_relationship_information.pkl')
+    coverage_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_coverage_ratio_information.pkl')
+    reuse_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_reuse_ratio_information.pkl')
+    group_file = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_group_information.pkl')
 
     cache_files = [mask_file, map_file, mult_file, group_file]
     need_regenerate = force_rebuild or any(not os.path.exists(file_path) for file_path in cache_files)
@@ -355,14 +369,15 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     return mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information
 
 
-def save_ft_build_only_projection(model, model_name, translate_name, weight_name, mask, group_information, checkpoint_epoch):
+def save_ft_build_only_projection(model, model_name, translate_name, weight_name, mask, group_information, checkpoint_epoch, artifact_dir='.'):
+    os.makedirs(artifact_dir, exist_ok=True)
     checkpoint_path = 'model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth'
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint['model'])
     apply_ft_group_projection(model, weight_name, mask, group_information)
-    torch.save(model.state_dict(), 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
-    parameters_to_txt(model, model_name, translate_name)
-    print('[FT build-only] saved projected parameters from epoch {}'.format(checkpoint_epoch))
+    torch.save(model.state_dict(), os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth'))
+    parameters_to_txt(model, model_name, translate_name, output_dir=artifact_dir)
+    print('[FT build-only] saved projected parameters from epoch {} -> {}'.format(checkpoint_epoch, artifact_dir))
 
 
 if __name__ == '__main__':
@@ -381,7 +396,8 @@ if __name__ == '__main__':
     ft_translate_epoch = ft_config['ft_translate_epoch']
     ft_group_refresh_epoch = ft_config['ft_group_refresh_epoch']
     ft_reg_boost_after_refresh = ft_config['ft_reg_boost_after_refresh']
-    print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={}'.format(
+    artifact_dir = resolve_artifact_dir(args)
+    print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={} artifact_dir={}'.format(
         ft_config['selected_preset'],
         ft_low_cost,
         ft_end_epoch,
@@ -391,6 +407,7 @@ if __name__ == '__main__':
         ft_reg_min_coverage,
         ft_reg_min_groups,
         ft_reg_boost_after_refresh,
+        artifact_dir,
     ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -508,6 +525,7 @@ if __name__ == '__main__':
                 ft_similarity_threshold=ft_similarity_threshold,
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
+                artifact_dir=artifact_dir,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -518,6 +536,7 @@ if __name__ == '__main__':
                     mask=mask,
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
+                    artifact_dir=artifact_dir,
                 )
                 raise SystemExit(0)
 
@@ -734,6 +753,7 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                output_dir=artifact_dir,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -874,6 +894,7 @@ if __name__ == '__main__':
                 ft_similarity_threshold=ft_similarity_threshold,
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
+                artifact_dir=artifact_dir,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -884,6 +905,7 @@ if __name__ == '__main__':
                     mask=mask,
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
+                    artifact_dir=artifact_dir,
                 )
                 raise SystemExit(0)
 
@@ -1100,6 +1122,7 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                output_dir=artifact_dir,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1278,6 +1301,7 @@ if __name__ == '__main__':
                 ft_similarity_threshold=ft_similarity_threshold,
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
+                artifact_dir=artifact_dir,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -1288,6 +1312,7 @@ if __name__ == '__main__':
                     mask=mask,
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
+                    artifact_dir=artifact_dir,
                 )
                 raise SystemExit(0)
 
@@ -1504,6 +1529,7 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                output_dir=artifact_dir,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1630,6 +1656,7 @@ if __name__ == '__main__':
                 ft_similarity_threshold=ft_similarity_threshold,
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
+                artifact_dir=artifact_dir,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -1640,6 +1667,7 @@ if __name__ == '__main__':
                     mask=mask,
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
+                    artifact_dir=artifact_dir,
                 )
                 raise SystemExit(0)
 
@@ -1856,6 +1884,7 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                output_dir=artifact_dir,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
