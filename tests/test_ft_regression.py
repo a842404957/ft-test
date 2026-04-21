@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from cut import extract_ou_patterns
+from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask
 from fault_tolerance_analyse import analyse
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
 from simulator.Fault_Tolerance.pattern_data_loader import PatternDataLoader
@@ -18,6 +18,12 @@ class TinyConvModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv = nn.Conv2d(4, 2, kernel_size=1, bias=False)
+
+
+class TinyFCModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(8, 8, bias=False)
 
 
 def _write_pkl(path: Path, payload):
@@ -125,6 +131,69 @@ class TestFTRegression(unittest.TestCase):
         self.assertEqual({entry['in_ch_start'] for entry in patterns}, {0, 2})
         self.assertEqual({entry['block_kind'] for entry in patterns}, {'conv1x1'})
         self.assertTrue(all(isinstance(entry['mask_signature'], bytes) for entry in patterns))
+
+    def test_ft_score_mask_deduplicates_dense_fc_candidates(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            model.fc.weight.copy_(torch.arange(64, dtype=torch.float32).reshape(8, 8))
+
+        _, seed_info = ft_group_score_mask(
+            model=model,
+            weight_name='fc.weight',
+            in_channel=8,
+            out_channel=8,
+            kernel_size=1,
+            channel_number=8,
+            pattern_value_number=1,
+            pattern_shape_number=8,
+            OU_size=8,
+            target_group_size=4,
+            sim_threshold=0.85,
+        )
+
+        self.assertLess(seed_info['candidate_count'], 6)
+
+    def test_compile_ft_regularization_state_skips_low_value_layers(self):
+        group_information = {
+            'high.weight': {
+                'coverage_ratio': 0.5,
+                'groups': [
+                    {
+                        'group_size': 2,
+                        'prototype': {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0},
+                        'members': [
+                            {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'prototype'},
+                            {'out_ch': 1, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 2.0, 'role': 'member'},
+                        ],
+                    }
+                ],
+            },
+            'low.weight': {
+                'coverage_ratio': 0.01,
+                'groups': [
+                    {
+                        'group_size': 2,
+                        'prototype': {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0},
+                        'members': [
+                            {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'prototype'},
+                            {'out_ch': 1, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0, 'role': 'member'},
+                        ],
+                    }
+                ],
+            },
+        }
+        state = _compile_ft_regularization_state(
+            weight_name=['high.weight', 'low.weight'],
+            ft_layer_enabled=[True, True],
+            group_information=group_information,
+            min_coverage=0.1,
+            min_repairable_groups=1,
+        )
+
+        self.assertIn('high.weight', state['layers'])
+        self.assertNotIn('low.weight', state['layers'])
+        self.assertEqual(state['summary']['layer_count'], 1)
+        self.assertEqual(state['summary']['skipped_low_coverage_layers'], 1)
 
     def test_group_information_parser_and_level1_scale_are_block_aware(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:

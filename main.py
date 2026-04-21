@@ -17,6 +17,8 @@ from cut import (
     pattern_value_similar_translate,
     structure_and_value_identical_translate,
     pattern_shape_and_value_similar_translate,
+    apply_ft_group_projection,
+    parameters_to_txt,
     ft_group_score_mask,
     ft_group_cluster_translate,
     ft_group_translate_train,
@@ -34,18 +36,24 @@ weight_decay_2 = 0.001
 
 OU_size = 8
 pattern_shape_number = 8
+base_checkpoint_epoch = 150
 translate_epoch = [150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200]
+ft_translate_epoch = [200]
 
 ft_min_group_size = 2
 ft_target_group_size_default = 4
 ft_similarity_threshold_default = 0.85
 ft_exact_similarity_threshold = 0.98
 ft_scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
-ft_group_refresh_epoch = [150, 160, 170, 180, 190, 195, 200]
+ft_group_refresh_epoch = [190, 200]
 ft_balance_lambda = 1e-4
 ft_proto_lambda = 1e-3
 ft_mask_lambda = 1e-3
 ft_sep_lambda = 5e-5
+ft_reg_interval_default = 1
+ft_reg_min_coverage_default = 0.0
+ft_reg_min_groups_default = 1
+ft_low_cost_end_epoch = 160
 
 
 def get_dataloader(data_name):
@@ -75,13 +83,52 @@ def parse_args():
     parser = argparse.ArgumentParser(description='FT-oriented grouping training entry')
     parser.add_argument('--model', type=str, default=model_name, choices=['Vgg16', 'Res18', 'Res50', 'WRN'], help='model name')
     parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
+    parser.add_argument('--build-only', action='store_true', help='only build FT grouping artifacts and projected parameters; skip FT fine-tuning')
+    parser.add_argument('--force-rebuild', action='store_true', help='ignore cached FT artifacts and rebuild them from the base checkpoint')
+    parser.add_argument('--ft-low-cost', action='store_true', help='use a lower-cost FT training preset with sparse FT regularization and a shorter FT fine-tuning window')
+    parser.add_argument('--ft-end-epoch', type=int, default=None, help='final epoch for FT fine-tuning; default keeps 200, ft-low-cost defaults to 160')
+    parser.add_argument('--ft-reg-interval', type=int, default=None, help='apply FT regularization every N batches; default 1, ft-low-cost defaults to 10')
+    parser.add_argument('--ft-reg-min-coverage', type=float, default=None, help='minimum layer coverage ratio required for FT regularization; default 0.0, ft-low-cost defaults to 0.1')
+    parser.add_argument('--ft-reg-min-groups', type=int, default=None, help='minimum repairable group count required for FT regularization on a layer; default 1, ft-low-cost defaults to 64')
+    parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
+    parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
+    parser.add_argument('--refresh-epochs', type=str, default=','.join(str(epoch) for epoch in ft_group_refresh_epoch), help='comma-separated group refresh epochs; empty disables refresh')
     return parser.parse_args()
+
+
+def parse_epoch_list(raw_value, allow_empty=False):
+    if raw_value is None:
+        return []
+    normalized = str(raw_value).strip()
+    if normalized == '':
+        if allow_empty:
+            return []
+        raise ValueError('epoch list cannot be empty')
+
+    tokens = [token.strip() for token in normalized.split(',') if token.strip()]
+    if not tokens:
+        if allow_empty:
+            return []
+        raise ValueError('epoch list cannot be empty')
+
+    epoch_values = sorted({int(token) for token in tokens})
+    if not allow_empty and not epoch_values:
+        raise ValueError('epoch list cannot be empty')
+    return epoch_values
+
+
+def normalize_schedule_epochs(epoch_values, checkpoint_epoch, end_epoch, ensure_final=False):
+    filtered_epochs = sorted({epoch for epoch in epoch_values if checkpoint_epoch < epoch <= end_epoch})
+    if ensure_final and end_epoch > checkpoint_epoch and end_epoch not in filtered_epochs:
+        filtered_epochs.append(end_epoch)
+    return filtered_epochs
 
 
 def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel,
                          kernel_size, channel_number, pattern_value_number, mask, map_information,
                          multiple_relationship_information, reuse_ratio_information, ft_layer_enabled,
-                         ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold):
+                         ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold,
+                         checkpoint_epoch, force_rebuild=False):
     group_information = {layer: None for layer in weight_name}
 
     mask_file = f'model_{model_name}_{translate_name}_mask.pkl'
@@ -92,12 +139,14 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     group_file = f'model_{model_name}_{translate_name}_group_information.pkl'
 
     cache_files = [mask_file, map_file, mult_file, group_file]
-    need_regenerate = any(not os.path.exists(file_path) for file_path in cache_files)
+    need_regenerate = force_rebuild or any(not os.path.exists(file_path) for file_path in cache_files)
     if not need_regenerate and not (os.path.exists(coverage_file) or os.path.exists(reuse_file)):
         need_regenerate = True
 
     if need_regenerate:
-        checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(translate_epoch[0]) + '_ckpt.pth')
+        if force_rebuild:
+            print('[FT artifacts] force rebuild enabled; ignoring cached artifacts')
+        checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth')
         model_original.load_state_dict(checkpoint['model'])
 
         for i in range(0, len(weight_name)):
@@ -197,10 +246,58 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     return mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information
 
 
+def save_ft_build_only_projection(model, model_name, translate_name, weight_name, mask, group_information, checkpoint_epoch):
+    checkpoint_path = 'model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth'
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model'])
+    apply_ft_group_projection(model, weight_name, mask, group_information)
+    torch.save(model.state_dict(), 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
+    parameters_to_txt(model, model_name, translate_name)
+    print('[FT build-only] saved projected parameters from epoch {}'.format(checkpoint_epoch))
+
+
 if __name__ == '__main__':
     args = parse_args()
     model_name = args.model
     translate_name = args.translate
+    build_only = args.build_only
+    force_rebuild = args.force_rebuild
+    ft_low_cost = args.ft_low_cost
+    base_checkpoint_epoch = args.base_checkpoint_epoch
+    ft_end_epoch = args.ft_end_epoch if args.ft_end_epoch is not None else (min(epoches, ft_low_cost_end_epoch) if ft_low_cost else epoches)
+    ft_reg_interval = args.ft_reg_interval if args.ft_reg_interval is not None else (10 if ft_low_cost else ft_reg_interval_default)
+    ft_reg_min_coverage = args.ft_reg_min_coverage if args.ft_reg_min_coverage is not None else (0.1 if ft_low_cost else ft_reg_min_coverage_default)
+    ft_reg_min_groups = args.ft_reg_min_groups if args.ft_reg_min_groups is not None else (64 if ft_low_cost else ft_reg_min_groups_default)
+    if ft_end_epoch <= base_checkpoint_epoch:
+        raise ValueError('--ft-end-epoch must be greater than --base-checkpoint-epoch')
+    if ft_reg_interval <= 0:
+        raise ValueError('--ft-reg-interval must be positive')
+    if ft_reg_min_coverage < 0.0 or ft_reg_min_coverage > 1.0:
+        raise ValueError('--ft-reg-min-coverage must be within [0, 1]')
+    if ft_reg_min_groups <= 0:
+        raise ValueError('--ft-reg-min-groups must be positive')
+
+    ft_translate_epoch = normalize_schedule_epochs(
+        parse_epoch_list(args.translate_epochs, allow_empty=False),
+        checkpoint_epoch=base_checkpoint_epoch,
+        end_epoch=ft_end_epoch,
+        ensure_final=True,
+    )
+    ft_group_refresh_epoch = normalize_schedule_epochs(
+        parse_epoch_list(args.refresh_epochs, allow_empty=True),
+        checkpoint_epoch=base_checkpoint_epoch,
+        end_epoch=ft_end_epoch,
+        ensure_final=ft_low_cost,
+    )
+    print('[FT schedule] low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={}'.format(
+        ft_low_cost,
+        ft_end_epoch,
+        ft_translate_epoch,
+        ft_group_refresh_epoch,
+        ft_reg_interval,
+        ft_reg_min_coverage,
+        ft_reg_min_groups,
+    ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
@@ -315,7 +412,20 @@ if __name__ == '__main__':
                 ft_group_target_ratio=ft_group_target_ratio,
                 ft_target_group_size=ft_target_group_size,
                 ft_similarity_threshold=ft_similarity_threshold,
+                checkpoint_epoch=base_checkpoint_epoch,
+                force_rebuild=force_rebuild,
             )
+            if build_only:
+                save_ft_build_only_projection(
+                    model=model_original,
+                    model_name=model_name,
+                    translate_name=translate_name,
+                    weight_name=weight_name,
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=base_checkpoint_epoch,
+                )
+                raise SystemExit(0)
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -514,8 +624,9 @@ if __name__ == '__main__':
                 scheduler=scheduler,
                 train_loader=train_loader,
                 test_loader=test_loader,
-                max_epoches=epoches,
-                translate_epoch=translate_epoch,
+                max_epoches=ft_end_epoch,
+                translate_epoch=ft_translate_epoch,
+                checkpoint_epoch=base_checkpoint_epoch,
                 group_refresh_epoch=ft_group_refresh_epoch,
                 min_group_size=ft_min_group_size,
                 target_group_size=ft_target_group_size,
@@ -525,6 +636,9 @@ if __name__ == '__main__':
                 pattern_value_number=pattern_value_number,
                 pattern_shape_number=pattern_shape_number,
                 OU_size=OU_size,
+                ft_reg_interval=ft_reg_interval,
+                ft_reg_min_coverage=ft_reg_min_coverage,
+                ft_reg_min_groups=ft_reg_min_groups,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -663,7 +777,20 @@ if __name__ == '__main__':
                 ft_group_target_ratio=ft_group_target_ratio,
                 ft_target_group_size=ft_target_group_size,
                 ft_similarity_threshold=ft_similarity_threshold,
+                checkpoint_epoch=base_checkpoint_epoch,
+                force_rebuild=force_rebuild,
             )
+            if build_only:
+                save_ft_build_only_projection(
+                    model=model_original,
+                    model_name=model_name,
+                    translate_name=translate_name,
+                    weight_name=weight_name,
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=base_checkpoint_epoch,
+                )
+                raise SystemExit(0)
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -862,8 +989,9 @@ if __name__ == '__main__':
                 scheduler=scheduler,
                 train_loader=train_loader,
                 test_loader=test_loader,
-                max_epoches=epoches,
-                translate_epoch=translate_epoch,
+                max_epoches=ft_end_epoch,
+                translate_epoch=ft_translate_epoch,
+                checkpoint_epoch=base_checkpoint_epoch,
                 group_refresh_epoch=ft_group_refresh_epoch,
                 min_group_size=ft_min_group_size,
                 target_group_size=ft_target_group_size,
@@ -873,6 +1001,9 @@ if __name__ == '__main__':
                 pattern_value_number=pattern_value_number,
                 pattern_shape_number=pattern_shape_number,
                 OU_size=OU_size,
+                ft_reg_interval=ft_reg_interval,
+                ft_reg_min_coverage=ft_reg_min_coverage,
+                ft_reg_min_groups=ft_reg_min_groups,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1049,7 +1180,20 @@ if __name__ == '__main__':
                 ft_group_target_ratio=ft_group_target_ratio,
                 ft_target_group_size=ft_target_group_size,
                 ft_similarity_threshold=ft_similarity_threshold,
+                checkpoint_epoch=base_checkpoint_epoch,
+                force_rebuild=force_rebuild,
             )
+            if build_only:
+                save_ft_build_only_projection(
+                    model=model_original,
+                    model_name=model_name,
+                    translate_name=translate_name,
+                    weight_name=weight_name,
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=base_checkpoint_epoch,
+                )
+                raise SystemExit(0)
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -1248,8 +1392,9 @@ if __name__ == '__main__':
                 scheduler=scheduler,
                 train_loader=train_loader,
                 test_loader=test_loader,
-                max_epoches=epoches,
-                translate_epoch=translate_epoch,
+                max_epoches=ft_end_epoch,
+                translate_epoch=ft_translate_epoch,
+                checkpoint_epoch=base_checkpoint_epoch,
                 group_refresh_epoch=ft_group_refresh_epoch,
                 min_group_size=ft_min_group_size,
                 target_group_size=ft_target_group_size,
@@ -1259,6 +1404,9 @@ if __name__ == '__main__':
                 pattern_value_number=pattern_value_number,
                 pattern_shape_number=pattern_shape_number,
                 OU_size=OU_size,
+                ft_reg_interval=ft_reg_interval,
+                ft_reg_min_coverage=ft_reg_min_coverage,
+                ft_reg_min_groups=ft_reg_min_groups,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)
@@ -1383,7 +1531,20 @@ if __name__ == '__main__':
                 ft_group_target_ratio=ft_group_target_ratio,
                 ft_target_group_size=ft_target_group_size,
                 ft_similarity_threshold=ft_similarity_threshold,
+                checkpoint_epoch=base_checkpoint_epoch,
+                force_rebuild=force_rebuild,
             )
+            if build_only:
+                save_ft_build_only_projection(
+                    model=model_original,
+                    model_name=model_name,
+                    translate_name=translate_name,
+                    weight_name=weight_name,
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=base_checkpoint_epoch,
+                )
+                raise SystemExit(0)
 
         if 'structure_pruning' in translate_name:
             if not os.path.exists('model_' + model_name + '_structure_mask' + '.pkl'):
@@ -1582,8 +1743,9 @@ if __name__ == '__main__':
                 scheduler=scheduler,
                 train_loader=train_loader,
                 test_loader=test_loader,
-                max_epoches=epoches,
-                translate_epoch=translate_epoch,
+                max_epoches=ft_end_epoch,
+                translate_epoch=ft_translate_epoch,
+                checkpoint_epoch=base_checkpoint_epoch,
                 group_refresh_epoch=ft_group_refresh_epoch,
                 min_group_size=ft_min_group_size,
                 target_group_size=ft_target_group_size,
@@ -1593,6 +1755,9 @@ if __name__ == '__main__':
                 pattern_value_number=pattern_value_number,
                 pattern_shape_number=pattern_shape_number,
                 OU_size=OU_size,
+                ft_reg_interval=ft_reg_interval,
+                ft_reg_min_coverage=ft_reg_min_coverage,
+                ft_reg_min_groups=ft_reg_min_groups,
             )
         else:
             pattern_translate(model_original, model_name, translate_name, weight_name, layer_in_channel, layer_out_channel, kernel_size, best_keep_ratio, mask, map_information, multiple_relationship_information, weight_decay_1, weight_decay_2, device, optimizer, scheduler, train_loader, test_loader, epoches, translate_epoch)

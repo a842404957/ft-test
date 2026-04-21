@@ -2,6 +2,8 @@
 
 `simulator/Fault_Tolerance/` 现在默认服务于 `ft_group_cluster_translate` 主路径，不再把旧 PRAP 路径当作默认示例。
 
+如果当前 shell 不是装好依赖的环境，请把下面的 `python` 替换成 `conda run -n <env> python`。在 `aris-gpu` 上，当前建议使用 `conda run -n ming python`。
+
 ## 模块结构
 
 ```text
@@ -24,6 +26,47 @@ simulator/Fault_Tolerance/
 
 ```bash
 python main.py --model Vgg16 --translate ft_group_cluster_translate
+```
+
+快速探索时，推荐先只构组：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --build-only
+```
+
+若要跳过缓存、强制重建 artifacts：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --build-only \
+  --force-rebuild
+```
+
+可用的 FT 入口参数：
+
+- `--build-only`：只生成 FT artifacts 和投影后的 `after_translate_parameters.pth`
+- `--force-rebuild`：忽略已有 FT artifacts 缓存，强制从 `--base-checkpoint-epoch` 对应 checkpoint 重建
+- `--ft-low-cost`：启用低成本 FT 训练 preset；默认会把 FT 训练终点压到 `160`，并保持至少一次 refresh
+- `--ft-end-epoch`：控制 FT 训练终点；默认 `200`，`--ft-low-cost` 默认 `160`
+- `--ft-reg-interval`：每 N 个 batch 才计算一次 FT 正则；默认 `1`，`--ft-low-cost` 默认 `10`
+- `--ft-reg-min-coverage`：只对 coverage 不低于该阈值的层计算 FT 正则；默认 `0.0`，`--ft-low-cost` 默认 `0.1`
+- `--ft-reg-min-groups`：只对 repairable group 数不少于该阈值的层计算 FT 正则；默认 `1`，`--ft-low-cost` 默认 `64`
+- `--translate-epochs`：FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
+- `--refresh-epochs`：动态 refresh 节点，默认 `190,200`
+- `--base-checkpoint-epoch`：FT 起始原始 checkpoint，默认 `150`
+
+探索性 FT 训练建议先用低成本模式：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --ft-low-cost
 ```
 
 2. 单次三级容错
