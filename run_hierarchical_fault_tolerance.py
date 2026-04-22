@@ -26,20 +26,35 @@ from torchvision import transforms, datasets
 DEFAULT_CONFIG_FILE = 'fault_tolerance_config_high_fault_rate.json'
 
 
-def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None, data_dir='.'):
-    """加载训练好的模型"""
-    # 如果提供了配置文件，尝试从中读取模型名称和类别数
-    num_classes = 10  # 默认值
+def load_model_config(config_file=None):
+    config_model_name = None
+    num_classes = 10
     if config_file and os.path.exists(config_file):
         try:
-            import json
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                model_name = config.get('model', {}).get('name', model_name)
-                num_classes = config.get('model', {}).get('num_classes', 10)
-                print(f"  📄 从配置文件读取: model={model_name}, num_classes={num_classes}")
+            config_model_name = config.get('model', {}).get('name')
+            num_classes = config.get('model', {}).get('num_classes', 10)
         except Exception as e:
             print(f"  ⚠️ 读取配置文件失败: {e}，使用默认参数")
+    return config_model_name, num_classes
+
+
+def resolve_runtime_model_name(cli_model_name, config_file=None):
+    config_model_name, num_classes = load_model_config(config_file)
+    runtime_model_name = cli_model_name or config_model_name or 'Vgg16'
+    if config_model_name:
+        if config_model_name != runtime_model_name:
+            print(f"  ⚠️ 配置文件 model={config_model_name} 与命令行 model={runtime_model_name} 不一致，使用命令行参数")
+        else:
+            print(f"  📄 从配置文件读取: model={config_model_name}, num_classes={num_classes}")
+    return runtime_model_name, num_classes
+
+
+def load_model(model_name, translate_name='ft_group_cluster_translate', device='cuda', config_file=None, data_dir='.', num_classes=None):
+    """加载训练好的模型"""
+    if num_classes is None:
+        model_name, num_classes = resolve_runtime_model_name(model_name, config_file)
 
     if model_name == 'Vgg16':
         model = Vgg16(num_classes=num_classes)
@@ -99,7 +114,7 @@ def load_test_data(batch_size=128, config_file=None):
     return test_loader
 
 
-def _build_runtime_config(base_config_file=None, config_overrides=None, report_output_dir=None):
+def _build_runtime_config(base_config_file=None, config_overrides=None, report_output_dir=None, runtime_model_name=None):
     base_config = {}
     if base_config_file and os.path.exists(base_config_file):
         with open(base_config_file, 'r', encoding='utf-8') as f:
@@ -155,6 +170,10 @@ def _build_runtime_config(base_config_file=None, config_overrides=None, report_o
     if report_output_dir:
         final_config.setdefault('report', {})
         final_config['report']['output_dir'] = report_output_dir
+
+    if runtime_model_name:
+        final_config.setdefault('model', {})
+        final_config['model']['name'] = runtime_model_name
 
     return final_config, base_config
 
@@ -222,6 +241,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
         base_config_file=base_config_file,
         config_overrides=config_overrides,
         report_output_dir=report_output_dir,
+        runtime_model_name=model_name,
     )
 
     # 决定使用哪个配置文件
@@ -292,19 +312,17 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             config_file = None
     
     # 🔧 从配置文件读取模型名称（或使用默认值）
-    model_name_from_config = model_name
-    if config_file:
-        try:
-            import json
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                model_name_from_config = config.get('model', {}).get('name', model_name)
-                print(f"  📄 从配置文件读取模型名称: {model_name_from_config}")
-        except Exception as e:
-            print(f"  ⚠️ 读取模型名称失败: {e}，使用默认值")
+    runtime_model_name, runtime_num_classes = resolve_runtime_model_name(model_name, config_file)
 
     # 加载模型和数据（使用配置文件中的模型名称）
-    model = load_model(model_name=model_name_from_config, translate_name=translate_name, device=device, config_file=config_file, data_dir=data_dir)
+    model = load_model(
+        model_name=runtime_model_name,
+        translate_name=translate_name,
+        device=device,
+        config_file=None,
+        data_dir=data_dir,
+        num_classes=runtime_num_classes,
+    )
     if model is None:
         return
 
@@ -371,6 +389,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             config_overrides=config['overrides'],
             base_config_file=config_file,
             num_samples=num_samples,
+            model_name=runtime_model_name,
             translate_name=translate_name,
             report_output_dir=report_output_dir,
             data_dir=data_dir,
@@ -485,22 +504,22 @@ def main():
     else:
         # 单次运行
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model = load_model(args.model, translate_name=args.translate, device=device, config_file=args.config, data_dir=args.artifact_dir)
+        runtime_model_name, runtime_num_classes = resolve_runtime_model_name(args.model, args.config)
+        model = load_model(
+            runtime_model_name,
+            translate_name=args.translate,
+            device=device,
+            config_file=None,
+            data_dir=args.artifact_dir,
+            num_classes=runtime_num_classes,
+        )
         if model is None:
             return
 
         test_loader = load_test_data(config_file=args.config)
 
         # 从配置文件或参数中获取模型名称
-        import json
-        model_name = args.model
-        if os.path.exists(args.config):
-            try:
-                with open(args.config, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                    model_name = config.get('model', {}).get('name', model_name)
-            except Exception as e:
-                print(f"  ⚠️ 读取配置文件失败: {e}，使用参数模型名称")
+        model_name = runtime_model_name
 
         run_simulation_with_config(
             model=model,

@@ -17,7 +17,9 @@ from torch.utils.data import DataLoader, TensorDataset
 from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask, ft_group_translate_train
 from fault_tolerance_analyse import analyse
 from main import resolve_ft_training_config
+from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
+from simulator.Fault_Tolerance.fault_tolerance_simulation import resolve_excluded_critical_layers
 from simulator.Fault_Tolerance.pattern_data_loader import PatternDataLoader
 from simulator.Fault_Tolerance.redundancy_group_parser import RedundancyGroupParser
 
@@ -342,6 +344,41 @@ class TestFTRegression(unittest.TestCase):
         args.refresh_epochs = '158'
         config = resolve_ft_training_config(args, argv=['--ft-cost-preset', 'fast', '--refresh-epochs', '158'])
         self.assertEqual(config['ft_group_refresh_epoch'], [158])
+
+    def test_runtime_model_name_prefers_cli_over_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {
+                    'name': 'Vgg16',
+                    'num_classes': 10,
+                }
+            }), encoding='utf-8')
+            model_name, num_classes = resolve_runtime_model_name('Res18', str(config_path))
+            self.assertEqual(model_name, 'Res18')
+            self.assertEqual(num_classes, 10)
+
+    def test_runtime_config_uses_runtime_model_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {
+                    'name': 'Vgg16',
+                    'num_classes': 10,
+                }
+            }), encoding='utf-8')
+            runtime_config, _ = _build_runtime_config(
+                base_config_file=str(config_path),
+                runtime_model_name='Res18',
+            )
+            self.assertEqual(runtime_config['model']['name'], 'Res18')
+
+    def test_resolve_excluded_critical_layers_uses_first_and_last(self):
+        layer_names = ['conv1.weight', 'layer1.0.conv1.weight', 'fc.weight']
+        resolved = resolve_excluded_critical_layers(layer_names, ['__first__', '__last__'])
+        self.assertEqual(resolved, ['conv1.weight', 'fc.weight'])
 
     def test_training_profile_and_regularization_reports_are_written(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:

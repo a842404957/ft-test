@@ -26,6 +26,28 @@ from .metrics_collector import MetricsCollector
 from .report_generator import ReportGenerator
 
 
+def resolve_excluded_critical_layers(layer_names: List[str], configured_exclusions=None) -> List[str]:
+    if not layer_names:
+        return []
+
+    if configured_exclusions in (None, '', 'auto'):
+        configured_exclusions = ['__first__', '__last__']
+    elif not isinstance(configured_exclusions, (list, tuple, set)):
+        configured_exclusions = [configured_exclusions]
+
+    resolved_layers = []
+    for item in configured_exclusions:
+        if item in ('__first__', 'first'):
+            candidate = layer_names[0]
+        elif item in ('__last__', 'last'):
+            candidate = layer_names[-1]
+        else:
+            candidate = item
+        if candidate in layer_names and candidate not in resolved_layers:
+            resolved_layers.append(candidate)
+    return resolved_layers
+
+
 class FaultToleranceSimulator:
     """容错仿真器主类"""
     
@@ -426,8 +448,10 @@ class FaultToleranceSimulator:
         layer_names = self.data_loader.get_all_layer_names()
 
         # 🔧 从配置文件读取排除的关键层
-        excluded_layers = fault_config.get('exclude_critical_layers',
-                                            ['conv1.weight', 'fc3.weight'])
+        excluded_layers = resolve_excluded_critical_layers(
+            layer_names,
+            fault_config.get('exclude_critical_layers', ['__first__', '__last__'])
+        )
         target_layers = fault_config.get('target_layers', 'all')
 
         # 初始化详细故障位置记录

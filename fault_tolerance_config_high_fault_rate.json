@@ -10,6 +10,10 @@
       "bit_flip"
     ],
     "target_layers": "all",
+    "exclude_critical_layers": [
+      "__first__",
+      "__last__"
+    ],
     "random_seed": 42,
     "bit_flip_positions": "random"
   },

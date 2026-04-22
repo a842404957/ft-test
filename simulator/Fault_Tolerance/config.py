@@ -21,6 +21,7 @@ class FaultToleranceConfig:
             'fault_rate': 0.01,  # 1% 故障率
             'fault_models': ['bit_flip'],  # 故障模型: bit_flip, output_corruption, stuck_at
             'target_layers': 'all',  # 'all' 或指定层列表
+            'exclude_critical_layers': ['__first__', '__last__'],  # 动态排除首层和末层
             'random_seed': 42,  # 随机种子，用于可重现性
             'bit_flip_positions': 'random',  # 'random' 或 'msb' 或 'lsb'
         },
@@ -193,4 +194,3 @@ if __name__ == "__main__":
     
     # 保存示例配置
     config.save_to_file('fault_tolerance_config_example.json')
-

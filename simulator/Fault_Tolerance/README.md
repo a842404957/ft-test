@@ -151,6 +151,8 @@ FT 主路径优先读取：
 - `group_information.pkl` 是主协议，记录显式 block-aware groups
 - `coverage_ratio_information.pkl` 是正式统计命名
 - `reuse_ratio_information.pkl` 只作为兼容别名保留
+- `fault_tolerance_config_*.json` 默认使用 `exclude_critical_layers = ["__first__", "__last__"]`，会按当前模型的层顺序自动跳过首层和末层
+- `run_hierarchical_fault_tolerance.py` 里命令行 `--model` 优先于配置文件中的 `model.name`
 
 ## 当前行为
 

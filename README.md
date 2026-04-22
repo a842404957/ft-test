@@ -259,6 +259,12 @@ FT 训练现在会额外生成：
 - `fault_tolerance_config_low_fault_rate.json`
 - `fault_tolerance_config_high_fault_rate.json`
 
+这两个配置现在默认使用：
+
+- `exclude_critical_layers = ["__first__", "__last__"]`
+- 也就是按当前 artifact 中的层顺序，自动跳过首层和末层做故障注入/容错
+- `run_hierarchical_fault_tolerance.py` 中命令行 `--model` 优先于配置文件里的 `model.name`
+
 ## 兼容说明
 
 - 旧 PRAP 路径和 `weight_pattern_shape_and_value_similar_translate` 仍保留在代码里，用于兼容旧产物。
