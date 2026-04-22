@@ -178,6 +178,27 @@ def _build_runtime_config(base_config_file=None, config_overrides=None, report_o
     return final_config, base_config
 
 
+def resolve_levels_overrides(levels: str):
+    normalized = (levels or 'all').strip().lower()
+    if normalized == 'level1':
+        return {
+            'level1.enabled': True,
+            'level2.enabled': False,
+            'level3.enabled': False,
+        }
+    if normalized in ('level1_level2', 'level1+level2'):
+        return {
+            'level1.enabled': True,
+            'level2.enabled': True,
+            'level3.enabled': False,
+        }
+    return {
+        'level1.enabled': True,
+        'level2.enabled': True,
+        'level3.enabled': True,
+    }
+
+
 def _export_compare_summary(all_results, output_dir):
     if not output_dir:
         return []
@@ -191,6 +212,7 @@ def _export_compare_summary(all_results, output_dir):
         reliability = metrics.get('reliability', {})
         accuracy = metrics.get('accuracy', {})
         hierarchical = reliability.get('hierarchical_correction', {})
+        repair_quality = reliability.get('repair_quality', {})
         summary_rows.append({
             'strategy': item['name'],
             'fault_correction_rate': reliability.get('fault_correction_rate', 0.0),
@@ -199,6 +221,10 @@ def _export_compare_summary(all_results, output_dir):
             'level1_corrections': hierarchical.get('level1_corrections', 0),
             'level2_corrections': hierarchical.get('level2_corrections', 0),
             'level3_corrections': hierarchical.get('level3_corrections', 0),
+            'level1_zero_scale_failed': hierarchical.get('level1_zero_scale_failed', 0),
+            'repair_mode': hierarchical.get('repair_mode', 'normal'),
+            'level1_improved_rate': repair_quality.get('level1', {}).get('improved_rate', 0.0),
+            'level2_improved_rate': repair_quality.get('level2', {}).get('improved_rate', 0.0),
         })
 
     json_path = output_path / 'comparison_summary.json'
@@ -215,13 +241,14 @@ def _export_compare_summary(all_results, output_dir):
 
     with open(md_path, 'w', encoding='utf-8') as handle:
         handle.write('# Comparison Summary\n\n')
-        handle.write('| strategy | fault_correction_rate | ft_accuracy | accuracy_recovery_rate | level1 | level2 | level3 |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| strategy | fault_correction_rate | ft_accuracy | accuracy_recovery_rate | level1 | level2 | level3 | zero_scale_failed | repair_mode | level1_improved_rate | level2_improved_rate |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in summary_rows:
             handle.write(
                 '| {strategy} | {fault_correction_rate:.6f} | {ft_accuracy:.6f} | '
                 '{accuracy_recovery_rate:.6f} | {level1_corrections} | '
-                '{level2_corrections} | {level3_corrections} |\n'.format(**row)
+                '{level2_corrections} | {level3_corrections} | {level1_zero_scale_failed} | '
+                '{repair_mode} | {level1_improved_rate:.6f} | {level2_improved_rate:.6f} |\n'.format(**row)
             )
 
     return [str(json_path), str(csv_path), str(md_path)]
@@ -292,7 +319,9 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
     return results
 
 
-def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate', model_name='Vgg16', report_output_dir=None, data_dir='.'):
+def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate',
+                       model_name='Vgg16', report_output_dir=None, data_dir='.',
+                       repair_mode='normal', levels='all'):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -329,32 +358,33 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
     test_loader = load_test_data(config_file=config_file)
     
     # 定义不同的测试配置
-    test_configs = [
-        {
-            'name': '仅Level 1 (冗余组)',
-            'overrides': {
-                'level1.enabled': True,
-                'level2.enabled': False,
-                'level3.enabled': False,
-            }
-        },
-        {
-            'name': 'Level 1 + Level 2 (冗余组 + 相似模式)',
-            'overrides': {
-                'level1.enabled': True,
-                'level2.enabled': True,
-                'level3.enabled': False,
-            }
-        },
-        {
-            'name': 'Level 1 + Level 2 + Level 3 (完整三级容错)',
-            'overrides': {
-                'level1.enabled': True,
-                'level2.enabled': True,
-                'level3.enabled': True,
-            }
-        },
-    ]
+    level1_only = {
+        'name': '仅Level 1 (冗余组)',
+        'overrides': {
+            'repair_mode': repair_mode,
+            **resolve_levels_overrides('level1'),
+        }
+    }
+    level1_level2 = {
+        'name': 'Level 1 + Level 2 (冗余组 + 相似模式)',
+        'overrides': {
+            'repair_mode': repair_mode,
+            **resolve_levels_overrides('level1_level2'),
+        }
+    }
+    all_levels = {
+        'name': 'Level 1 + Level 2 + Level 3 (完整三级容错)',
+        'overrides': {
+            'repair_mode': repair_mode,
+            **resolve_levels_overrides('all'),
+        }
+    }
+    if levels == 'level1':
+        test_configs = [level1_only]
+    elif levels == 'level1_level2':
+        test_configs = [level1_level2]
+    else:
+        test_configs = [level1_only, level1_level2, all_levels]
     
     # 存储结果
     all_results = []
@@ -484,6 +514,12 @@ def main():
                        help='配置文件路径 (JSON格式)')
     parser.add_argument('--translate', type=str, default='ft_group_cluster_translate',
                        help='转换方法名称')
+    parser.add_argument('--repair-mode', type=str, default='normal',
+                       choices=['normal', 'oracle'],
+                       help='修复模式: normal(当前FT/PRAP路径) 或 oracle(直接恢复为原始权重)')
+    parser.add_argument('--levels', type=str, default='all',
+                       choices=['level1', 'level1_level2', 'all'],
+                       help='单次仿真或裁剪后的 compare 级别选择')
     parser.add_argument('--output-dir', type=str, default='',
                        help='可选：覆盖仿真报告输出目录；建议同一轮 single/compare 使用同一个目录')
     parser.add_argument('--artifact-dir', type=str, default='.',
@@ -498,6 +534,8 @@ def main():
             num_samples=args.samples,
             translate_name=args.translate,
             model_name=args.model,
+            repair_mode=args.repair_mode,
+            levels=args.levels,
             report_output_dir=args.output_dir or None,
             data_dir=args.artifact_dir,
         )
@@ -524,11 +562,10 @@ def main():
         run_simulation_with_config(
             model=model,
             test_loader=test_loader,
-            config_name='完整三级容错',
+            config_name='单次容错实验',
             config_overrides={
-                'level1.enabled': True,
-                'level2.enabled': True,
-                'level3.enabled': True,
+                'repair_mode': args.repair_mode,
+                **resolve_levels_overrides(args.levels),
             },
             base_config_file=args.config,
             num_samples=args.samples,

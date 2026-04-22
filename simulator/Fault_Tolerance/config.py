@@ -7,6 +7,7 @@
 
 import json
 import os
+import copy
 from typing import Dict, Any
 
 
@@ -24,6 +25,7 @@ class FaultToleranceConfig:
             'exclude_critical_layers': ['__first__', '__last__'],  # 动态排除首层和末层
             'random_seed': 42,  # 随机种子，用于可重现性
             'bit_flip_positions': 'random',  # 'random' 或 'msb' 或 'lsb'
+            'bit_flip_ratio': 0.25,
         },
         
         # 多数表决器配置
@@ -39,6 +41,7 @@ class FaultToleranceConfig:
         # 三级容错策略配置
         'hierarchical_fault_tolerance': {
             'enabled': True,  # 启用分层容错
+            'repair_mode': 'normal',  # normal, oracle
             'level1': {
                 'name': 'redundancy_group',
                 'enabled': True,
@@ -116,7 +119,7 @@ class FaultToleranceConfig:
         Args:
             config_file: 配置文件路径（可选）
         """
-        self.config = self.DEFAULT_CONFIG.copy()
+        self.config = copy.deepcopy(self.DEFAULT_CONFIG)
         
         # 如果提供了配置文件，加载并合并
         if config_file and os.path.exists(config_file):

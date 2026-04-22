@@ -1,6 +1,11 @@
-# FT-Oriented Fault Tolerance V1.3.4
+# FT-Oriented Fault Tolerance V1.3.6
 
-`simulator/Fault_Tolerance/` 现在默认服务于 `ft_group_cluster_translate` 主路径，不再把旧 PRAP 路径当作默认示例。
+`simulator/Fault_Tolerance/` 当前对应 V1.3.6：重点不再只是“三级容错能跑”，而是要验证两件事：
+
+- 修复机制是否真的有效，而不是只看 correction count
+- 当前 FT 剪枝 / grouping 是否真的提高了 OU 冗余度
+
+当前推荐主路径仍是 `ft_group_cluster_translate`，旧 PRAP 产物只保留为 fallback 和对照统计。
 
 如果当前 shell 不是装好依赖的环境，请把下面的 `python` 替换成 `conda run -n <env> python`。在 `aris-gpu` 上，当前建议使用 `conda run -n ming python`。
 
@@ -63,6 +68,12 @@ python main.py \
 - `--translate-epochs`：FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
 - `--refresh-epochs`：动态 refresh 节点，默认 `190,200`
 - `--base-checkpoint-epoch`：FT 起始原始 checkpoint，默认 `150`
+- `--ft-mask-density-sweep`：显式比较不同剪枝强度的 mask 候选
+- `--ft-mask-keep-ratios`：手动给出 keep ratio sweep，例如 `1.0,0.8889,0.6667,0.4444,0.2222`
+- `--ft-target-coverage`：优先满足 repairable coverage 的最小失真 mask
+- `--ft-prefer-sparser-mask`：候选接近时偏向更稀疏的 mask
+- `--ft-score-singleton-penalty`：FTScore_v2 对 singleton ratio 的惩罚
+- `--ft-score-zero-scale-penalty`：FTScore_v2 对 zero multiplier ratio 的惩罚
 
 探索性 FT 训练建议先用低成本模式：
 
@@ -82,6 +93,8 @@ python run_hierarchical_fault_tolerance.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_low_fault_rate.json \
+  --repair-mode normal \
+  --levels all \
   --samples 256 \
   --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
@@ -95,6 +108,8 @@ python run_hierarchical_fault_tolerance.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
+  --repair-mode normal \
+  --levels all \
   --samples 256 \
   --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
@@ -111,7 +126,18 @@ python fault_tolerance_analyse.py \
   --output-csv results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/analysis/ft_layers.csv
 ```
 
-5. 结果收集
+5. 冗余构建诊断 / PRAP 对照
+
+```bash
+python scripts/analyse_redundancy_construction.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --data-dir results/ft_runs/Res18/ft_group_cluster_translate/res18_fast/artifacts \
+  --output-dir results/ft_runs/Res18/ft_group_cluster_translate/res18_fast/analysis \
+  --prap-translate weight_pattern_shape_and_value_similar_translate
+```
+
+6. 结果收集
 
 ```bash
 python scripts/collect_ft_results.py \
@@ -159,6 +185,8 @@ FT 主路径优先读取：
 - `PatternDataLoader` 优先读取 `group_information.pkl` 和 `coverage_ratio_information.pkl`
 - `RedundancyGroupParser` 优先按显式 group 解析
 - `FaultToleranceSimulator` 的 Level 1 已按 block-aware 成员做替换
+- `FaultToleranceSimulator` 现在支持 `--repair-mode oracle`，用于确认 fault injection / restore 链路本身是否可信
+- `run_hierarchical_fault_tolerance.py` 现在支持 `--levels {level1,level1_level2,all}`，便于直接跑 Level 1-only 或 Level1+2
 - `fault_tolerance_analyse.py`、`run_hierarchical_fault_tolerance.py` 和 `scripts/collect_ft_results.py` 现在都支持指向独立 artifact 目录
 
 ## 兼容说明

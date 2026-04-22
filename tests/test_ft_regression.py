@@ -17,9 +17,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask, ft_group_translate_train
 from fault_tolerance_analyse import analyse
 from main import resolve_ft_training_config
-from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name
+from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
+from scripts.analyse_redundancy_construction import build_redundancy_construction_report
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
 from simulator.Fault_Tolerance.fault_tolerance_simulation import resolve_excluded_critical_layers
+from simulator.Fault_Tolerance.config import FaultToleranceConfig
 from simulator.Fault_Tolerance.pattern_data_loader import PatternDataLoader
 from simulator.Fault_Tolerance.redundancy_group_parser import RedundancyGroupParser
 
@@ -128,6 +130,72 @@ def _build_prap_fallback_artifacts(temp_dir: Path, model_name: str = 'ToyOld'):
     _write_pkl(temp_dir / f'model_{model_name}_shape_and_value_multiple_relationship_information.pkl', multiple_relationship)
     _write_pkl(temp_dir / f'model_{model_name}_shape_and_value_reuse_ratio_information.pkl', reuse_ratio)
     _write_pkl(temp_dir / f'model_{model_name}_pattern_mask.pkl', mask)
+
+
+def _build_zero_scale_ft_artifacts(temp_dir: Path, model_name: str = 'ToyZero'):
+    mask = {'conv.weight': torch.ones((2, 2, 1, 1), dtype=torch.float32)}
+    group_information = {
+        'conv.weight': {
+            'layer_name': 'conv.weight',
+            'group_count': 1,
+            'block_count': 2,
+            'ou_count': 4,
+            'repairable_block_count': 2,
+            'repairable_ou_count': 4,
+            'coverage_ratio': 1.0,
+            'block_coverage_ratio': 1.0,
+            'singleton_group_count': 0,
+            'singleton_ratio': 0.0,
+            'avg_group_size': 2.0,
+            'exact_group_count': 0,
+            'scaled_group_count': 1,
+            'exact_group_ratio': 0.0,
+            'scaled_group_ratio': 1.0,
+            'groups': [
+                {
+                    'group_id': 0,
+                    'member_count': 2,
+                    'group_size': 2,
+                    'covered_ou_count': 2,
+                    'repair_mode': 'scaled',
+                    'prototype': {
+                        'out_ch': 0,
+                        'in_ch_start': 0,
+                        'channel_span': 1,
+                        'multiplier': 1.0,
+                        'role': 'prototype',
+                        'mask_signature': 'shared',
+                    },
+                    'members': [
+                        {
+                            'out_ch': 0,
+                            'in_ch_start': 0,
+                            'channel_span': 1,
+                            'multiplier': 1.0,
+                            'role': 'prototype',
+                            'mask_signature': 'shared',
+                            'similarity': 1.0,
+                        },
+                        {
+                            'out_ch': 1,
+                            'in_ch_start': 0,
+                            'channel_span': 1,
+                            'multiplier': 0.0,
+                            'role': 'member',
+                            'mask_signature': 'shared',
+                            'similarity': 1.0,
+                        },
+                    ],
+                }
+            ],
+        }
+    }
+    coverage_ratio = {'conv.weight': 1.0}
+
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_group_information.pkl', group_information)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_mask.pkl', mask)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_coverage_ratio_information.pkl', coverage_ratio)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_reuse_ratio_information.pkl', coverage_ratio)
 
 
 @contextmanager
@@ -584,6 +652,205 @@ class TestFTRegression(unittest.TestCase):
             groups = parser.get_layer_groups('fc.weight')
             self.assertEqual(len(groups), 1)
             self.assertEqual(groups[0].size(), 2)
+
+    def test_oracle_restore_restores_weights(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyOracle')
+
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyOracle', 'num_classes': 10},
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+                'hierarchical_fault_tolerance': {
+                    'enabled': True,
+                    'repair_mode': 'oracle',
+                    'level1': {'enabled': True},
+                    'level2': {'enabled': False},
+                    'level3': {'enabled': False},
+                },
+                'report': {'output_dir': str(temp_dir / 'reports')},
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.copy_(torch.arange(8, dtype=torch.float32).reshape(2, 4, 1, 1))
+
+            simulator = FaultToleranceSimulator(
+                model=model,
+                model_name='ToyOracle',
+                translate_name='ft_group_cluster_translate',
+                config_file=str(config_path),
+                data_dir=str(temp_dir),
+            )
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[1, 1, 0, 0] = -123.0
+
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(1, 1)]}, original_weights)
+            self.assertEqual(stats['repair_mode'], 'oracle')
+            self.assertEqual(stats['oracle_count'], 1)
+            self.assertAlmostEqual(simulator.model.conv.weight[1, 1, 0, 0].item(), original_weights['conv.weight'][1, 1, 0, 0].item(), places=6)
+            self.assertEqual(stats['repair_quality']['oracle']['exact_restored'], 1)
+
+    def test_zero_scale_level1_is_not_counted_as_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_zero_scale_ft_artifacts(temp_dir, model_name='ToyZero')
+
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyZero', 'num_classes': 10},
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+                'hierarchical_fault_tolerance': {
+                    'enabled': True,
+                    'repair_mode': 'normal',
+                    'level1': {'enabled': True},
+                    'level2': {'enabled': False},
+                    'level3': {'enabled': False},
+                },
+                'report': {'output_dir': str(temp_dir / 'reports')},
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 2.0
+                model.conv.weight[1, 0, 0, 0] = -99.0
+
+            simulator = FaultToleranceSimulator(
+                model=model,
+                model_name='ToyZero',
+                translate_name='ft_group_cluster_translate',
+                config_file=str(config_path),
+                data_dir=str(temp_dir),
+            )
+            original_weights = simulator._save_model_weights()
+
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(1, 0)]}, original_weights)
+            self.assertEqual(stats['level1_count'], 0)
+            self.assertEqual(stats['level1_zero_scale_failed'], 1)
+            self.assertEqual(stats['repair_quality']['level1']['attempted'], 1)
+            self.assertEqual(stats['repair_quality']['level1']['effective_improved'], 0)
+
+    def test_repair_quality_metrics_fields_exist(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyQuality')
+
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyQuality', 'num_classes': 10},
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+                'hierarchical_fault_tolerance': {
+                    'enabled': True,
+                    'repair_mode': 'normal',
+                    'level1': {'enabled': True},
+                    'level2': {'enabled': False},
+                    'level3': {'enabled': True},
+                },
+                'report': {'output_dir': str(temp_dir / 'reports')},
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 1.0
+                model.conv.weight[0, 1, 0, 0] = 2.0
+                model.conv.weight[1, 0, 0, 0] = 2.0
+                model.conv.weight[1, 1, 0, 0] = 4.0
+
+            simulator = FaultToleranceSimulator(
+                model=model,
+                model_name='ToyQuality',
+                translate_name='ft_group_cluster_translate',
+                config_file=str(config_path),
+                data_dir=str(temp_dir),
+            )
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[1, 1, 0, 0] = -111.0
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(1, 1)]}, original_weights)
+            level1_quality = stats['repair_quality']['level1']
+            self.assertIn('attempted', level1_quality)
+            self.assertIn('effective_improved', level1_quality)
+            self.assertIn('exact_restored', level1_quality)
+            self.assertIn('avg_before_error', level1_quality)
+            self.assertIn('avg_after_error', level1_quality)
+            self.assertIn('improved_rate', level1_quality)
+
+    def test_stress_configs_load(self):
+        stress3 = FaultToleranceConfig('fault_tolerance_config_stress_3pct.json')
+        stress5 = FaultToleranceConfig('fault_tolerance_config_stress_5pct.json')
+        late = FaultToleranceConfig('fault_tolerance_config_target_late_layers.json')
+        self.assertAlmostEqual(stress3.get('fault_injection', 'fault_rate'), 0.03, places=6)
+        self.assertAlmostEqual(stress5.get('fault_injection', 'fault_rate'), 0.05, places=6)
+        self.assertEqual(stress3.get('fault_injection', 'bit_flip_ratio'), 1.0)
+        self.assertIn('conv10.weight', late.get('fault_injection', 'target_layers'))
+
+    def test_level1_only_mode_resolves(self):
+        overrides = resolve_levels_overrides('level1')
+        self.assertTrue(overrides['level1.enabled'])
+        self.assertFalse(overrides['level2.enabled'])
+        self.assertFalse(overrides['level3.enabled'])
+
+    def test_redundancy_construction_analysis_script_on_synthetic_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyDiag')
+            report = build_redundancy_construction_report('ToyDiag', 'ft_group_cluster_translate', str(temp_dir))
+            self.assertIn('global', report)
+            self.assertTrue(report['layers'])
+            layer = report['layers'][0]
+            self.assertIn('selected_mask_strategy', layer)
+            self.assertIn('mask_density', layer)
+            self.assertIn('repairable_ou_ratio', layer)
+            self.assertIn('candidate_summaries', layer)
+
+    def test_sparse_mask_candidate_can_reduce_singleton_ratio(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            weight = torch.tensor([
+                [4.0, 4.0, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0],
+                [8.0, 8.0, -1.0, 1.0, -1.5, 1.5, -2.0, 2.0],
+                [2.0, 2.0, 0.9, -0.9, 1.3, -1.3, 1.8, -1.8],
+                [6.0, 6.0, -0.9, 0.9, -1.3, 1.3, -1.8, 1.8],
+                [3.0, 3.0, 1.1, -1.1, 1.4, -1.4, 2.1, -2.1],
+                [9.0, 9.0, -1.1, 1.1, -1.4, 1.4, -2.1, 2.1],
+                [5.0, 5.0, 0.8, -0.8, 1.2, -1.2, 1.7, -1.7],
+                [10.0, 10.0, -0.8, 0.8, -1.2, 1.2, -1.7, 1.7],
+            ], dtype=torch.float32)
+            model.fc.weight.copy_(weight)
+
+        _, seed_info = ft_group_score_mask(
+            model=model,
+            weight_name='fc.weight',
+            in_channel=8,
+            out_channel=8,
+            kernel_size=1,
+            channel_number=8,
+            pattern_value_number=1,
+            pattern_shape_number=8,
+            OU_size=8,
+            target_group_size=4,
+            sim_threshold=0.98,
+            mask_density_sweep=True,
+            mask_keep_ratios=[1.0, 0.25],
+            prefer_sparser_mask=True,
+            singleton_penalty=0.35,
+            zero_scale_penalty=0.1,
+        )
+        candidates = {item['strategy']: item for item in seed_info['candidate_summaries']}
+        dense_like = None
+        sparse_like = None
+        for item in candidates.values():
+            if abs(item['mask_density'] - 1.0) <= 1e-6:
+                dense_like = item
+            if item['mask_density'] < 1.0:
+                sparse_like = item if sparse_like is None else min(sparse_like, item, key=lambda row: row['estimated_singleton_ratio'])
+        self.assertIsNotNone(dense_like)
+        self.assertIsNotNone(sparse_like)
+        self.assertLess(sparse_like['estimated_singleton_ratio'], dense_like['estimated_singleton_ratio'])
 
 
 if __name__ == '__main__':

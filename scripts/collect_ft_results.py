@@ -26,6 +26,8 @@ ARTIFACT_SUFFIXES = [
     'refresh_log.csv',
     'training_profile.csv',
     'regularization_layers.csv',
+    'mask_sweep_report.csv',
+    'mask_sweep_report.json',
 ]
 
 

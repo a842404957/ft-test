@@ -1,6 +1,6 @@
-# ft-test V1.3.4
+# ft-test V1.3.6
 
-V1.3.4 是 low-cost FT validation patch：当前推荐主路径是 `ft_group_cluster_translate`，重点是让低成本 FT 训练和实验收集更稳、更可比、更不容易互相覆盖。
+V1.3.6 是 FT repair validity + redundancy construction audit 版：当前推荐主路径仍然是 `ft_group_cluster_translate`，但重点已经从“低成本训练能跑”转到“修复是否真的有效、当前剪枝是否真的提高了 OU 冗余度、singleton 为什么这么多”。
 
 ## 环境前提
 
@@ -58,6 +58,12 @@ FT 主路径现在支持：
 - `--ft-reg-min-coverage`：只对 coverage 不低于该阈值的层计算 FT 正则；默认 `0.0`，`--ft-low-cost` 默认 `0.1`
 - `--ft-reg-min-groups`：只对 repairable group 数不少于该阈值的层计算 FT 正则；默认 `1`，`--ft-low-cost` 默认 `64`
 - `--ft-reg-boost-after-refresh`：refresh epoch 和 refresh 后 1 个 epoch 内，把有效正则间隔减半
+- `--ft-mask-density-sweep`：显式比较不同剪枝强度的 mask 候选
+- `--ft-mask-keep-ratios`：手动给出 keep ratio sweep，例如 `1.0,0.8889,0.6667,0.4444,0.2222`
+- `--ft-target-coverage`：优先满足 repairable coverage 的最小失真 mask
+- `--ft-prefer-sparser-mask`：当候选接近时偏向更稀疏的 mask
+- `--ft-score-singleton-penalty`：FTScore_v2 中对 singleton ratio 的惩罚
+- `--ft-score-zero-scale-penalty`：FTScore_v2 中对 zero multiplier ratio 的惩罚
 - `--translate-epochs`：控制 FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
 - `--refresh-epochs`：控制动态重分组 refresh 节点，默认 `190,200`
 - `--base-checkpoint-epoch`：控制 FT 构建/训练的起始原始 checkpoint，默认 `150`
@@ -97,6 +103,8 @@ python run_hierarchical_fault_tolerance.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_low_fault_rate.json \
+  --repair-mode normal \
+  --levels all \
   --samples 256 \
   --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
@@ -110,6 +118,8 @@ python run_hierarchical_fault_tolerance.py \
   --model Vgg16 \
   --translate ft_group_cluster_translate \
   --config fault_tolerance_config_high_fault_rate.json \
+  --repair-mode normal \
+  --levels all \
   --samples 256 \
   --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
@@ -126,7 +136,18 @@ python fault_tolerance_analyse.py \
   --output-csv results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/analysis/ft_layers.csv
 ```
 
-6. 结果收集
+6. 冗余构建诊断 / PRAP 对照
+
+```bash
+python scripts/analyse_redundancy_construction.py \
+  --model Res18 \
+  --translate ft_group_cluster_translate \
+  --data-dir results/ft_runs/Res18/ft_group_cluster_translate/res18_fast/artifacts \
+  --output-dir results/ft_runs/Res18/ft_group_cluster_translate/res18_fast/analysis \
+  --prap-translate weight_pattern_shape_and_value_similar_translate
+```
+
+7. 结果收集
 
 ```bash
 python scripts/collect_ft_results.py \
@@ -230,6 +251,32 @@ FT 训练现在会额外生成：
 - `skipped_small_group_layers`
 - `epoch_time_sec` / `reg_time_sec` / `refresh_time_sec`
 
+## 冗余构建审计
+
+当前版本新增：
+
+- `scripts/analyse_redundancy_construction.py`
+- `--repair-mode {normal,oracle}`
+- `--levels {level1,level1_level2,all}`
+- `fault_tolerance_config_stress_3pct.json`
+- `fault_tolerance_config_stress_5pct.json`
+- `fault_tolerance_config_target_late_layers.json`
+
+`analyse_redundancy_construction.py` 会输出每层：
+
+- `selected_mask_strategy`
+- `mask_density`
+- `pattern_value_number`
+- `channel_number`
+- `singleton_ratio`
+- `repairable_ou_ratio`
+- `avg_group_size`
+- `zero_multiplier_ratio`
+- `scale_distribution`
+- `candidate_summaries`
+
+它还会给出 singleton 最严重层的 Top-K，以及 `mask_density` 和 `repairable_ou_ratio` 的相关性。
+
 ## 产物协议
 
 `ft_group_cluster_translate` 主路径会生成以下产物：
@@ -244,6 +291,8 @@ FT 训练现在会额外生成：
 - `model_{model_name}_{translate_name}_refresh_log.csv`
 - `model_{model_name}_{translate_name}_training_profile.csv`
 - `model_{model_name}_{translate_name}_regularization_layers.csv`
+- `model_{model_name}_{translate_name}_mask_sweep_report.csv`
+- `model_{model_name}_{translate_name}_mask_sweep_report.json`
 
 其中：
 
@@ -254,10 +303,13 @@ FT 训练现在会额外生成：
 
 ## 示例配置
 
-仓库当前提供两个示例配置：
+仓库当前提供以下示例配置：
 
 - `fault_tolerance_config_low_fault_rate.json`
 - `fault_tolerance_config_high_fault_rate.json`
+- `fault_tolerance_config_stress_3pct.json`
+- `fault_tolerance_config_stress_5pct.json`
+- `fault_tolerance_config_target_late_layers.json`
 
 这两个配置现在默认使用：
 

@@ -1,10 +1,12 @@
 import copy
+import json
 import math
 import time
 import pickle as pkl
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import pandas as pd
 import torch.nn.functional as F
@@ -945,6 +947,75 @@ def _mean_or_zero(values: List[float]) -> float:
     return float(sum(values) / len(values))
 
 
+def _format_multiplier_key(multiplier: float) -> str:
+    if not np.isfinite(multiplier):
+        return 'nan_or_inf'
+    rounded = round(float(multiplier), 6)
+    if abs(rounded) <= 1e-8:
+        rounded = 0.0
+    return f'{rounded:.6f}'
+
+
+def _compute_group_multiplier_stats(layer_groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scale_distribution: Dict[str, int] = {}
+    total_members = 0
+    zero_multiplier_members = 0
+    nonzero_multiplier_members = 0
+
+    for group in layer_groups:
+        for member in group.get('members', []):
+            multiplier = float(member.get('multiplier', 1.0))
+            scale_key = _format_multiplier_key(multiplier)
+            scale_distribution[scale_key] = scale_distribution.get(scale_key, 0) + 1
+            total_members += 1
+            if abs(multiplier) <= 1e-8 or not np.isfinite(multiplier):
+                zero_multiplier_members += 1
+            else:
+                nonzero_multiplier_members += 1
+
+    return {
+        'zero_multiplier_count': int(zero_multiplier_members),
+        'nonzero_multiplier_count': int(nonzero_multiplier_members),
+        'zero_multiplier_ratio': zero_multiplier_members / max(total_members, 1),
+        'nonzero_multiplier_ratio': nonzero_multiplier_members / max(total_members, 1),
+        'scale_distribution': scale_distribution,
+    }
+
+
+def _build_layer_group_summary(layer_groups: List[Dict[str, Any]],
+                               total_block_count: int,
+                               total_ou_count: int,
+                               repairable_block_count: int,
+                               repairable_ou_count: int,
+                               singleton_group_count: int,
+                               exact_group_count: int,
+                               scaled_group_count: int) -> Dict[str, Any]:
+    multiplier_stats = _compute_group_multiplier_stats(layer_groups)
+    group_sizes = [group['group_size'] for group in layer_groups]
+    return {
+        'group_count': len(layer_groups),
+        'block_count': total_block_count,
+        'ou_count': total_ou_count,
+        'repairable_block_count': repairable_block_count,
+        'repairable_ou_count': repairable_ou_count,
+        'coverage_ratio': repairable_ou_count / max(total_ou_count, 1),
+        'block_coverage_ratio': repairable_block_count / max(total_block_count, 1),
+        'singleton_group_count': singleton_group_count,
+        'singleton_ratio': singleton_group_count / max(len(layer_groups), 1),
+        'avg_group_size': _mean_or_zero(group_sizes),
+        'max_group_size': max(group_sizes) if group_sizes else 0,
+        'exact_group_count': exact_group_count,
+        'scaled_group_count': scaled_group_count,
+        'exact_group_ratio': exact_group_count / max(len(layer_groups), 1),
+        'scaled_group_ratio': scaled_group_count / max(len(layer_groups), 1),
+        'zero_multiplier_count': multiplier_stats['zero_multiplier_count'],
+        'nonzero_multiplier_count': multiplier_stats['nonzero_multiplier_count'],
+        'zero_multiplier_ratio': multiplier_stats['zero_multiplier_ratio'],
+        'nonzero_multiplier_ratio': multiplier_stats['nonzero_multiplier_ratio'],
+        'scale_distribution': multiplier_stats['scale_distribution'],
+    }
+
+
 FT_GROUP_COMPARE_WINDOW = 512
 FT_GROUP_COMPARE_WINDOW_FC = 256
 FT_GROUP_SCALE_CHUNK = 1024
@@ -1552,22 +1623,16 @@ def _build_layer_ft_groups_from_packed(packed: Dict[str, Any], min_group_size: i
 
     total_block_count = packed['out_channel'] * packed['num_blocks']
     total_ou_count = total_block_count * packed['channel_span']
-    layer_summary = {
-        'group_count': len(layer_groups),
-        'block_count': total_block_count,
-        'ou_count': total_ou_count,
-        'repairable_block_count': repairable_block_count,
-        'repairable_ou_count': repairable_ou_count,
-        'coverage_ratio': repairable_ou_count / max(total_ou_count, 1),
-        'block_coverage_ratio': repairable_block_count / max(total_block_count, 1),
-        'singleton_group_count': singleton_group_count,
-        'singleton_ratio': singleton_group_count / max(len(layer_groups), 1),
-        'avg_group_size': _mean_or_zero([group['group_size'] for group in layer_groups]),
-        'exact_group_count': exact_group_count,
-        'scaled_group_count': scaled_group_count,
-        'exact_group_ratio': exact_group_count / max(len(layer_groups), 1),
-        'scaled_group_ratio': scaled_group_count / max(len(layer_groups), 1),
-    }
+    layer_summary = _build_layer_group_summary(
+        layer_groups=layer_groups,
+        total_block_count=total_block_count,
+        total_ou_count=total_ou_count,
+        repairable_block_count=repairable_block_count,
+        repairable_ou_count=repairable_ou_count,
+        singleton_group_count=singleton_group_count,
+        exact_group_count=exact_group_count,
+        scaled_group_count=scaled_group_count,
+    )
     return layer_groups, layer_summary
 
 
@@ -1638,22 +1703,16 @@ def _build_layer_ft_groups(pattern_list, min_group_size, target_group_size, sim_
 
     total_block_count = len(pattern_list)
     total_ou_count = int(sum(pattern['channel_span'] for pattern in pattern_list))
-    layer_summary = {
-        'group_count': len(layer_groups),
-        'block_count': total_block_count,
-        'ou_count': total_ou_count,
-        'repairable_block_count': repairable_block_count,
-        'repairable_ou_count': repairable_ou_count,
-        'coverage_ratio': repairable_ou_count / max(total_ou_count, 1),
-        'block_coverage_ratio': repairable_block_count / max(total_block_count, 1),
-        'singleton_group_count': singleton_group_count,
-        'singleton_ratio': singleton_group_count / max(len(layer_groups), 1),
-        'avg_group_size': _mean_or_zero([group['group_size'] for group in layer_groups]),
-        'exact_group_count': exact_group_count,
-        'scaled_group_count': scaled_group_count,
-        'exact_group_ratio': exact_group_count / max(len(layer_groups), 1),
-        'scaled_group_ratio': scaled_group_count / max(len(layer_groups), 1),
-    }
+    layer_summary = _build_layer_group_summary(
+        layer_groups=layer_groups,
+        total_block_count=total_block_count,
+        total_ou_count=total_ou_count,
+        repairable_block_count=repairable_block_count,
+        repairable_ou_count=repairable_ou_count,
+        singleton_group_count=singleton_group_count,
+        exact_group_count=exact_group_count,
+        scaled_group_count=scaled_group_count,
+    )
     return layer_groups, layer_summary
 
 
@@ -1850,6 +1909,53 @@ def _write_regularization_layers_report(model_name, translate_name, regularizati
     return str(report_path)
 
 
+def write_mask_sweep_report(model_name, translate_name, group_information, output_dir='.'):
+    rows = []
+    for layer_name, layer_group_info in (group_information or {}).items():
+        seed_info = {}
+        if isinstance(layer_group_info, dict):
+            seed_info = layer_group_info.get('seed_info', {}) or {}
+        candidate_summaries = seed_info.get('candidate_summaries', []) or []
+        selected_candidate = next((item for item in candidate_summaries if item.get('selected')), None)
+        if selected_candidate is None and candidate_summaries:
+            selected_strategy = seed_info.get('selected_strategy', '')
+            selected_candidate = next(
+                (item for item in candidate_summaries if item.get('strategy') == selected_strategy),
+                None,
+            )
+        mask_density = seed_info.get('mask_density', None)
+        if mask_density is None and selected_candidate is not None:
+            mask_density = selected_candidate.get('mask_density', 0.0)
+        if mask_density is None:
+            mask_density = 0.0
+        rows.append({
+            'layer': layer_name,
+            'selected_mask_strategy': seed_info.get('selected_strategy', ''),
+            'mask_density': mask_density,
+            'selected_candidate_coverage': seed_info.get('estimated_coverage', 0.0),
+            'selected_candidate_block_coverage': seed_info.get('estimated_block_coverage', 0.0),
+            'selected_candidate_avg_group_size': seed_info.get('estimated_avg_group_size', 0.0),
+            'selected_candidate_singleton_ratio': seed_info.get('estimated_singleton_ratio', 0.0),
+            'selected_candidate_zero_multiplier_ratio': seed_info.get('estimated_zero_multiplier_ratio', 0.0),
+            'selected_candidate_exact_group_ratio': seed_info.get('estimated_exact_group_ratio', 0.0),
+            'selected_candidate_scaled_group_ratio': seed_info.get('estimated_scaled_group_ratio', 0.0),
+            'selected_candidate_distortion': seed_info.get('pruning_distortion', 0.0),
+            'target_coverage': seed_info.get('target_coverage', None),
+            'prefer_sparser_mask': seed_info.get('prefer_sparser_mask', False),
+            'singleton_penalty': seed_info.get('singleton_penalty', 0.0),
+            'zero_scale_penalty': seed_info.get('zero_scale_penalty', 0.0),
+            'candidate_count': seed_info.get('candidate_count', 0),
+            'fallback_used': seed_info.get('fallback_used', False),
+            'candidate_summaries': json.dumps(candidate_summaries, ensure_ascii=False),
+        })
+
+    csv_path = _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_mask_sweep_report.csv')
+    json_path = _artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_mask_sweep_report.json')
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding='utf-8')
+    return str(csv_path), str(json_path)
+
+
 def _write_training_profile(profile_records, profile_path):
     pd.DataFrame(profile_records).to_csv(profile_path, index=False)
 
@@ -1866,7 +1972,10 @@ def _effective_ft_reg_interval(epoch_number, base_interval, refresh_epochs, boos
 
 def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size,
                         channel_number, pattern_value_number, pattern_shape_number,
-                        OU_size, target_group_size=4, sim_threshold=0.85):
+                        OU_size, target_group_size=4, sim_threshold=0.85,
+                        mask_density_sweep=False, mask_keep_ratios=None,
+                        target_coverage=None, prefer_sparser_mask=False,
+                        singleton_penalty=0.18, zero_scale_penalty=0.12):
     """用FTScore在多个mask候选间搜索最适合冗余组构建的shape/mask。"""
     try:
         shape_seed_mask = get_shape_mask(
@@ -1885,11 +1994,17 @@ def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size
 
     raw_weight = model.state_dict()[weight_name].detach().cpu()
     seed_density = float(shape_seed_mask.sum().item() / max(shape_seed_mask.numel(), 1))
-    keep_ratios = sorted({
-        max(0.15, min(1.0, round(seed_density * 0.75, 4))),
-        max(0.15, min(1.0, round(seed_density, 4))),
-        max(0.15, min(1.0, round(seed_density * 1.2 + 0.02, 4))),
-    })
+    keep_ratios = set()
+    if mask_keep_ratios:
+        keep_ratios.update(max(0.05, min(1.0, round(float(ratio), 4))) for ratio in mask_keep_ratios)
+    if mask_density_sweep or not keep_ratios:
+        keep_ratios.update({
+            max(0.05, min(1.0, round(seed_density * 0.5, 4))),
+            max(0.05, min(1.0, round(seed_density * 0.75, 4))),
+            max(0.05, min(1.0, round(seed_density, 4))),
+            max(0.05, min(1.0, round(seed_density * 1.2 + 0.02, 4))),
+        })
+    keep_ratios = sorted(keep_ratios)
 
     candidate_masks = [('shape_seed', shape_seed_mask)]
     for keep_ratio in keep_ratios:
@@ -1964,27 +2079,44 @@ def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size
                     member_similarities.append(float(member.get('similarity', 1.0)))
 
         pruning_distortion = (raw_weight - raw_weight * candidate_mask).abs().sum().item() / (raw_weight.abs().sum().item() + 1e-8)
+        mask_density = float(candidate_mask.sum().item() / max(candidate_mask.numel(), 1))
         avg_similarity = _mean_or_zero(member_similarities) if member_similarities else (1.0 if estimated_groups else 0.0)
         avg_group_size = float(estimated_summary.get('avg_group_size', 0.0))
         normalized_group_size = min(avg_group_size / max(float(target_group_size), 1.0), 1.0)
+        singleton_ratio = float(estimated_summary.get('singleton_ratio', 1.0))
+        zero_multiplier_ratio = float(estimated_summary.get('zero_multiplier_ratio', 0.0))
+        repairable_ou_ratio = float(estimated_summary.get('coverage_ratio', 0.0))
+        exact_group_ratio = float(estimated_summary.get('exact_group_ratio', 0.0))
         ft_score = (
-            0.42 * estimated_summary['coverage_ratio']
-            + 0.22 * avg_similarity
+            0.48 * repairable_ou_ratio
             + 0.18 * normalized_group_size
-            + 0.08 * estimated_summary['exact_group_ratio']
+            + 0.08 * avg_similarity
+            + 0.06 * exact_group_ratio
+            - singleton_penalty * singleton_ratio
             - 0.18 * pruning_distortion
+            - zero_scale_penalty * zero_multiplier_ratio
         )
+        if prefer_sparser_mask:
+            ft_score -= 0.05 * mask_density
 
         candidate_summary = {
             'strategy': strategy_name,
             'score': float(ft_score),
+            'mask_density': mask_density,
             'estimated_coverage': float(estimated_summary['coverage_ratio']),
             'estimated_block_coverage': float(estimated_summary['block_coverage_ratio']),
+            'estimated_repairable_ou_ratio': repairable_ou_ratio,
             'estimated_avg_group_size': avg_group_size,
             'estimated_group_count': int(estimated_summary['group_count']),
             'estimated_singleton_ratio': float(estimated_summary['singleton_ratio']),
+            'estimated_zero_multiplier_ratio': zero_multiplier_ratio,
+            'estimated_exact_group_ratio': exact_group_ratio,
+            'estimated_scaled_group_ratio': float(estimated_summary.get('scaled_group_ratio', 0.0)),
+            'estimated_max_group_size': int(estimated_summary.get('max_group_size', 0)),
+            'estimated_scale_distribution': estimated_summary.get('scale_distribution', {}),
             'avg_intra_group_similarity': float(avg_similarity),
             'pruning_distortion': float(pruning_distortion),
+            'target_coverage_satisfied': bool(target_coverage is not None and repairable_ou_ratio >= float(target_coverage)),
             'selected': False,
         }
         candidate_summaries.append(candidate_summary)
@@ -1992,27 +2124,55 @@ def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size
 
     fallback_used = False
     if valid_candidates:
-        best_summary, best_mask = max(
-            valid_candidates,
-            key=lambda item: (
-                item[0]['score'],
-                item[0]['estimated_coverage'],
-                item[0]['avg_intra_group_similarity'],
-                item[0]['estimated_avg_group_size'],
-                1 if item[0]['strategy'] != 'shape_seed' else 0,
-            ),
-        )
+        target_candidates = []
+        if target_coverage is not None:
+            target_candidates = [
+                item for item in valid_candidates
+                if item[0]['estimated_repairable_ou_ratio'] >= float(target_coverage)
+            ]
+        selection_pool = target_candidates if target_candidates else valid_candidates
+        if target_candidates:
+            best_summary, best_mask = min(
+                selection_pool,
+                key=lambda item: (
+                    item[0]['pruning_distortion'],
+                    item[0]['mask_density'] if prefer_sparser_mask else 0.0,
+                    -item[0]['estimated_repairable_ou_ratio'],
+                    -item[0]['score'],
+                ),
+            )
+        else:
+            best_summary, best_mask = max(
+                selection_pool,
+                key=lambda item: (
+                    item[0]['score'],
+                    item[0]['estimated_repairable_ou_ratio'],
+                    -item[0]['estimated_singleton_ratio'],
+                    item[0]['avg_intra_group_similarity'],
+                    item[0]['estimated_avg_group_size'],
+                    -item[0]['mask_density'] if prefer_sparser_mask else 0.0,
+                    1 if item[0]['strategy'] != 'shape_seed' else 0,
+                ),
+            )
     else:
         best_summary = {
             'strategy': 'shape_seed',
             'score': 0.0,
+            'mask_density': seed_density,
             'estimated_coverage': 0.0,
             'estimated_block_coverage': 0.0,
+            'estimated_repairable_ou_ratio': 0.0,
             'estimated_avg_group_size': 0.0,
             'estimated_group_count': 0,
             'estimated_singleton_ratio': 1.0,
+            'estimated_zero_multiplier_ratio': 0.0,
+            'estimated_exact_group_ratio': 0.0,
+            'estimated_scaled_group_ratio': 0.0,
+            'estimated_max_group_size': 0,
+            'estimated_scale_distribution': {},
             'avg_intra_group_similarity': 0.0,
             'pruning_distortion': 0.0,
+            'target_coverage_satisfied': False,
             'selected': True,
         }
         best_mask = shape_seed_mask
@@ -2029,8 +2189,18 @@ def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size
         'estimated_avg_group_size': best_summary['estimated_avg_group_size'],
         'estimated_group_count': best_summary['estimated_group_count'],
         'estimated_singleton_ratio': best_summary['estimated_singleton_ratio'],
+        'estimated_zero_multiplier_ratio': best_summary['estimated_zero_multiplier_ratio'],
+        'estimated_exact_group_ratio': best_summary['estimated_exact_group_ratio'],
+        'estimated_scaled_group_ratio': best_summary['estimated_scaled_group_ratio'],
+        'estimated_max_group_size': best_summary['estimated_max_group_size'],
+        'estimated_scale_distribution': best_summary['estimated_scale_distribution'],
+        'mask_density': best_summary['mask_density'],
         'avg_intra_group_similarity': best_summary['avg_intra_group_similarity'],
         'pruning_distortion': best_summary['pruning_distortion'],
+        'target_coverage': float(target_coverage) if target_coverage is not None else None,
+        'prefer_sparser_mask': bool(prefer_sparser_mask),
+        'singleton_penalty': float(singleton_penalty),
+        'zero_scale_penalty': float(zero_scale_penalty),
         'candidate_count': len(candidate_summaries),
         'fallback_used': fallback_used,
         'candidate_summaries': candidate_summaries,
@@ -2140,10 +2310,16 @@ def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
         'singleton_group_count': layer_summary['singleton_group_count'],
         'singleton_ratio': layer_summary['singleton_ratio'],
         'avg_group_size': layer_summary['avg_group_size'],
+        'max_group_size': layer_summary.get('max_group_size', 0),
         'exact_group_count': layer_summary['exact_group_count'],
         'scaled_group_count': layer_summary['scaled_group_count'],
         'exact_group_ratio': layer_summary['exact_group_ratio'],
         'scaled_group_ratio': layer_summary['scaled_group_ratio'],
+        'zero_multiplier_count': layer_summary.get('zero_multiplier_count', 0),
+        'nonzero_multiplier_count': layer_summary.get('nonzero_multiplier_count', 0),
+        'zero_multiplier_ratio': layer_summary.get('zero_multiplier_ratio', 0.0),
+        'nonzero_multiplier_ratio': layer_summary.get('nonzero_multiplier_ratio', 0.0),
+        'scale_distribution': layer_summary.get('scale_distribution', {}),
         'groups': layer_groups,
     }
     return map_table, multiple_relationship_table, layer_summary['coverage_ratio'], layer_group_information
@@ -2298,6 +2474,12 @@ def ft_group_translate_train(model, model_name, translate_name,
                              ft_reg_min_coverage=0.0,
                              ft_reg_min_groups=1,
                              ft_reg_boost_after_refresh=False,
+                             ft_mask_density_sweep=False,
+                             ft_mask_keep_ratios=None,
+                             ft_target_coverage=None,
+                             ft_prefer_sparser_mask=False,
+                             ft_score_singleton_penalty=0.18,
+                             ft_score_zero_scale_penalty=0.12,
                              output_dir='.'):
     """最小可运行FT训练器。保持旧训练器不动，新方法单独落盘。"""
     if scale_candidates is None:
@@ -2343,6 +2525,7 @@ def ft_group_translate_train(model, model_name, translate_name,
         min_repairable_groups=ft_reg_min_groups,
     )
     regularization_report_path = _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
+    write_mask_sweep_report(model_name, translate_name, group_information, output_dir=output_dir)
     print('[FT regularization] layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={} reg_interval={} report={}'.format(
         regularization_state['summary']['layer_count'],
         regularization_state['summary']['repairable_group_count'],
@@ -2491,6 +2674,12 @@ def ft_group_translate_train(model, model_name, translate_name,
                         OU_size=OU_size,
                         target_group_size=target_group_size_list[i],
                         sim_threshold=sim_threshold_list[i],
+                        mask_density_sweep=ft_mask_density_sweep,
+                        mask_keep_ratios=ft_mask_keep_ratios,
+                        target_coverage=ft_target_coverage,
+                        prefer_sparser_mask=ft_prefer_sparser_mask,
+                        singleton_penalty=ft_score_singleton_penalty,
+                        zero_scale_penalty=ft_score_zero_scale_penalty,
                     )
                     print('[FT refresh] epoch {} layer {} regroup'.format(epoch + 1, weight_name[i]))
                     candidate_map_information[weight_name[i]], candidate_multiple_relationship_information[weight_name[i]], candidate_reuse_ratio_information[weight_name[i]], candidate_group_information[weight_name[i]] = ft_group_cluster_translate(
@@ -2525,6 +2714,7 @@ def ft_group_translate_train(model, model_name, translate_name,
                         min_repairable_groups=ft_reg_min_groups,
                     )
                     _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
+                    write_mask_sweep_report(model_name, translate_name, group_information, output_dir=output_dir)
                     print('[FT regularization] epoch {} cache layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={}'.format(
                         epoch + 1,
                         regularization_state['summary']['layer_count'],
@@ -2645,6 +2835,7 @@ def ft_group_translate_train(model, model_name, translate_name,
         pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
     with open(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '_group_information.pkl'), 'wb') as f_group:
         pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
+    write_mask_sweep_report(model_name, translate_name, group_information, output_dir=output_dir)
 
     result_all['Before_Translate_Accuracy'] = before_translate_accuracy
     result_all['Before_Translate_Loss'] = before_translate_loss

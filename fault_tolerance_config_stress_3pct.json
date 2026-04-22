@@ -1,0 +1,34 @@
+{
+  "model": {
+    "name": "Vgg16",
+    "num_classes": 10
+  },
+  "fault_injection": {
+    "enabled": true,
+    "fault_rate": 0.03,
+    "fault_models": [
+      "bit_flip"
+    ],
+    "target_layers": "all",
+    "exclude_critical_layers": [
+      "__last__"
+    ],
+    "random_seed": 42,
+    "bit_flip_positions": "random",
+    "bit_flip_ratio": 1.0
+  },
+  "simulation": {
+    "batch_size": 128,
+    "num_test_samples": 1000,
+    "device": "cuda",
+    "verbose": true
+  },
+  "report": {
+    "output_dir": "./fault_tolerance_results/stress_3pct",
+    "formats": [
+      "json",
+      "csv",
+      "md"
+    ]
+  }
+}

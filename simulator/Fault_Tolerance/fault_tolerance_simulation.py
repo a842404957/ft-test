@@ -284,7 +284,11 @@ class FaultToleranceSimulator:
             if enable_ft:
                 hierarchical_stats = self._apply_weight_level_correction(ou_fault_mask, original_weights)
                 correctable_faults = hierarchical_stats['total_correctable']
-                print(f"  已在权重层面纠正 {correctable_faults}/{total_faults} 个故障")
+                repair_mode = hierarchical_stats.get('repair_mode', 'normal')
+                if repair_mode == 'oracle':
+                    print(f"  已在权重层面执行 Oracle restore: {correctable_faults}/{total_faults} 个故障")
+                else:
+                    print(f"  已在权重层面纠正 {correctable_faults}/{total_faults} 个故障")
                 self._hierarchical_stats = hierarchical_stats
                 
                 # 🔍 关键验证：检查Level 2纠正的权重是否真的被修改且保持
@@ -430,6 +434,51 @@ class FaultToleranceSimulator:
 
         cosine = torch.dot(faulty_vec.float(), candidate_vec.float()) / (norm_f * norm_c)
         return ((cosine + 1.0) / 2.0).item()
+
+    @staticmethod
+    def _new_repair_quality_bucket() -> Dict[str, float]:
+        return {
+            'attempted': 0,
+            'effective_improved': 0,
+            'exact_restored': 0,
+            'before_error_sum': 0.0,
+            'after_error_sum': 0.0,
+        }
+
+    @staticmethod
+    def _finalize_repair_quality_bucket(bucket: Dict[str, float]) -> Dict[str, float]:
+        attempted = int(bucket.get('attempted', 0))
+        before_error_sum = float(bucket.get('before_error_sum', 0.0))
+        after_error_sum = float(bucket.get('after_error_sum', 0.0))
+        return {
+            'attempted': attempted,
+            'effective_improved': int(bucket.get('effective_improved', 0)),
+            'exact_restored': int(bucket.get('exact_restored', 0)),
+            'avg_before_error': before_error_sum / max(attempted, 1),
+            'avg_after_error': after_error_sum / max(attempted, 1),
+            'improved_rate': float(bucket.get('effective_improved', 0)) / max(attempted, 1),
+        }
+
+    @staticmethod
+    def _record_repair_quality(bucket: Dict[str, float],
+                               before_weight: torch.Tensor,
+                               after_weight: torch.Tensor,
+                               original_weight: torch.Tensor):
+        before_error = torch.norm((before_weight - original_weight).float(), p=2).item()
+        after_error = torch.norm((after_weight - original_weight).float(), p=2).item()
+        bucket['attempted'] += 1
+        bucket['before_error_sum'] += float(before_error)
+        bucket['after_error_sum'] += float(after_error)
+        if after_error + 1e-8 < before_error:
+            bucket['effective_improved'] += 1
+        if after_error < 1e-6:
+            bucket['exact_restored'] += 1
+
+    @staticmethod
+    def _is_invalid_scale_factor(scale_factor: float, eps: float = 1e-6) -> bool:
+        if not np.isfinite(scale_factor):
+            return True
+        return abs(float(scale_factor)) <= eps
     
     def _inject_ou_level_faults(self) -> Dict[str, List[Tuple[int, int]]]:
         """
@@ -601,19 +650,31 @@ class FaultToleranceSimulator:
             容错统计信息字典
         """
         hierarchical_config = self.config.config.get('hierarchical_fault_tolerance', {})
+        repair_mode = str(hierarchical_config.get('repair_mode', 'normal')).strip().lower() or 'normal'
 
         level1_count = 0
         level2_count = 0
         level3_count = 0
+        oracle_count = 0
         level1_prototype_repairs = 0
         level1_member_repairs = 0
         level1_exact_repairs = 0
         level1_scaled_repairs = 0
         level1_failed_singleton = 0
+        level1_zero_scale_failed = 0
+
+        repair_quality_buckets = {
+            'level1': self._new_repair_quality_bucket(),
+            'level2': self._new_repair_quality_bucket(),
+            'level3': self._new_repair_quality_bucket(),
+        }
+        if repair_mode == 'oracle':
+            repair_quality_buckets['oracle'] = self._new_repair_quality_bucket()
 
         level1_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
         level2_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
         level3_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
+        oracle_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
         uncorrected_by_layer: Dict[str, List[Tuple[int, int]]] = {}
 
         for layer_name, faulty_ou_indices in ou_fault_mask.items():
@@ -645,11 +706,41 @@ class FaultToleranceSimulator:
             layer_level1 = []
             layer_level2 = []
             layer_level3 = []
+            layer_oracle = []
             layer_mask = self.data_loader.get_layer_mask(layer_name)
             if layer_mask is not None and layer_mask.shape[:2] == layer_weights.shape[:2]:
                 layer_mask = layer_mask.to(layer_weights.device)
             else:
                 layer_mask = None
+
+            if repair_mode == 'oracle':
+                for faulty_ou in faulty_ous:
+                    before_weight = self._extract_ou_weight(layer_weights, faulty_ou).clone()
+                    original_weight = self._extract_ou_weight(original_layer_weights, faulty_ou).clone()
+
+                    out_ch, in_ch = faulty_ou
+                    if layer_weights.dim() == 4:
+                        layer_weights[out_ch, in_ch, :, :] = original_weight
+                    elif layer_weights.dim() == 2:
+                        layer_weights[out_ch, in_ch] = original_weight
+                    else:
+                        continue
+
+                    after_weight = self._extract_ou_weight(layer_weights, faulty_ou).clone()
+                    self._record_repair_quality(
+                        repair_quality_buckets['oracle'],
+                        before_weight=before_weight,
+                        after_weight=after_weight,
+                        original_weight=original_weight,
+                    )
+                    layer_oracle.append(faulty_ou)
+                    oracle_count += 1
+
+                oracle_corrected_ous[layer_name] = layer_oracle
+                level1_corrected_ous[layer_name] = layer_level1
+                level2_corrected_ous[layer_name] = layer_level2
+                level3_corrected_ous[layer_name] = layer_level3
+                continue
 
             # ---------- Level 1: 冗余组缩放替换（100%恢复）----------
             # 策略：用冗余组内健康OU的权重，按倍数关系缩放后替换故障OU
@@ -671,7 +762,8 @@ class FaultToleranceSimulator:
 
                     # 找到健康的OU
                     out_ch, in_ch = faulty_ou
-                    faulty_weight = self._extract_ou_weight(original_layer_weights, faulty_ou)
+                    faulty_original_weight = self._extract_ou_weight(original_layer_weights, faulty_ou).clone()
+                    faulty_current_weight = self._extract_ou_weight(layer_weights, faulty_ou).clone()
                     faulty_mask_slice = layer_mask[out_ch, in_ch] if layer_mask is not None else None
                     faulty_block_entry = containing_group.ou_to_block.get(faulty_ou)
                     faulty_block = None
@@ -725,7 +817,7 @@ class FaultToleranceSimulator:
                         for candidate_block, candidate_ou in healthy_candidates:
                             candidate_weight = self._extract_ou_weight(original_layer_weights, candidate_ou)
                             similarity = self._compute_ou_similarity(
-                                faulty_weight=faulty_weight,
+                                faulty_weight=faulty_original_weight,
                                 candidate_weight=candidate_weight,
                                 mask_slice=faulty_mask_slice,
                             )
@@ -761,10 +853,22 @@ class FaultToleranceSimulator:
                         continue
 
                     # 计算缩放因子
-                    if abs(replacement_multiplier) > 1e-6:
+                    if abs(replacement_multiplier) > 1e-8:
                         scale_factor = self.compute_member_to_member_scale(faulty_multiplier, replacement_multiplier)
                     else:
-                        scale_factor = 1.0
+                        scale_factor = float('nan')
+                    if self._is_invalid_scale_factor(scale_factor):
+                        level1_zero_scale_failed += 1
+                        self._record_repair_quality(
+                            repair_quality_buckets['level1'],
+                            before_weight=faulty_current_weight,
+                            after_weight=faulty_current_weight,
+                            original_weight=faulty_original_weight,
+                        )
+                        if level1_zero_scale_failed <= 3:
+                            print(f"  ⚠️ Level 1 zero-scale skipped: {layer_name}[{faulty_ou}] "
+                                  f"(faulty_multiplier={faulty_multiplier:.4f}, replacement_multiplier={replacement_multiplier:.4f})")
+                        continue
                     corrected_weight = replacement_weight * scale_factor
 
                     # 应用替换
@@ -772,6 +876,13 @@ class FaultToleranceSimulator:
                         layer_weights[out_ch, in_ch, :, :] = corrected_weight
                     elif layer_weights.dim() == 2:
                         layer_weights[out_ch, in_ch] = corrected_weight
+                    corrected_weight_after = self._extract_ou_weight(layer_weights, faulty_ou).clone()
+                    self._record_repair_quality(
+                        repair_quality_buckets['level1'],
+                        before_weight=faulty_current_weight,
+                        after_weight=corrected_weight_after,
+                        original_weight=faulty_original_weight,
+                    )
 
                     if level1_count < 3:
                         print(f"  ✅ Level 1: {layer_name}[{faulty_ou}] ← OU[{replacement_ou}] "
@@ -813,12 +924,15 @@ class FaultToleranceSimulator:
 
                     out_ch, in_ch = faulty_ou
                     if layer_weights.dim() == 4:
-                        faulty_weight = original_layer_weights[out_ch, in_ch, :, :]
+                        faulty_weight = layer_weights[out_ch, in_ch, :, :]
+                        original_weight = original_layer_weights[out_ch, in_ch, :, :].clone()
                     elif layer_weights.dim() == 2:
-                        faulty_weight = original_layer_weights[out_ch, in_ch]
+                        faulty_weight = layer_weights[out_ch, in_ch]
+                        original_weight = original_layer_weights[out_ch, in_ch].clone()
                     else:
                         self.nearest_pattern_corrector.correction_statistics['failed_corrections'] += 1
                         continue
+                    before_weight = faulty_weight.clone()
 
                     if mask is not None and mask.shape[:2] == layer_weights.shape[:2]:
                         mask_slice = mask[out_ch, in_ch]
@@ -902,6 +1016,13 @@ class FaultToleranceSimulator:
                         layer_weights[out_ch, in_ch, :, :] = corrected_weight
                     else:
                         layer_weights[out_ch, in_ch] = corrected_weight
+                    after_weight = self._extract_ou_weight(layer_weights, faulty_ou).clone()
+                    self._record_repair_quality(
+                        repair_quality_buckets['level2'],
+                        before_weight=before_weight,
+                        after_weight=after_weight,
+                        original_weight=original_weight,
+                    )
 
                     level2_count += 1
                     layer_level2.append(faulty_ou)
@@ -919,6 +1040,8 @@ class FaultToleranceSimulator:
             remaining_for_level3 = [ou for ou in faulty_ous if ou not in layer_level1 and ou not in layer_level2]
             if hierarchical_config.get('level3', {}).get('enabled', True):
                 for faulty_ou_idx in remaining_for_level3:
+                    before_weight = self._extract_ou_weight(layer_weights, faulty_ou_idx).clone()
+                    original_weight = self._extract_ou_weight(original_layer_weights, faulty_ou_idx).clone()
                     if layer_weights.dim() == 2:
                         out_ch, in_ch = faulty_ou_idx
                         layer_weights[out_ch, in_ch] = 0
@@ -926,6 +1049,13 @@ class FaultToleranceSimulator:
                             print(f"  ✅ Level 3: {layer_name}[{faulty_ou_idx}] 权重置0")
                         layer_level3.append(faulty_ou_idx)
                         level3_count += 1
+                        after_weight = self._extract_ou_weight(layer_weights, faulty_ou_idx).clone()
+                        self._record_repair_quality(
+                            repair_quality_buckets['level3'],
+                            before_weight=before_weight,
+                            after_weight=after_weight,
+                            original_weight=original_weight,
+                        )
                         continue
                     # ✅ Level 3细粒度容错：只置零故障权重，保留健康权重
                     if hasattr(self, 'detailed_fault_mask') and layer_name in self.detailed_fault_mask:
@@ -959,6 +1089,13 @@ class FaultToleranceSimulator:
 
                     layer_level3.append(faulty_ou_idx)
                     level3_count += 1
+                    after_weight = self._extract_ou_weight(layer_weights, faulty_ou_idx).clone()
+                    self._record_repair_quality(
+                        repair_quality_buckets['level3'],
+                        before_weight=before_weight,
+                        after_weight=after_weight,
+                        original_weight=original_weight,
+                    )
             else:
                 # 如果Level 3未启用，这些故障无法纠正
                 for idx in remaining_for_level3:
@@ -973,17 +1110,25 @@ class FaultToleranceSimulator:
                 uncorrected_by_layer.setdefault(layer_name, []).extend(residual_uncorrected)
 
         # 统计输出
-        total_corrected = level1_count + level2_count + level3_count
+        total_corrected = level1_count + level2_count + level3_count + oracle_count
         total_faults = sum(len(indices) for indices in ou_fault_mask.values())
         uncorrectable_count = total_faults - total_corrected
 
         print(f"  分层容错覆盖:")
-        print(f"    Level 1 (冗余组缩放替换-100%): {level1_count}")
-        print(f"    Level 2 (相似模式替换-95%): {level2_count}")
-        print(f"    Level 3 (自适应屏蔽-置0): {level3_count}")
+        if repair_mode == 'oracle':
+            print(f"    Oracle Restore: {oracle_count}")
+        else:
+            print(f"    Level 1 (冗余组缩放替换-100%): {level1_count}")
+            print(f"    Level 2 (相似模式替换-95%): {level2_count}")
+            print(f"    Level 3 (自适应屏蔽-置0): {level3_count}")
+            print(f"    Level 1 zero-scale failed: {level1_zero_scale_failed}")
         print(f"    无法纠正: {uncorrectable_count}")
         
         # 🔍 显示各级容错的详细分布
+        if repair_mode == 'oracle' and oracle_corrected_ous:
+            oracle_distribution = {k: len(v) for k, v in oracle_corrected_ous.items() if v}
+            if oracle_distribution:
+                print(f"  📊 Oracle恢复分布: {oracle_distribution}")
         if level1_corrected_ous:
             level1_distribution = {k: len(v) for k, v in level1_corrected_ous.items() if v}
             if level1_distribution:
@@ -1005,27 +1150,40 @@ class FaultToleranceSimulator:
         self.majority_voter.voting_statistics['corrections_by_layer'] = {
             layer: len(level1_corrected_ous.get(layer, [])) +
                    len(level2_corrected_ous.get(layer, [])) +
-                   len(level3_corrected_ous.get(layer, []))
+                   len(level3_corrected_ous.get(layer, [])) +
+                   len(oracle_corrected_ous.get(layer, []))
             for layer in ou_fault_mask.keys()
             if (len(level1_corrected_ous.get(layer, [])) +
                 len(level2_corrected_ous.get(layer, [])) +
-                len(level3_corrected_ous.get(layer, []))) > 0
+                len(level3_corrected_ous.get(layer, [])) +
+                len(oracle_corrected_ous.get(layer, []))) > 0
+        }
+
+        repair_quality = {
+            level_name: self._finalize_repair_quality_bucket(bucket)
+            for level_name, bucket in repair_quality_buckets.items()
+            if bucket.get('attempted', 0) > 0
         }
 
         return {
             'level1_count': level1_count,
             'level2_count': level2_count,
             'level3_count': level3_count,
+            'oracle_count': oracle_count,
             'level1_prototype_repairs': level1_prototype_repairs,
             'level1_member_repairs': level1_member_repairs,
             'level1_exact_repairs': level1_exact_repairs,
             'level1_scaled_repairs': level1_scaled_repairs,
             'level1_failed_singleton': level1_failed_singleton,
+            'level1_zero_scale_failed': level1_zero_scale_failed,
             'uncorrectable_count': uncorrectable_count,
             'total_correctable': total_corrected,
+            'repair_mode': repair_mode,
+            'repair_quality': repair_quality,
             'level1_corrected_ous': level1_corrected_ous,
             'level2_corrected_ous': level2_corrected_ous,
             'level3_corrected_ous': level3_corrected_ous,
+            'oracle_corrected_ous': oracle_corrected_ous,
             'uncorrected_by_layer': uncorrected_by_layer
         }
     
@@ -1075,7 +1233,12 @@ class FaultToleranceSimulator:
                 level1_count=self._hierarchical_stats['level1_count'],
                 level2_count=self._hierarchical_stats['level2_count'],
                 level3_count=self._hierarchical_stats['level3_count'],
-                level2_similarity_avg=level2_similarity
+                level2_similarity_avg=level2_similarity,
+                level1_zero_scale_failed=self._hierarchical_stats.get('level1_zero_scale_failed', 0),
+                repair_mode=self._hierarchical_stats.get('repair_mode', 'normal'),
+            )
+            self.metrics_collector.update_repair_quality_stats(
+                self._hierarchical_stats.get('repair_quality', {})
             )
         
         # 硬件开销（包含三级容错的额外开销）
@@ -1106,6 +1269,9 @@ class FaultToleranceSimulator:
             faulty_acc=faulty_acc,
             ft_acc=ft_acc
         )
+        if hasattr(self, '_hierarchical_stats') and self._hierarchical_stats.get('repair_mode') == 'oracle':
+            if ft_acc + 0.002 < baseline_acc:
+                print("  ⚠️ Oracle restore 未接近 baseline accuracy，故障/恢复流程可能仍有问题")
         
         # 计算冗余开销
         self.metrics_collector.compute_redundancy_overhead(

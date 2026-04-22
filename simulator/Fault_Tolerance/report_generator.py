@@ -103,6 +103,21 @@ class ReportGenerator:
                 writer.writerow(['Reliability', 'Faults Corrected', rel.get('faults_corrected', 0)])
                 writer.writerow(['Reliability', 'Faults Missed', rel.get('faults_missed', 0)])
                 writer.writerow(['Reliability', 'Fault Correction Rate', f"{rel.get('fault_correction_rate', 0):.2%}"])
+                hierarchical = rel.get('hierarchical_correction', {})
+                if hierarchical:
+                    writer.writerow(['Reliability', 'Level1 Corrections', hierarchical.get('level1_corrections', 0)])
+                    writer.writerow(['Reliability', 'Level2 Corrections', hierarchical.get('level2_corrections', 0)])
+                    writer.writerow(['Reliability', 'Level3 Corrections', hierarchical.get('level3_corrections', 0)])
+                    writer.writerow(['Reliability', 'Level1 Zero Scale Failed', hierarchical.get('level1_zero_scale_failed', 0)])
+                    writer.writerow(['Reliability', 'Repair Mode', hierarchical.get('repair_mode', 'normal')])
+                repair_quality = rel.get('repair_quality', {})
+                for level_name, stats in repair_quality.items():
+                    writer.writerow(['RepairQuality', f'{level_name}.attempted', stats.get('attempted', 0)])
+                    writer.writerow(['RepairQuality', f'{level_name}.effective_improved', stats.get('effective_improved', 0)])
+                    writer.writerow(['RepairQuality', f'{level_name}.exact_restored', stats.get('exact_restored', 0)])
+                    writer.writerow(['RepairQuality', f'{level_name}.avg_before_error', f"{stats.get('avg_before_error', 0):.6f}"])
+                    writer.writerow(['RepairQuality', f'{level_name}.avg_after_error', f"{stats.get('avg_after_error', 0):.6f}"])
+                    writer.writerow(['RepairQuality', f'{level_name}.improved_rate', f"{stats.get('improved_rate', 0):.2%}"])
             
             # 硬件开销指标
             if 'hardware_overhead' in metrics:
@@ -168,10 +183,32 @@ class ReportGenerator:
                 f.write(f"| 未纠正数 | {rel.get('faults_missed', 0)} |\n")
                 f.write(f"| 检测失败数 | {rel.get('detection_failures', 0)} |\n")
                 f.write(f"| **故障纠正率** | **{rel.get('fault_correction_rate', 0):.2%}** |\n\n")
+                hierarchical = rel.get('hierarchical_correction', {})
+                if hierarchical:
+                    f.write("### 2.1 三级容错统计\n\n")
+                    f.write("| 指标 | 值 |\n")
+                    f.write("|------|----|\n")
+                    f.write(f"| Level 1纠正数 | {hierarchical.get('level1_corrections', 0)} |\n")
+                    f.write(f"| Level 2纠正数 | {hierarchical.get('level2_corrections', 0)} |\n")
+                    f.write(f"| Level 3纠正数 | {hierarchical.get('level3_corrections', 0)} |\n")
+                    f.write(f"| Level 1 zero-scale failed | {hierarchical.get('level1_zero_scale_failed', 0)} |\n")
+                    f.write(f"| 修复模式 | {hierarchical.get('repair_mode', 'normal')} |\n\n")
+                repair_quality = rel.get('repair_quality', {})
+                if repair_quality:
+                    f.write("### 2.2 修复质量统计\n\n")
+                    f.write("| Level | Attempted | Improved | Exact Restored | Avg Before Error | Avg After Error | Improved Rate |\n")
+                    f.write("|------|-----------|----------|----------------|------------------|-----------------|---------------|\n")
+                    for level_name, stats in repair_quality.items():
+                        f.write(
+                            f"| {level_name} | {stats.get('attempted', 0)} | {stats.get('effective_improved', 0)} | "
+                            f"{stats.get('exact_restored', 0)} | {stats.get('avg_before_error', 0):.6f} | "
+                            f"{stats.get('avg_after_error', 0):.6f} | {stats.get('improved_rate', 0):.2%} |\n"
+                        )
+                    f.write("\n")
                 
                 # 逐层故障统计
                 if 'layer_wise_faults' in rel and rel['layer_wise_faults']:
-                    f.write("### 2.1 逐层故障统计\n\n")
+                    f.write("### 2.3 逐层故障统计\n\n")
                     f.write("| 层名称 | 故障数 | 纠正数 | 纠正率 |\n")
                     f.write("|--------|--------|--------|--------|\n")
                     
@@ -390,4 +427,3 @@ def test_report_generator():
 
 if __name__ == "__main__":
     test_report_generator()
-

@@ -23,6 +23,7 @@ from cut import (
     ft_group_score_mask,
     ft_group_cluster_translate,
     ft_group_translate_train,
+    write_mask_sweep_report,
 )
 
 
@@ -118,6 +119,12 @@ def parse_args():
     parser.add_argument('--ft-reg-min-coverage', type=float, default=None, help='minimum layer coverage ratio required for FT regularization; default 0.0, ft-low-cost defaults to 0.1')
     parser.add_argument('--ft-reg-min-groups', type=int, default=None, help='minimum repairable group count required for FT regularization on a layer; default 1, ft-low-cost defaults to 64')
     parser.add_argument('--ft-reg-boost-after-refresh', action='store_true', help='halve the effective FT regularization interval during refresh epochs and the following epoch')
+    parser.add_argument('--ft-mask-density-sweep', action='store_true', help='explicitly compare multiple pruning keep ratios when selecting FT masks')
+    parser.add_argument('--ft-mask-keep-ratios', type=str, default='', help='comma-separated explicit mask keep ratios, e.g. 1.0,0.6667,0.4444')
+    parser.add_argument('--ft-target-coverage', type=float, default=None, help='prefer the minimum-distortion candidate that reaches this repairable coverage target')
+    parser.add_argument('--ft-prefer-sparser-mask', action='store_true', help='bias FT mask selection toward lower mask density when scores are close')
+    parser.add_argument('--ft-score-singleton-penalty', type=float, default=0.18, help='penalty applied to singleton_ratio in FTScore_v2')
+    parser.add_argument('--ft-score-zero-scale-penalty', type=float, default=0.12, help='penalty applied to zero_multiplier_ratio in FTScore_v2')
     parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
     parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
     parser.add_argument('--refresh-epochs', type=str, default=','.join(str(epoch) for epoch in ft_group_refresh_epoch), help='comma-separated group refresh epochs; empty disables refresh')
@@ -143,6 +150,15 @@ def parse_epoch_list(raw_value, allow_empty=False):
     if not allow_empty and not epoch_values:
         raise ValueError('epoch list cannot be empty')
     return epoch_values
+
+
+def parse_float_list(raw_value):
+    if raw_value is None:
+        return []
+    normalized = str(raw_value).strip()
+    if normalized == '':
+        return []
+    return [float(token.strip()) for token in normalized.split(',') if token.strip()]
 
 
 def normalize_schedule_epochs(epoch_values, checkpoint_epoch, end_epoch, ensure_final=False):
@@ -250,7 +266,10 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                          kernel_size, channel_number, pattern_value_number, mask, map_information,
                          multiple_relationship_information, reuse_ratio_information, ft_layer_enabled,
                          ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold,
-                         checkpoint_epoch, force_rebuild=False, artifact_dir='.'):
+                         checkpoint_epoch, force_rebuild=False, artifact_dir='.',
+                         ft_mask_density_sweep=False, ft_mask_keep_ratios=None,
+                         ft_target_coverage=None, ft_prefer_sparser_mask=False,
+                         ft_score_singleton_penalty=0.18, ft_score_zero_scale_penalty=0.12):
     group_information = {layer: None for layer in weight_name}
     os.makedirs(artifact_dir, exist_ok=True)
 
@@ -308,6 +327,12 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                 OU_size=OU_size,
                 target_group_size=target_group_size,
                 sim_threshold=similarity_threshold,
+                mask_density_sweep=ft_mask_density_sweep,
+                mask_keep_ratios=ft_mask_keep_ratios,
+                target_coverage=ft_target_coverage,
+                prefer_sparser_mask=ft_prefer_sparser_mask,
+                singleton_penalty=ft_score_singleton_penalty,
+                zero_scale_penalty=ft_score_zero_scale_penalty,
             )
             print('[FTScore seed] {} strategy={} coverage={:.4f} avg_group_size={:.2f} fallback={}'.format(
                 weight_name[i],
@@ -366,6 +391,8 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
         else:
             print(f'Warning: missing {group_file}, simulator will fallback to map_information.')
 
+    write_mask_sweep_report(model_name, translate_name, group_information, output_dir=artifact_dir)
+
     return mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information
 
 
@@ -396,6 +423,9 @@ if __name__ == '__main__':
     ft_translate_epoch = ft_config['ft_translate_epoch']
     ft_group_refresh_epoch = ft_config['ft_group_refresh_epoch']
     ft_reg_boost_after_refresh = ft_config['ft_reg_boost_after_refresh']
+    ft_mask_keep_ratios = parse_float_list(args.ft_mask_keep_ratios)
+    if args.ft_target_coverage is not None and not (0.0 <= args.ft_target_coverage <= 1.0):
+        raise ValueError('--ft-target-coverage must be within [0, 1]')
     artifact_dir = resolve_artifact_dir(args)
     print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={} artifact_dir={}'.format(
         ft_config['selected_preset'],
@@ -408,6 +438,14 @@ if __name__ == '__main__':
         ft_reg_min_groups,
         ft_reg_boost_after_refresh,
         artifact_dir,
+    ))
+    print('[FT score] mask_density_sweep={} keep_ratios={} target_coverage={} prefer_sparser_mask={} singleton_penalty={:.3f} zero_scale_penalty={:.3f}'.format(
+        args.ft_mask_density_sweep,
+        ft_mask_keep_ratios,
+        args.ft_target_coverage,
+        args.ft_prefer_sparser_mask,
+        args.ft_score_singleton_penalty,
+        args.ft_score_zero_scale_penalty,
     ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -526,6 +564,12 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -753,6 +797,12 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
                 output_dir=artifact_dir,
             )
         else:
@@ -895,6 +945,12 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -1122,6 +1178,12 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
                 output_dir=artifact_dir,
             )
         else:
@@ -1302,6 +1364,12 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -1529,6 +1597,12 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
                 output_dir=artifact_dir,
             )
         else:
@@ -1657,6 +1731,12 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
             )
             if build_only:
                 save_ft_build_only_projection(
@@ -1884,6 +1964,12 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_mask_density_sweep=args.ft_mask_density_sweep,
+                ft_mask_keep_ratios=ft_mask_keep_ratios,
+                ft_target_coverage=args.ft_target_coverage,
+                ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
+                ft_score_singleton_penalty=args.ft_score_singleton_penalty,
+                ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
                 output_dir=artifact_dir,
             )
         else:

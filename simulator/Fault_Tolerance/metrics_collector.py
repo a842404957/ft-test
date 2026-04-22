@@ -46,8 +46,11 @@ class MetricsCollector:
                 'level2_rate': 0.0,
                 'level3_rate': 0.0,
                 'level2_similarity_avg': 0.0,  # Level 2平均相似度
+                'level1_zero_scale_failed': 0,
+                'repair_mode': 'normal',
             }
         }
+        self.reliability_metrics['repair_quality'] = {}
         
         # 硬件开销指标
         self.hardware_metrics = {
@@ -119,12 +122,16 @@ class MetricsCollector:
                                             level1_count: int,
                                             level2_count: int,
                                             level3_count: int,
-                                            level2_similarity_avg: float = 0.0):
+                                            level2_similarity_avg: float = 0.0,
+                                            level1_zero_scale_failed: int = 0,
+                                            repair_mode: str = 'normal'):
         """更新三级容错统计"""
         self.reliability_metrics['hierarchical_correction']['level1_corrections'] = level1_count
         self.reliability_metrics['hierarchical_correction']['level2_corrections'] = level2_count
         self.reliability_metrics['hierarchical_correction']['level3_corrections'] = level3_count
         self.reliability_metrics['hierarchical_correction']['level2_similarity_avg'] = level2_similarity_avg
+        self.reliability_metrics['hierarchical_correction']['level1_zero_scale_failed'] = level1_zero_scale_failed
+        self.reliability_metrics['hierarchical_correction']['repair_mode'] = repair_mode
         
         # 计算各级纠正率
         total_corrected = level1_count + level2_count + level3_count
@@ -132,6 +139,10 @@ class MetricsCollector:
             self.reliability_metrics['hierarchical_correction']['level1_rate'] = level1_count / total_corrected
             self.reliability_metrics['hierarchical_correction']['level2_rate'] = level2_count / total_corrected
             self.reliability_metrics['hierarchical_correction']['level3_rate'] = level3_count / total_corrected
+
+    def update_repair_quality_stats(self, repair_quality: Dict[str, Any]):
+        """更新逐级修复质量统计。"""
+        self.reliability_metrics['repair_quality'] = json.loads(json.dumps(repair_quality))
     
     def update_hardware_overhead(self, 
                                 computation_latency: float,
@@ -250,10 +261,25 @@ class MetricsCollector:
         if hierarchical['level1_corrections'] + hierarchical['level2_corrections'] + hierarchical['level3_corrections'] > 0:
             print("\n🔧 三级容错策略统计:")
             print(f"  Level 1 (冗余组):     {hierarchical['level1_corrections']:4d} ({hierarchical['level1_rate']:.1%})")
+            if hierarchical.get('level1_zero_scale_failed', 0) > 0:
+                print(f"    - zero-scale failed: {hierarchical['level1_zero_scale_failed']}")
             print(f"  Level 2 (相似模式):   {hierarchical['level2_corrections']:4d} ({hierarchical['level2_rate']:.1%})")
             if hierarchical['level2_similarity_avg'] > 0:
                 print(f"    - 平均相似度:      {hierarchical['level2_similarity_avg']:.4f}")
             print(f"  Level 3 (自适应屏蔽): {hierarchical['level3_corrections']:4d} ({hierarchical['level3_rate']:.1%})")
+            if hierarchical.get('repair_mode', 'normal') != 'normal':
+                print(f"  Repair Mode:          {hierarchical['repair_mode']}")
+
+        repair_quality = self.reliability_metrics.get('repair_quality', {})
+        if repair_quality:
+            print("\n🧪 修复质量统计:")
+            for level_name, stats in repair_quality.items():
+                print(
+                    f"  {level_name}: attempted={stats.get('attempted', 0)} "
+                    f"improved={stats.get('effective_improved', 0)} "
+                    f"exact={stats.get('exact_restored', 0)} "
+                    f"improved_rate={stats.get('improved_rate', 0.0):.2%}"
+                )
         
         print("\n⚙️ 硬件开销指标:")
         print(f"  总延迟:            {self.hardware_metrics['total_latency_ns']:.2f} ns")
@@ -423,4 +449,3 @@ def test_metrics_collector():
 
 if __name__ == "__main__":
     test_metrics_collector()
-
