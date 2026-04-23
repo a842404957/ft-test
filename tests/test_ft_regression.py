@@ -14,9 +14,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from cut import _compile_ft_regularization_state, extract_ou_patterns, ft_group_score_mask, ft_group_translate_train
+from cut import (
+    _compile_ft_regularization_state,
+    budgeted_assign_members,
+    budgeted_select_prototypes,
+    extract_ou_patterns,
+    ft_budgeted_select_mask_candidate,
+    ft_budgeted_group_translate,
+    ft_group_score_mask,
+    ft_group_translate_train,
+)
 from fault_tolerance_analyse import analyse
-from main import resolve_ft_training_config
+from main import prepare_ft_artifacts, resolve_ft_training_config
 from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
 from scripts.analyse_redundancy_construction import build_redundancy_construction_report
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
@@ -196,6 +205,18 @@ def _build_zero_scale_ft_artifacts(temp_dir: Path, model_name: str = 'ToyZero'):
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_mask.pkl', mask)
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_coverage_ratio_information.pkl', coverage_ratio)
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_reuse_ratio_information.pkl', coverage_ratio)
+
+
+def _make_budget_pattern(out_ch: int, values, mask_signature: bytes = b'shared'):
+    masked = torch.tensor(values, dtype=torch.float32)
+    return {
+        'out_ch': out_ch,
+        'in_ch_start': 0,
+        'channel_span': masked.numel(),
+        'masked': masked,
+        'norm1': float(masked.abs().sum().item()),
+        'mask_signature': mask_signature,
+    }
 
 
 @contextmanager
@@ -851,6 +872,240 @@ class TestFTRegression(unittest.TestCase):
         self.assertIsNotNone(dense_like)
         self.assertIsNotNone(sparse_like)
         self.assertLess(sparse_like['estimated_singleton_ratio'], dense_like['estimated_singleton_ratio'])
+
+    def test_budgeted_prototype_selection_is_deterministic(self):
+        patterns = [
+            _make_budget_pattern(0, [1.0, 0.0]),
+            _make_budget_pattern(1, [0.9, 0.1]),
+            _make_budget_pattern(2, [0.0, 1.0]),
+            _make_budget_pattern(3, [0.1, 0.9]),
+        ]
+        selected_first = budgeted_select_prototypes(patterns, prototype_budget=2)
+        selected_second = budgeted_select_prototypes(patterns, prototype_budget=2)
+        self.assertEqual(selected_first, selected_second)
+        self.assertEqual(len(selected_first), 2)
+        self.assertEqual(len(set(selected_first)), 2)
+
+    def test_budgeted_assignment_respects_scale_candidates(self):
+        patterns = [
+            _make_budget_pattern(0, [1.0, 2.0]),
+            _make_budget_pattern(1, [2.0, 4.0]),
+            _make_budget_pattern(2, [0.5, 1.0]),
+        ]
+        groups = budgeted_assign_members(
+            pattern_list=patterns,
+            prototype_indices=[0],
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            max_scale_error=0.05,
+            exact_threshold=0.999,
+        )
+        main_group = next(group for group in groups if group['prototype']['out_ch'] == 0)
+        member_multipliers = {
+            member['pattern']['out_ch']: member['multiplier']
+            for member in main_group['members']
+            if member['role'] != 'prototype'
+        }
+        self.assertAlmostEqual(member_multipliers[1], 2.0, places=6)
+        self.assertAlmostEqual(member_multipliers[2], 0.5, places=6)
+
+    def test_budgeted_grouping_reduces_singletons_on_synthetic_data(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            weight = torch.tensor([
+                [1.0, 2.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0],
+                [2.0, 4.0, 0.0, 0.0, 2.0, 4.0, 0.0, 0.0],
+                [1.1, 2.2, 0.0, 0.0, 1.1, 2.2, 0.0, 0.0],
+                [5.0, 1.0, 0.0, 0.0, 5.0, 1.0, 0.0, 0.0],
+                [10.0, 2.0, 0.0, 0.0, 10.0, 2.0, 0.0, 0.0],
+                [5.2, 1.1, 0.0, 0.0, 5.2, 1.1, 0.0, 0.0],
+                [0.2, 0.2, 0.0, 0.0, 0.2, 0.2, 0.0, 0.0],
+                [0.4, 0.4, 0.0, 0.0, 0.4, 0.4, 0.0, 0.0],
+            ], dtype=torch.float32)
+            model.fc.weight.copy_(weight)
+
+        dense_mask = torch.ones_like(model.fc.weight)
+        _, _, _, layer_group_info = ft_budgeted_group_translate(
+            model=model,
+            in_channel=8,
+            out_channel=8,
+            weight_name='fc.weight',
+            kernel_size=1,
+            channel_number=8,
+            mask=dense_mask,
+            min_group_size=2,
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            budget_config={
+                'target_coverage': 0.6,
+                'max_singleton': 0.5,
+                'min_avg_group_size': 2.0,
+                'prototype_budget_ratio': 0.25,
+                'prototype_budget_min': 1,
+                'prototype_budget_max': 4,
+                'relax_threshold': 0.85,
+                'max_scale_error': 0.25,
+                'bucket_mode': 'nonzero_count',
+            },
+        )
+        self.assertLess(layer_group_info['singleton_ratio'], 1.0)
+        self.assertGreaterEqual(layer_group_info['avg_group_size'], 2.0)
+
+    def test_budgeted_mask_family_selection_can_pick_sparse_candidate(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            weight = torch.tensor([
+                [4.0, 4.0, 0.1, -0.1, 0.1, -0.1, 0.1, -0.1],
+                [8.0, 8.0, -0.1, 0.1, -0.1, 0.1, -0.1, 0.1],
+                [2.0, 2.0, 0.1, -0.1, 0.1, -0.1, 0.1, -0.1],
+                [6.0, 6.0, -0.1, 0.1, -0.1, 0.1, -0.1, 0.1],
+            ], dtype=torch.float32)
+            model.fc.weight[:4].copy_(weight)
+
+        _, seed_info, outputs = ft_budgeted_select_mask_candidate(
+            model=model,
+            weight_name='fc.weight',
+            in_channel=8,
+            out_channel=8,
+            kernel_size=1,
+            channel_number=8,
+            pattern_value_number=1,
+            pattern_shape_number=8,
+            OU_size=8,
+            min_group_size=2,
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            budget_config={
+                'target_coverage': 0.6,
+                'max_singleton': 0.5,
+                'min_avg_group_size': 2.0,
+                'prototype_budget_ratio': 0.25,
+                'prototype_budget_min': 1,
+                'prototype_budget_max': 4,
+                'relax_threshold': 0.85,
+                'max_scale_error': 0.25,
+                'bucket_mode': 'nonzero_count',
+                'mask_family': ['shared_topk'],
+                'mask_keep_ratios': [0.25],
+            },
+        )
+        self.assertEqual(seed_info['selected_strategy'], 'shared_topk_0.2500_budgeted')
+        self.assertEqual(outputs[3]['grouping_mode'], 'budgeted')
+        self.assertGreater(outputs[3]['coverage_ratio'], 0.0)
+
+    def test_budgeted_build_only_artifact_protocol_works(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            model = TinyTrainModel()
+            optimizer = optim.SGD(model.parameters(), lr=0.01)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_schedule': scheduler.state_dict(),
+                'epoch': 0,
+            }
+            torch.save(checkpoint, temp_dir / 'model_ToyBudget_original_parameter_epoch0_ckpt.pth')
+
+            mask = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+            map_information = {'conv.weight': torch.zeros((4, 2, 2), dtype=torch.long)}
+            multiple_relationship_information = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+            reuse_ratio_information = {'conv.weight': 0.0}
+
+            with _working_directory(temp_dir):
+                mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                    model_original=model,
+                    model_name='ToyBudget',
+                    translate_name='ft_budgeted_group_translate',
+                    weight_name=['conv.weight'],
+                    layer_in_channel=[4],
+                    layer_out_channel=[2],
+                    kernel_size=[1],
+                    channel_number=[2],
+                    pattern_value_number=[1],
+                    mask=mask,
+                    map_information=map_information,
+                    multiple_relationship_information=multiple_relationship_information,
+                    reuse_ratio_information=reuse_ratio_information,
+                    ft_layer_enabled=[True],
+                    ft_group_target_ratio=[0.75],
+                    ft_target_group_size=[2],
+                    ft_similarity_threshold=[0.85],
+                    checkpoint_epoch=0,
+                    force_rebuild=True,
+                    artifact_dir=str(artifact_dir),
+                    ft_grouping_mode='budgeted',
+                    ft_budget_config={
+                        'grouping_mode': 'budgeted',
+                        'target_coverage': 0.6,
+                        'max_singleton': 0.5,
+                        'min_avg_group_size': 2.0,
+                        'prototype_budget_ratio': 0.25,
+                        'prototype_budget_min': 1,
+                        'prototype_budget_max': 4,
+                        'relax_threshold': 0.85,
+                        'max_scale_error': 0.25,
+                        'bucket_mode': 'nonzero_count',
+                        'mask_family': ['shape_seed', 'shared_topk'],
+                        'mask_keep_ratios': [0.6667, 0.4444],
+                        'layer_overrides': {},
+                    },
+                )
+            self.assertTrue((artifact_dir / 'model_ToyBudget_ft_budgeted_group_translate_group_information.pkl').exists())
+            self.assertTrue((artifact_dir / 'model_ToyBudget_ft_budgeted_group_translate_mask.pkl').exists())
+            self.assertEqual(group_information['conv.weight']['grouping_mode'], 'budgeted')
+            self.assertIn('prototype_budget', group_information['conv.weight'])
+            self.assertIn('assignment_error_p95', group_information['conv.weight'])
+            self.assertEqual(group_information['conv.weight']['bucket_mode'], 'nonzero_count')
+
+    def test_redundancy_diagnostics_include_budgeted_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            model = TinyTrainModel()
+            with torch.no_grad():
+                model.conv.weight[0, 0, 0, 0] = 1.0
+                model.conv.weight[0, 1, 0, 0] = 2.0
+                model.conv.weight[1, 0, 0, 0] = 2.0
+                model.conv.weight[1, 1, 0, 0] = 4.0
+            mask = torch.ones_like(model.conv.weight)
+            _, _, coverage_ratio, group_info = ft_budgeted_group_translate(
+                model=model,
+                in_channel=4,
+                out_channel=2,
+                weight_name='conv.weight',
+                kernel_size=1,
+                channel_number=2,
+                mask=mask,
+                min_group_size=2,
+                exact_threshold=0.98,
+                scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+                budget_config={
+                    'target_coverage': 0.6,
+                    'max_singleton': 0.5,
+                    'min_avg_group_size': 2.0,
+                    'prototype_budget_ratio': 0.25,
+                    'prototype_budget_min': 1,
+                    'prototype_budget_max': 4,
+                    'relax_threshold': 0.85,
+                    'max_scale_error': 0.25,
+                    'bucket_mode': 'shape_family',
+                    'mask_family': ['shape_seed', 'shared_topk'],
+                    'mask_keep_ratios': [0.6667, 0.4444],
+                },
+            )
+            _write_pkl(temp_dir / 'model_ToyBudgetDiag_ft_budgeted_group_translate_group_information.pkl', {'conv.weight': group_info})
+            _write_pkl(temp_dir / 'model_ToyBudgetDiag_ft_budgeted_group_translate_mask.pkl', {'conv.weight': mask})
+            _write_pkl(temp_dir / 'model_ToyBudgetDiag_ft_budgeted_group_translate_coverage_ratio_information.pkl', {'conv.weight': coverage_ratio})
+            _write_pkl(temp_dir / 'model_ToyBudgetDiag_ft_budgeted_group_translate_reuse_ratio_information.pkl', {'conv.weight': coverage_ratio})
+
+            report = build_redundancy_construction_report('ToyBudgetDiag', 'ft_budgeted_group_translate', str(temp_dir))
+            layer = report['layers'][0]
+            self.assertEqual(layer['grouping_mode'], 'budgeted')
+            self.assertIn('prototype_budget_ratio', layer)
+            self.assertIn('assignment_error_p95', layer)
+            self.assertIn('target_coverage', layer)
+            self.assertIn('coverage_gap', layer)
+            self.assertEqual(layer['bucket_mode'], 'shape_family')
 
 
 if __name__ == '__main__':

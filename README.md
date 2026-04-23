@@ -1,6 +1,8 @@
-# ft-test V1.3.6
+# ft-test V1.3.8
 
-V1.3.6 是 FT repair validity + redundancy construction audit 版：当前推荐主路径仍然是 `ft_group_cluster_translate`，但重点已经从“低成本训练能跑”转到“修复是否真的有效、当前剪枝是否真的提高了 OU 冗余度、singleton 为什么这么多”。
+V1.3.8 进入 `Redundancy-Budgeted OU Grouping` 原型阶段：`V1.3.6` 的诊断基线已经固定，当前目标不再是继续烧全量 mask sweep，而是验证“主动预算式构组能否把 repairable coverage 和 singleton ratio 拉到可用区间”。
+
+`V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 
 ## 环境前提
 
@@ -32,6 +34,26 @@ python main.py \
   --translate ft_group_cluster_translate \
   --build-only \
   --run-tag res18_build_only
+```
+
+如果要验证新的 budgeted grouping 原型，优先用 build-only，不要先跑完整 FT train：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_budgeted_group_translate \
+  --build-only \
+  --force-rebuild \
+  --run-tag res18_budget_build \
+  --ft-grouping-mode budgeted \
+  --ft-budget-target-coverage 0.6 \
+  --ft-budget-max-singleton 0.5 \
+  --ft-budget-min-avg-group-size 2.0 \
+  --ft-prototype-budget-ratio 0.25 \
+  --ft-budget-bucket-mode nonzero_count \
+  --ft-budget-mask-family shape_seed,shared_topk,per_out_topk \
+  --ft-budget-mask-keep-ratios 0.6667,0.4444 \
+  --ft-budget-max-scale-error 0.25
 ```
 
 如果要忽略已有缓存、强制重新构建 artifacts：
@@ -67,6 +89,17 @@ FT 主路径现在支持：
 - `--translate-epochs`：控制 FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
 - `--refresh-epochs`：控制动态重分组 refresh 节点，默认 `190,200`
 - `--base-checkpoint-epoch`：控制 FT 构建/训练的起始原始 checkpoint，默认 `150`
+- `--ft-grouping-mode {ftscore,budgeted}`：FT-oriented grouping 的主模式；`--translate ft_budgeted_group_translate` 会自动启用 `budgeted`
+- `--ft-budget-target-coverage`：budgeted grouping 的目标 repairable coverage
+- `--ft-budget-max-singleton`：budgeted grouping 允许的最大 singleton ratio
+- `--ft-budget-min-avg-group-size`：budgeted grouping 期望的最小平均组大小
+- `--ft-prototype-budget-ratio` / `--ft-prototype-budget-min` / `--ft-prototype-budget-max`：每个 block bucket 的 prototype 预算
+- `--ft-budget-relax-threshold`：coverage 不足时的 relax 因子
+- `--ft-budget-max-scale-error`：member 分配到 prototype 的最大归一化误差
+- `--ft-budget-bucket-mode {exact_mask,nonzero_count,shape_family}`：budgeted grouping 的粗粒度分桶方式；默认 `nonzero_count`
+- `--ft-budget-mask-family`：budgeted build-only 的轻量 mask family；默认 `shape_seed,shared_topk,per_out_topk`
+- `--ft-budget-mask-keep-ratios`：budgeted 固定稀疏 mask family 的 keep ratio；默认 `0.6667,0.4444`
+- `--ft-budget-layer-config`：按层覆盖 budgeted grouping 参数的 JSON 文件
 
 cost preset 建议：
 

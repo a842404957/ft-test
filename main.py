@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import json
 import torch
 import torch.utils.data
 import pickle as pkl
@@ -22,6 +23,8 @@ from cut import (
     parameters_to_txt,
     ft_group_score_mask,
     ft_group_cluster_translate,
+    ft_budgeted_group_translate,
+    ft_budgeted_select_mask_candidate,
     ft_group_translate_train,
     write_mask_sweep_report,
 )
@@ -29,6 +32,7 @@ from cut import (
 
 model_name = 'Vgg16'  # select one from[Vgg16, Res18, Res50, WRN]
 translate_name = 'ft_group_cluster_translate'  # 新默认方法：面向容错的OU分组剪枝/映射
+ft_grouping_mode_default = 'ftscore'
 
 lr = 0.1
 epoches = 200
@@ -79,6 +83,18 @@ ft_cost_presets = {
         'refresh_epochs': [170, 185, 200],
     },
 }
+ft_budget_target_coverage_default = 0.6
+ft_budget_max_singleton_default = 0.5
+ft_budget_min_avg_group_size_default = 2.0
+ft_prototype_budget_ratio_default = 0.25
+ft_prototype_budget_min_default = 4
+ft_prototype_budget_max_default = 256
+ft_budget_relax_threshold_default = 0.85
+ft_budget_max_scale_error_default = 0.25
+ft_budget_bucket_mode_default = 'nonzero_count'
+ft_budget_mask_family_default = 'shape_seed,shared_topk,per_out_topk'
+ft_budget_mask_keep_ratios_default = '0.6667,0.4444'
+ft_grouping_translate_names = {'ft_group_cluster_translate', 'ft_budgeted_group_translate'}
 
 
 def get_dataloader(data_name):
@@ -108,6 +124,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='FT-oriented grouping training entry')
     parser.add_argument('--model', type=str, default=model_name, choices=['Vgg16', 'Res18', 'Res50', 'WRN'], help='model name')
     parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
+    parser.add_argument('--ft-grouping-mode', type=str, default=ft_grouping_mode_default, choices=['ftscore', 'budgeted'], help='FT grouping mode used by FT-oriented translate paths')
     parser.add_argument('--run-tag', type=str, default='', help='optional run tag; when set without --artifact-dir, artifacts are written to results/ft_runs/<model>/<translate>/<run-tag>/artifacts')
     parser.add_argument('--artifact-dir', type=str, default='', help='optional artifact directory for FT outputs; overrides the default run-tag-derived artifact location')
     parser.add_argument('--build-only', action='store_true', help='only build FT grouping artifacts and projected parameters; skip FT fine-tuning')
@@ -125,6 +142,18 @@ def parse_args():
     parser.add_argument('--ft-prefer-sparser-mask', action='store_true', help='bias FT mask selection toward lower mask density when scores are close')
     parser.add_argument('--ft-score-singleton-penalty', type=float, default=0.18, help='penalty applied to singleton_ratio in FTScore_v2')
     parser.add_argument('--ft-score-zero-scale-penalty', type=float, default=0.12, help='penalty applied to zero_multiplier_ratio in FTScore_v2')
+    parser.add_argument('--ft-budget-target-coverage', type=float, default=ft_budget_target_coverage_default, help='budgeted grouping target repairable coverage ratio')
+    parser.add_argument('--ft-budget-max-singleton', type=float, default=ft_budget_max_singleton_default, help='budgeted grouping target upper bound for singleton ratio')
+    parser.add_argument('--ft-budget-min-avg-group-size', type=float, default=ft_budget_min_avg_group_size_default, help='budgeted grouping target lower bound for average group size')
+    parser.add_argument('--ft-prototype-budget-ratio', type=float, default=ft_prototype_budget_ratio_default, help='budgeted grouping prototype budget ratio per block bucket')
+    parser.add_argument('--ft-prototype-budget-min', type=int, default=ft_prototype_budget_min_default, help='minimum prototype budget per block bucket')
+    parser.add_argument('--ft-prototype-budget-max', type=int, default=ft_prototype_budget_max_default, help='maximum prototype budget per block bucket')
+    parser.add_argument('--ft-budget-relax-threshold', type=float, default=ft_budget_relax_threshold_default, help='budgeted grouping relax factor; lower values reduce prototype budget and widen error tolerance')
+    parser.add_argument('--ft-budget-max-scale-error', type=float, default=ft_budget_max_scale_error_default, help='maximum normalized scale assignment error for budgeted grouping')
+    parser.add_argument('--ft-budget-bucket-mode', type=str, default=ft_budget_bucket_mode_default, choices=['exact_mask', 'nonzero_count', 'shape_family'], help='bucket granularity for budgeted grouping before prototype assignment')
+    parser.add_argument('--ft-budget-mask-family', type=str, default=ft_budget_mask_family_default, help='comma-separated lightweight mask family used by budgeted build-only selection')
+    parser.add_argument('--ft-budget-mask-keep-ratios', type=str, default=ft_budget_mask_keep_ratios_default, help='comma-separated keep ratios for budgeted sparse mask family candidates')
+    parser.add_argument('--ft-budget-layer-config', type=str, default='', help='optional JSON file with per-layer budgeted grouping overrides')
     parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
     parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
     parser.add_argument('--refresh-epochs', type=str, default=','.join(str(epoch) for epoch in ft_group_refresh_epoch), help='comma-separated group refresh epochs; empty disables refresh')
@@ -170,6 +199,97 @@ def normalize_schedule_epochs(epoch_values, checkpoint_epoch, end_epoch, ensure_
 
 def _flag_present(argv, flag_name):
     return any(token == flag_name or token.startswith(flag_name + '=') for token in argv)
+
+
+def is_ft_grouping_translate(translate_name):
+    return translate_name in ft_grouping_translate_names
+
+
+def resolve_ft_grouping_mode(translate_name, requested_mode):
+    if translate_name == 'ft_budgeted_group_translate':
+        return 'budgeted'
+    return requested_mode
+
+
+def _load_budget_layer_config(layer_config_path):
+    if not layer_config_path:
+        return {}
+    with open(layer_config_path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict) and 'layers' in payload and isinstance(payload['layers'], dict):
+        return payload['layers']
+    if isinstance(payload, dict):
+        return payload
+    raise ValueError('--ft-budget-layer-config must be a JSON object or contain a top-level "layers" object')
+
+
+def _parse_float_list(raw_value, *, option_name, allow_empty=False):
+    normalized = str(raw_value).strip()
+    if normalized == '':
+        if allow_empty:
+            return []
+        raise ValueError(f'{option_name} cannot be empty')
+    values = []
+    for token in normalized.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    if not values and not allow_empty:
+        raise ValueError(f'{option_name} cannot be empty')
+    return values
+
+
+def build_budgeted_grouping_config(args, translate_name):
+    grouping_mode = resolve_ft_grouping_mode(translate_name, args.ft_grouping_mode)
+    if args.ft_budget_target_coverage < 0.0 or args.ft_budget_target_coverage > 1.0:
+        raise ValueError('--ft-budget-target-coverage must be within [0, 1]')
+    if args.ft_budget_max_singleton < 0.0 or args.ft_budget_max_singleton > 1.0:
+        raise ValueError('--ft-budget-max-singleton must be within [0, 1]')
+    if args.ft_budget_min_avg_group_size < 1.0:
+        raise ValueError('--ft-budget-min-avg-group-size must be >= 1')
+    if args.ft_prototype_budget_ratio <= 0.0 or args.ft_prototype_budget_ratio > 1.0:
+        raise ValueError('--ft-prototype-budget-ratio must be within (0, 1]')
+    if args.ft_prototype_budget_min <= 0:
+        raise ValueError('--ft-prototype-budget-min must be positive')
+    if args.ft_prototype_budget_max < args.ft_prototype_budget_min:
+        raise ValueError('--ft-prototype-budget-max must be >= --ft-prototype-budget-min')
+    if args.ft_budget_relax_threshold <= 0.0 or args.ft_budget_relax_threshold >= 1.0:
+        raise ValueError('--ft-budget-relax-threshold must be within (0, 1)')
+    if args.ft_budget_max_scale_error <= 0.0:
+        raise ValueError('--ft-budget-max-scale-error must be positive')
+    budget_mask_family = [item.strip() for item in str(args.ft_budget_mask_family).split(',') if item.strip()]
+    if not budget_mask_family:
+        raise ValueError('--ft-budget-mask-family must contain at least one candidate family')
+    invalid_budget_mask_family = sorted(set(budget_mask_family) - {'shape_seed', 'shared_topk', 'per_out_topk'})
+    if invalid_budget_mask_family:
+        raise ValueError(f'unsupported --ft-budget-mask-family entries: {", ".join(invalid_budget_mask_family)}')
+    budget_mask_keep_ratios = _parse_float_list(
+        args.ft_budget_mask_keep_ratios,
+        option_name='--ft-budget-mask-keep-ratios',
+        allow_empty=True,
+    )
+    for keep_ratio in budget_mask_keep_ratios:
+        if keep_ratio <= 0.0 or keep_ratio > 1.0:
+            raise ValueError('--ft-budget-mask-keep-ratios values must be within (0, 1]')
+
+    layer_overrides = _load_budget_layer_config(args.ft_budget_layer_config)
+    return {
+        'grouping_mode': grouping_mode,
+        'target_coverage': float(args.ft_budget_target_coverage),
+        'max_singleton': float(args.ft_budget_max_singleton),
+        'min_avg_group_size': float(args.ft_budget_min_avg_group_size),
+        'prototype_budget_ratio': float(args.ft_prototype_budget_ratio),
+        'prototype_budget_min': int(args.ft_prototype_budget_min),
+        'prototype_budget_max': int(args.ft_prototype_budget_max),
+        'relax_threshold': float(args.ft_budget_relax_threshold),
+        'max_scale_error': float(args.ft_budget_max_scale_error),
+        'bucket_mode': str(args.ft_budget_bucket_mode),
+        'mask_family': budget_mask_family,
+        'mask_keep_ratios': [float(ratio) for ratio in budget_mask_keep_ratios],
+        'layer_overrides': layer_overrides,
+        'layer_config_path': os.path.abspath(args.ft_budget_layer_config) if args.ft_budget_layer_config else '',
+    }
 
 
 def resolve_ft_training_config(args, argv=None):
@@ -267,6 +387,7 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                          multiple_relationship_information, reuse_ratio_information, ft_layer_enabled,
                          ft_group_target_ratio, ft_target_group_size, ft_similarity_threshold,
                          checkpoint_epoch, force_rebuild=False, artifact_dir='.',
+                         ft_grouping_mode='ftscore', ft_budget_config=None,
                          ft_mask_density_sweep=False, ft_mask_keep_ratios=None,
                          ft_target_coverage=None, ft_prefer_sparser_mask=False,
                          ft_score_singleton_penalty=0.18, ft_score_zero_scale_penalty=0.12):
@@ -285,6 +406,20 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     if not need_regenerate and not (os.path.exists(coverage_file) or os.path.exists(reuse_file)):
         need_regenerate = True
 
+    def _flush_artifacts():
+        with open(mask_file, 'wb') as f_mask:
+            pkl.dump(mask, f_mask, pkl.HIGHEST_PROTOCOL)
+        with open(map_file, 'wb') as f_map:
+            pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
+        with open(mult_file, 'wb') as f_mult:
+            pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
+        with open(coverage_file, 'wb') as f_coverage:
+            pkl.dump(reuse_ratio_information, f_coverage, pkl.HIGHEST_PROTOCOL)
+        with open(reuse_file, 'wb') as f_reuse:
+            pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
+        with open(group_file, 'wb') as f_group:
+            pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
+
     if need_regenerate:
         if force_rebuild:
             print('[FT artifacts] force rebuild enabled; ignoring cached artifacts')
@@ -292,6 +427,7 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
         model_original.load_state_dict(checkpoint['model'])
 
         for i in range(0, len(weight_name)):
+            print('[FT artifacts] layer {} build start ({}/{})'.format(weight_name[i], i + 1, len(weight_name)))
             if not ft_layer_enabled[i]:
                 group_information[weight_name[i]] = {
                     'layer_name': weight_name[i],
@@ -311,29 +447,56 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                     'scaled_group_ratio': 0.0,
                     'groups': [],
                 }
+                _flush_artifacts()
+                print('[FT artifacts] layer {} skipped (ft_layer_enabled=False)'.format(weight_name[i]))
                 continue
 
             target_group_size = ft_target_group_size[i]
             similarity_threshold = ft_similarity_threshold[i]
-            mask[weight_name[i]], group_seed_info = ft_group_score_mask(
-                model=model_original,
-                weight_name=weight_name[i],
-                in_channel=layer_in_channel[i],
-                out_channel=layer_out_channel[i],
-                kernel_size=kernel_size[i],
-                channel_number=channel_number[i],
-                pattern_value_number=pattern_value_number[i],
-                pattern_shape_number=pattern_shape_number,
-                OU_size=OU_size,
-                target_group_size=target_group_size,
-                sim_threshold=similarity_threshold,
-                mask_density_sweep=ft_mask_density_sweep,
-                mask_keep_ratios=ft_mask_keep_ratios,
-                target_coverage=ft_target_coverage,
-                prefer_sparser_mask=ft_prefer_sparser_mask,
-                singleton_penalty=ft_score_singleton_penalty,
-                zero_scale_penalty=ft_score_zero_scale_penalty,
+            selected_group_outputs = None
+            use_budgeted_mask_family = (
+                ft_grouping_mode == 'budgeted'
+                and not ft_mask_density_sweep
+                and not ft_mask_keep_ratios
+                and ft_target_coverage is None
+                and not ft_prefer_sparser_mask
             )
+            if use_budgeted_mask_family:
+                mask[weight_name[i]], group_seed_info, selected_group_outputs = ft_budgeted_select_mask_candidate(
+                    model=model_original,
+                    weight_name=weight_name[i],
+                    in_channel=layer_in_channel[i],
+                    out_channel=layer_out_channel[i],
+                    kernel_size=kernel_size[i],
+                    channel_number=channel_number[i],
+                    pattern_value_number=pattern_value_number[i],
+                    pattern_shape_number=pattern_shape_number,
+                    OU_size=OU_size,
+                    min_group_size=ft_min_group_size,
+                    exact_threshold=ft_exact_similarity_threshold,
+                    scale_candidates=ft_scale_candidates,
+                    budget_config=ft_budget_config,
+                )
+            else:
+                mask[weight_name[i]], group_seed_info = ft_group_score_mask(
+                    model=model_original,
+                    weight_name=weight_name[i],
+                    in_channel=layer_in_channel[i],
+                    out_channel=layer_out_channel[i],
+                    kernel_size=kernel_size[i],
+                    channel_number=channel_number[i],
+                    pattern_value_number=pattern_value_number[i],
+                    pattern_shape_number=pattern_shape_number,
+                    OU_size=OU_size,
+                    target_group_size=target_group_size,
+                    sim_threshold=similarity_threshold,
+                    mask_density_sweep=ft_mask_density_sweep,
+                    mask_keep_ratios=ft_mask_keep_ratios,
+                    target_coverage=ft_target_coverage,
+                    prefer_sparser_mask=ft_prefer_sparser_mask,
+                    singleton_penalty=ft_score_singleton_penalty,
+                    zero_scale_penalty=ft_score_zero_scale_penalty,
+                )
             print('[FTScore seed] {} strategy={} coverage={:.4f} avg_group_size={:.2f} fallback={}'.format(
                 weight_name[i],
                 group_seed_info.get('selected_strategy'),
@@ -341,35 +504,37 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                 group_seed_info.get('estimated_avg_group_size', 0.0),
                 group_seed_info.get('fallback_used', False),
             ))
-            map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = ft_group_cluster_translate(
-                model=model_original,
-                in_channel=layer_in_channel[i],
-                out_channel=layer_out_channel[i],
-                weight_name=weight_name[i],
-                kernel_size=kernel_size[i],
-                channel_number=channel_number[i],
-                mask=mask[weight_name[i]],
-                min_group_size=ft_min_group_size,
-                target_group_size=target_group_size,
-                sim_threshold=similarity_threshold,
-                exact_threshold=ft_exact_similarity_threshold,
-                scale_candidates=ft_scale_candidates,
-            )
+            if selected_group_outputs is not None:
+                map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = selected_group_outputs
+            else:
+                grouping_fn = ft_budgeted_group_translate if ft_grouping_mode == 'budgeted' else ft_group_cluster_translate
+                map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = grouping_fn(
+                    model=model_original,
+                    in_channel=layer_in_channel[i],
+                    out_channel=layer_out_channel[i],
+                    weight_name=weight_name[i],
+                    kernel_size=kernel_size[i],
+                    channel_number=channel_number[i],
+                    mask=mask[weight_name[i]],
+                    min_group_size=ft_min_group_size,
+                    target_group_size=target_group_size,
+                    sim_threshold=similarity_threshold,
+                    exact_threshold=ft_exact_similarity_threshold,
+                    scale_candidates=ft_scale_candidates,
+                    grouping_mode=ft_grouping_mode,
+                    budget_config=ft_budget_config,
+                )
             group_information[weight_name[i]]['target_ratio'] = ft_group_target_ratio[i]
             group_information[weight_name[i]]['seed_info'] = group_seed_info
-
-        with open(mask_file, 'wb') as f_mask:
-            pkl.dump(mask, f_mask, pkl.HIGHEST_PROTOCOL)
-        with open(map_file, 'wb') as f_map:
-            pkl.dump(map_information, f_map, pkl.HIGHEST_PROTOCOL)
-        with open(mult_file, 'wb') as f_mult:
-            pkl.dump(multiple_relationship_information, f_mult, pkl.HIGHEST_PROTOCOL)
-        with open(coverage_file, 'wb') as f_coverage:
-            pkl.dump(reuse_ratio_information, f_coverage, pkl.HIGHEST_PROTOCOL)
-        with open(reuse_file, 'wb') as f_reuse:
-            pkl.dump(reuse_ratio_information, f_reuse, pkl.HIGHEST_PROTOCOL)
-        with open(group_file, 'wb') as f_group:
-            pkl.dump(group_information, f_group, pkl.HIGHEST_PROTOCOL)
+            group_information[weight_name[i]]['grouping_mode'] = ft_grouping_mode
+            _flush_artifacts()
+            print('[FT artifacts] layer {} build done mode={} coverage={:.4f} groups={} singleton={:.4f}'.format(
+                weight_name[i],
+                ft_grouping_mode,
+                float(group_information[weight_name[i]].get('coverage_ratio', 0.0)),
+                int(group_information[weight_name[i]].get('group_count', 0)),
+                float(group_information[weight_name[i]].get('singleton_ratio', 0.0)),
+            ))
     else:
         with open(mask_file, 'rb') as f_mask:
             mask = pkl.load(f_mask)
@@ -427,6 +592,7 @@ if __name__ == '__main__':
     if args.ft_target_coverage is not None and not (0.0 <= args.ft_target_coverage <= 1.0):
         raise ValueError('--ft-target-coverage must be within [0, 1]')
     artifact_dir = resolve_artifact_dir(args)
+    ft_budget_config = build_budgeted_grouping_config(args, translate_name)
     print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={} artifact_dir={}'.format(
         ft_config['selected_preset'],
         ft_low_cost,
@@ -446,6 +612,21 @@ if __name__ == '__main__':
         args.ft_prefer_sparser_mask,
         args.ft_score_singleton_penalty,
         args.ft_score_zero_scale_penalty,
+    ))
+    print('[FT grouping] mode={} target_coverage={:.3f} max_singleton={:.3f} min_avg_group_size={:.3f} prototype_budget_ratio={:.3f} prototype_budget=[{}, {}] relax_threshold={:.3f} max_scale_error={:.3f} bucket_mode={} mask_family={} keep_ratios={} layer_config={}'.format(
+        ft_budget_config['grouping_mode'],
+        ft_budget_config['target_coverage'],
+        ft_budget_config['max_singleton'],
+        ft_budget_config['min_avg_group_size'],
+        ft_budget_config['prototype_budget_ratio'],
+        ft_budget_config['prototype_budget_min'],
+        ft_budget_config['prototype_budget_max'],
+        ft_budget_config['relax_threshold'],
+        ft_budget_config['max_scale_error'],
+        ft_budget_config['bucket_mode'],
+        ft_budget_config['mask_family'],
+        ft_budget_config['mask_keep_ratios'],
+        ft_budget_config['layer_config_path'] or '-',
     ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -542,7 +723,7 @@ if __name__ == '__main__':
         ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
         group_information = {layer: None for layer in weight_name}
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
                 model_original=model_original,
                 model_name=model_name,
@@ -564,6 +745,8 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -756,7 +939,7 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             ft_group_translate_train(
                 model=model_original,
                 model_name=model_name,
@@ -797,6 +980,8 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -923,7 +1108,7 @@ if __name__ == '__main__':
         ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
         group_information = {layer: None for layer in weight_name}
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
                 model_original=model_original,
                 model_name=model_name,
@@ -945,6 +1130,8 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -1137,7 +1324,7 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             ft_group_translate_train(
                 model=model_original,
                 model_name=model_name,
@@ -1178,6 +1365,8 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -1342,7 +1531,7 @@ if __name__ == '__main__':
         ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
         group_information = {layer: None for layer in weight_name}
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
                 model_original=model_original,
                 model_name=model_name,
@@ -1364,6 +1553,8 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -1556,7 +1747,7 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             ft_group_translate_train(
                 model=model_original,
                 model_name=model_name,
@@ -1597,6 +1788,8 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -1709,7 +1902,7 @@ if __name__ == '__main__':
         ft_similarity_threshold = [ft_similarity_threshold_default] * len(weight_name)
         group_information = {layer: None for layer in weight_name}
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
                 model_original=model_original,
                 model_name=model_name,
@@ -1731,6 +1924,8 @@ if __name__ == '__main__':
                 checkpoint_epoch=base_checkpoint_epoch,
                 force_rebuild=force_rebuild,
                 artifact_dir=artifact_dir,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,
@@ -1923,7 +2118,7 @@ if __name__ == '__main__':
                 for i in range(0, len(weight_name)):
                     best_keep_ratio[i] = 1.0 - reuse_ratio_information[weight_name[i]]
 
-        if translate_name == 'ft_group_cluster_translate':
+        if is_ft_grouping_translate(translate_name):
             ft_group_translate_train(
                 model=model_original,
                 model_name=model_name,
@@ -1964,6 +2159,8 @@ if __name__ == '__main__':
                 ft_reg_min_coverage=ft_reg_min_coverage,
                 ft_reg_min_groups=ft_reg_min_groups,
                 ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+                ft_grouping_mode=ft_budget_config['grouping_mode'],
+                ft_budget_config=ft_budget_config,
                 ft_mask_density_sweep=args.ft_mask_density_sweep,
                 ft_mask_keep_ratios=ft_mask_keep_ratios,
                 ft_target_coverage=args.ft_target_coverage,

@@ -941,6 +941,44 @@ def _tensor_mask_signature(mask_tensor: torch.Tensor) -> bytes:
     return mask_tensor.flatten().to(torch.uint8).cpu().numpy().tobytes()
 
 
+def _tensor_mask_channel_counts(mask_tensor: torch.Tensor) -> Tuple[int, Tuple[int, ...]]:
+    if mask_tensor.dim() == 0:
+        reshaped = mask_tensor.reshape(1, 1).float()
+    elif mask_tensor.dim() == 1:
+        reshaped = mask_tensor.reshape(mask_tensor.shape[0], 1).float()
+    else:
+        reshaped = mask_tensor.reshape(mask_tensor.shape[0], -1).float()
+    channel_counts = tuple(int(value) for value in reshaped.sum(dim=1).tolist())
+    return int(sum(channel_counts)), channel_counts
+
+
+def _normalize_budget_bucket_key(bucket_key: Any):
+    if isinstance(bucket_key, tuple):
+        return tuple(_normalize_budget_bucket_key(item) for item in bucket_key)
+    if isinstance(bucket_key, bytes):
+        return bucket_key.hex()
+    return bucket_key
+
+
+def _budget_bucket_key_from_mask(mask_tensor: torch.Tensor, bucket_mode: str):
+    if bucket_mode == 'exact_mask':
+        return ('exact_mask', _tensor_mask_signature(mask_tensor))
+    nonzero_count, channel_counts = _tensor_mask_channel_counts(mask_tensor)
+    if bucket_mode == 'shape_family':
+        return ('shape_family', nonzero_count, tuple(sorted(channel_counts, reverse=True)))
+    return ('nonzero_count', nonzero_count)
+
+
+def _budget_bucket_key_from_pattern(pattern: Dict[str, Any], bucket_mode: str):
+    if bucket_mode == 'exact_mask':
+        return ('exact_mask', pattern['mask_signature'])
+    nonzero_count = int(pattern.get('mask_nonzero_count', 0))
+    channel_counts = tuple(int(value) for value in pattern.get('mask_channel_counts', (nonzero_count,)))
+    if bucket_mode == 'shape_family':
+        return ('shape_family', nonzero_count, tuple(sorted(channel_counts, reverse=True)))
+    return ('nonzero_count', nonzero_count)
+
+
 def _mean_or_zero(values: List[float]) -> float:
     if not values:
         return 0.0
@@ -1070,6 +1108,7 @@ def _pattern_from_packed_block(packed: Dict[str, Any], out_index: int, block_ind
     current_mask = packed['mask_blocks'][out_index, block_index].clone()
     raw = packed['raw_blocks'][out_index, block_index].clone()
     masked = raw * current_mask
+    mask_nonzero_count, mask_channel_counts = _tensor_mask_channel_counts(current_mask)
     return {
         'out_ch': int(out_index),
         'in_ch_start': int(packed['in_starts'][block_index].item()),
@@ -1079,6 +1118,8 @@ def _pattern_from_packed_block(packed: Dict[str, Any], out_index: int, block_ind
         'norm1': float(packed['norm1'][out_index, block_index].item()),
         'norm2': float(packed['norm2'][out_index, block_index].item()),
         'mask_signature': _tensor_mask_signature(current_mask),
+        'mask_nonzero_count': int(mask_nonzero_count),
+        'mask_channel_counts': mask_channel_counts,
         'multiplier': 1.0,
         'block_kind': packed['block_kind'],
         'block_index': int(block_index),
@@ -1267,6 +1308,7 @@ def extract_ou_patterns(model, weight_name, in_channel, out_channel, kernel_size
             raw = _extract_block_tensor(weight_tensor, out_ch, in_ch_start, channel_span)
             current_mask = _extract_block_tensor(mask_tensor, out_ch, in_ch_start, channel_span)
             masked = raw * current_mask
+            mask_nonzero_count, mask_channel_counts = _tensor_mask_channel_counts(current_mask)
             pattern_list.append({
                 'out_ch': out_ch,
                 'in_ch_start': in_ch_start,
@@ -1276,6 +1318,8 @@ def extract_ou_patterns(model, weight_name, in_channel, out_channel, kernel_size
                 'norm1': masked.abs().sum().item(),
                 'norm2': torch.norm(masked.reshape(-1).float(), p=2).item(),
                 'mask_signature': _tensor_mask_signature(current_mask),
+                'mask_nonzero_count': int(mask_nonzero_count),
+                'mask_channel_counts': mask_channel_counts,
                 'multiplier': 1.0,
                 'block_kind': 'fc' if 'fc' in weight_name else ('conv1x1' if kernel_size == 1 else 'conv3x3'),
                 'block_index': in_ch_start // block_step,
@@ -1311,6 +1355,411 @@ def search_best_power_of_two_scale(source_tensor, target_tensor, scale_candidate
             best_similarity = similarity
 
     return best_scale, best_error, best_similarity
+
+
+def _resolve_budgeted_layer_config(budget_config: Optional[Dict[str, Any]], layer_name: str) -> Dict[str, Any]:
+    budget_config = budget_config or {}
+    resolved = {
+        'target_coverage': float(budget_config.get('target_coverage', 0.6)),
+        'max_singleton': float(budget_config.get('max_singleton', 0.5)),
+        'min_avg_group_size': float(budget_config.get('min_avg_group_size', 2.0)),
+        'prototype_budget_ratio': float(budget_config.get('prototype_budget_ratio', 0.25)),
+        'prototype_budget_min': int(budget_config.get('prototype_budget_min', 4)),
+        'prototype_budget_max': int(budget_config.get('prototype_budget_max', 256)),
+        'relax_threshold': float(budget_config.get('relax_threshold', 0.85)),
+        'max_scale_error': float(budget_config.get('max_scale_error', 0.25)),
+        'bucket_mode': str(budget_config.get('bucket_mode', 'nonzero_count')),
+        'mask_family': list(budget_config.get('mask_family', ['shape_seed', 'shared_topk', 'per_out_topk'])),
+        'mask_keep_ratios': [float(value) for value in budget_config.get('mask_keep_ratios', [0.6667, 0.4444])],
+    }
+    layer_overrides = budget_config.get('layer_overrides', {}) or {}
+    layer_override = layer_overrides.get(layer_name, {})
+    if isinstance(layer_override, dict):
+        for key in resolved:
+            if key in layer_override:
+                if key.endswith('_min') or key.endswith('_max'):
+                    resolved[key] = int(layer_override[key])
+                elif key == 'bucket_mode':
+                    resolved[key] = str(layer_override[key])
+                elif key in {'mask_family'}:
+                    resolved[key] = [str(value) for value in layer_override[key]]
+                elif key in {'mask_keep_ratios'}:
+                    resolved[key] = [float(value) for value in layer_override[key]]
+                else:
+                    resolved[key] = float(layer_override[key])
+    return resolved
+
+
+def _resolve_prototype_budget(num_patterns: int, config: Dict[str, Any]) -> int:
+    if num_patterns <= 1:
+        return num_patterns
+    desired = int(round(num_patterns * float(config.get('prototype_budget_ratio', 0.25))))
+    desired = max(int(config.get('prototype_budget_min', 4)), desired)
+    desired = min(int(config.get('prototype_budget_max', 256)), desired)
+    desired = min(desired, max(1, num_patterns // 2))
+    return max(1, min(num_patterns, desired))
+
+
+def budgeted_select_prototypes(pattern_list: List[Dict[str, Any]], prototype_budget: int) -> List[int]:
+    """Deterministic farthest-first prototype selection on normalized masked vectors."""
+    if not pattern_list:
+        return []
+    if len(pattern_list) == 1:
+        return [0]
+
+    feature_matrix = torch.stack([pattern['masked'].reshape(-1).float() for pattern in pattern_list], dim=0)
+    norms = torch.norm(feature_matrix, p=2, dim=1)
+    normalized = feature_matrix / torch.clamp(norms.unsqueeze(1), min=1e-8)
+    importance = torch.tensor([float(pattern.get('norm1', feature_matrix[i].abs().sum().item())) for i, pattern in enumerate(pattern_list)])
+
+    target_budget = max(1, min(len(pattern_list), int(prototype_budget)))
+    selected = [max(range(len(pattern_list)), key=lambda index: (float(importance[index]), -index))]
+    min_distance = torch.full((len(pattern_list),), float('inf'))
+    min_distance[selected[0]] = -1.0
+
+    while len(selected) < target_budget:
+        newest = selected[-1]
+        distances = 1.0 - torch.mv(normalized, normalized[newest])
+        min_distance = torch.minimum(min_distance, distances)
+        for existing_index in selected:
+            min_distance[existing_index] = -1.0
+
+        candidate_index = max(
+            (index for index in range(len(pattern_list)) if index not in selected),
+            key=lambda index: (float(min_distance[index]), float(importance[index]), -index),
+        )
+        selected.append(candidate_index)
+
+    return selected
+
+
+def budgeted_assign_members(pattern_list: List[Dict[str, Any]],
+                            prototype_indices: List[int],
+                            scale_candidates,
+                            max_scale_error: float,
+                            exact_threshold: float,
+                            bucket_key: Any = None):
+    groups = []
+    if not pattern_list:
+        return groups
+
+    prototype_set = set(prototype_indices)
+    groups_by_index = {}
+    for prototype_index in prototype_indices:
+        prototype_pattern = pattern_list[prototype_index]
+        groups_by_index[prototype_index] = {
+            'prototype': prototype_pattern,
+            'members': [{
+                'pattern': prototype_pattern,
+                'multiplier': 1.0,
+                'similarity': 1.0,
+                'normalized_error': 0.0,
+                'role': 'prototype',
+            }],
+            'repair_mode': 'exact',
+            'bucket_key': bucket_key,
+        }
+
+    for pattern_index, pattern in enumerate(pattern_list):
+        if pattern_index in prototype_set:
+            continue
+
+        best_assignment = None
+        member_norm = float(pattern.get('norm1', pattern['masked'].abs().sum().item()))
+        for prototype_index in prototype_indices:
+            prototype_pattern = pattern_list[prototype_index]
+            scale, error, similarity = search_best_power_of_two_scale(
+                pattern['masked'],
+                prototype_pattern['masked'],
+                scale_candidates=scale_candidates,
+            )
+            normalized_error = float(error / (member_norm + 1e-8))
+            if (
+                not np.isfinite(scale)
+                or abs(scale) <= 1e-8
+                or not np.isfinite(normalized_error)
+            ):
+                continue
+
+            candidate_assignment = {
+                'prototype_index': prototype_index,
+                'multiplier': float(scale),
+                'similarity': float(similarity),
+                'normalized_error': normalized_error,
+            }
+            if best_assignment is None or (
+                candidate_assignment['normalized_error'],
+                -candidate_assignment['similarity'],
+                candidate_assignment['prototype_index'],
+            ) < (
+                best_assignment['normalized_error'],
+                -best_assignment['similarity'],
+                best_assignment['prototype_index'],
+            ):
+                best_assignment = candidate_assignment
+
+        if best_assignment is not None and best_assignment['normalized_error'] <= float(max_scale_error):
+            target_group = groups_by_index[best_assignment['prototype_index']]
+            target_group['members'].append({
+                'pattern': pattern,
+                'multiplier': best_assignment['multiplier'],
+                'similarity': best_assignment['similarity'],
+                'normalized_error': best_assignment['normalized_error'],
+                'role': 'member',
+            })
+            if abs(best_assignment['multiplier'] - 1.0) > 1e-6 or best_assignment['similarity'] < exact_threshold:
+                target_group['repair_mode'] = 'scaled'
+        else:
+            groups_by_index[pattern_index] = {
+                'prototype': pattern,
+                'members': [{
+                    'pattern': pattern,
+                    'multiplier': 1.0,
+                    'similarity': 1.0,
+                    'normalized_error': 0.0,
+                    'role': 'prototype',
+                }],
+                'repair_mode': 'exact',
+                'bucket_key': bucket_key,
+            }
+
+    groups.extend(groups_by_index.values())
+    groups.sort(key=lambda item: (item['prototype']['in_ch_start'], item['prototype']['out_ch']))
+    return groups
+
+
+def budgeted_merge_singletons(groups: List[Dict[str, Any]],
+                              scale_candidates,
+                              max_scale_error: float,
+                              exact_threshold: float,
+                              min_group_size: int = 2):
+    if not groups:
+        return groups
+
+    final_groups = list(groups)
+    singleton_groups = [group for group in final_groups if len(group['members']) < min_group_size]
+    non_singleton_groups = [group for group in final_groups if len(group['members']) >= min_group_size]
+    merged_singleton_ids = set()
+
+    for singleton_group in singleton_groups:
+        singleton_pattern = singleton_group['prototype']
+        singleton_norm = float(singleton_pattern.get('norm1', singleton_pattern['masked'].abs().sum().item()))
+        best_target = None
+
+        for target_group in non_singleton_groups:
+            if singleton_group.get('bucket_key') != target_group.get('bucket_key'):
+                continue
+            scale, error, similarity = search_best_power_of_two_scale(
+                singleton_pattern['masked'],
+                target_group['prototype']['masked'],
+                scale_candidates=scale_candidates,
+            )
+            normalized_error = float(error / (singleton_norm + 1e-8))
+            if (
+                not np.isfinite(scale)
+                or abs(scale) <= 1e-8
+                or not np.isfinite(normalized_error)
+                or normalized_error > float(max_scale_error)
+            ):
+                continue
+
+            candidate = {
+                'target_group': target_group,
+                'multiplier': float(scale),
+                'similarity': float(similarity),
+                'normalized_error': normalized_error,
+            }
+            if best_target is None or (
+                candidate['normalized_error'],
+                -candidate['similarity'],
+                candidate['target_group']['prototype']['out_ch'],
+            ) < (
+                best_target['normalized_error'],
+                -best_target['similarity'],
+                best_target['target_group']['prototype']['out_ch'],
+            ):
+                best_target = candidate
+
+        if best_target is None:
+            continue
+
+        best_target['target_group']['members'].append({
+            'pattern': singleton_pattern,
+            'multiplier': best_target['multiplier'],
+            'similarity': best_target['similarity'],
+            'normalized_error': best_target['normalized_error'],
+            'role': 'member',
+        })
+        if abs(best_target['multiplier'] - 1.0) > 1e-6 or best_target['similarity'] < exact_threshold:
+            best_target['target_group']['repair_mode'] = 'scaled'
+        merged_singleton_ids.add(id(singleton_group))
+
+    return [group for group in final_groups if id(group) not in merged_singleton_ids]
+
+
+def summarize_budgeted_grouping(layer_summary: Dict[str, Any],
+                                assignment_errors: List[float],
+                                config: Dict[str, Any],
+                                prototype_budget: int,
+                                prototype_count: int,
+                                relaxed: bool,
+                                relax_steps: int) -> Dict[str, Any]:
+    if assignment_errors:
+        assignment_error_mean = float(np.mean(assignment_errors))
+        assignment_error_p95 = float(np.percentile(assignment_errors, 95))
+    else:
+        assignment_error_mean = 0.0
+        assignment_error_p95 = 0.0
+
+    achieved_coverage = float(layer_summary.get('coverage_ratio', 0.0))
+    singleton_ratio = float(layer_summary.get('singleton_ratio', 1.0))
+    avg_group_size = float(layer_summary.get('avg_group_size', 0.0))
+    return {
+        'grouping_mode': 'budgeted',
+        'bucket_mode': str(config.get('bucket_mode', 'nonzero_count')),
+        'prototype_budget': int(prototype_budget),
+        'prototype_budget_ratio': float(config.get('prototype_budget_ratio', 0.25)),
+        'prototype_count': int(prototype_count),
+        'target_coverage': float(config.get('target_coverage', 0.6)),
+        'achieved_coverage': achieved_coverage,
+        'coverage_gap': max(float(config.get('target_coverage', 0.6)) - achieved_coverage, 0.0),
+        'singleton_ratio': singleton_ratio,
+        'avg_group_size': avg_group_size,
+        'assignment_error_mean': assignment_error_mean,
+        'assignment_error_p95': assignment_error_p95,
+        'max_scale_error': float(config.get('max_scale_error', 0.25)),
+        'budget_max_singleton': float(config.get('max_singleton', 0.5)),
+        'budget_min_avg_group_size': float(config.get('min_avg_group_size', 2.0)),
+        'prototype_budget_min': int(config.get('prototype_budget_min', 4)),
+        'prototype_budget_max': int(config.get('prototype_budget_max', 256)),
+        'relax_threshold': float(config.get('relax_threshold', 0.85)),
+        'mask_family': list(config.get('mask_family', [])),
+        'mask_keep_ratios': [float(value) for value in config.get('mask_keep_ratios', [])],
+        'relaxed': int(bool(relaxed)),
+        'relax_steps': int(relax_steps),
+    }
+
+
+def _budgeted_candidate_key(layer_summary: Dict[str, Any], budget_stats: Dict[str, Any], config: Dict[str, Any]) -> Tuple[float, ...]:
+    coverage_gap = max(float(config.get('target_coverage', 0.6)) - float(layer_summary.get('coverage_ratio', 0.0)), 0.0)
+    singleton_excess = max(float(layer_summary.get('singleton_ratio', 1.0)) - float(config.get('max_singleton', 0.5)), 0.0)
+    avg_group_gap = max(float(config.get('min_avg_group_size', 2.0)) - float(layer_summary.get('avg_group_size', 0.0)), 0.0)
+    return (
+        coverage_gap,
+        singleton_excess,
+        avg_group_gap,
+        float(budget_stats.get('assignment_error_p95', 0.0)),
+        float(budget_stats.get('assignment_error_mean', 0.0)),
+        float(layer_summary.get('singleton_ratio', 1.0)),
+        -float(layer_summary.get('coverage_ratio', 0.0)),
+    )
+
+
+def _build_budgeted_groups_for_patterns(pattern_list: List[Dict[str, Any]],
+                                        min_group_size: int,
+                                        exact_threshold: float,
+                                        scale_candidates,
+                                        config: Dict[str, Any],
+                                        bucket_key: Any = None):
+    if not pattern_list:
+        empty_summary = _build_layer_group_summary([], 0, 0, 0, 0, 0, 0, 0)
+        empty_summary.update(summarize_budgeted_grouping(empty_summary, [], config, 0, 0, False, 0))
+        return [], empty_summary
+
+    num_patterns = len(pattern_list)
+    current_config = dict(config)
+    best_result = None
+    relax_steps = 0
+    max_relax_steps = 4
+
+    for current_step in range(max_relax_steps + 1):
+        prototype_budget = _resolve_prototype_budget(num_patterns, current_config)
+        prototype_indices = budgeted_select_prototypes(pattern_list, prototype_budget)
+        current_groups = budgeted_assign_members(
+            pattern_list=pattern_list,
+            prototype_indices=prototype_indices,
+            scale_candidates=scale_candidates,
+            max_scale_error=float(current_config.get('max_scale_error', 0.25)),
+            exact_threshold=exact_threshold,
+            bucket_key=bucket_key,
+        )
+        current_groups = budgeted_merge_singletons(
+            current_groups,
+            scale_candidates=scale_candidates,
+            max_scale_error=float(current_config.get('max_scale_error', 0.25)),
+            exact_threshold=exact_threshold,
+            min_group_size=min_group_size,
+        )
+
+        repairable_block_count = 0
+        repairable_ou_count = 0
+        singleton_group_count = 0
+        exact_group_count = 0
+        scaled_group_count = 0
+        assignment_errors = []
+
+        for group in current_groups:
+            group_size = len(group['members'])
+            covered_ou_count = int(sum(int(member['pattern'].get('channel_span', 1)) for member in group['members']))
+            if group_size >= min_group_size:
+                repairable_block_count += group_size
+                repairable_ou_count += covered_ou_count
+                if group['repair_mode'] == 'exact':
+                    exact_group_count += 1
+                else:
+                    scaled_group_count += 1
+                assignment_errors.extend(
+                    float(member.get('normalized_error', 0.0))
+                    for member in group['members']
+                    if member.get('role') != 'prototype'
+                )
+            else:
+                singleton_group_count += 1
+
+        total_ou_count = int(sum(int(pattern.get('channel_span', 1)) for pattern in pattern_list))
+        layer_summary = _build_layer_group_summary(
+            layer_groups=[{'group_size': len(group['members']), 'members': group['members'], 'repair_mode': group['repair_mode']} for group in current_groups],
+            total_block_count=num_patterns,
+            total_ou_count=total_ou_count,
+            repairable_block_count=repairable_block_count,
+            repairable_ou_count=repairable_ou_count,
+            singleton_group_count=singleton_group_count,
+            exact_group_count=exact_group_count,
+            scaled_group_count=scaled_group_count,
+        )
+        budget_stats = summarize_budgeted_grouping(
+            layer_summary=layer_summary,
+            assignment_errors=assignment_errors,
+            config=current_config,
+            prototype_budget=prototype_budget,
+            prototype_count=len(current_groups),
+            relaxed=current_step > 0,
+            relax_steps=current_step,
+        )
+        layer_summary.update(budget_stats)
+
+        candidate_result = {
+            'groups': current_groups,
+            'layer_summary': layer_summary,
+            'config': dict(current_config),
+        }
+        if best_result is None or _budgeted_candidate_key(candidate_result['layer_summary'], budget_stats, current_config) < _budgeted_candidate_key(best_result['layer_summary'], best_result['layer_summary'], best_result['config']):
+            best_result = candidate_result
+
+        if (
+            float(layer_summary['coverage_ratio']) >= float(current_config.get('target_coverage', 0.6))
+            and float(layer_summary['singleton_ratio']) <= float(current_config.get('max_singleton', 0.5))
+            and float(layer_summary['avg_group_size']) >= float(current_config.get('min_avg_group_size', 2.0))
+        ):
+            break
+
+        if current_step == max_relax_steps:
+            break
+        relax_steps += 1
+        current_config['prototype_budget_ratio'] = max(0.05, float(current_config['prototype_budget_ratio']) * float(current_config.get('relax_threshold', 0.85)))
+        current_config['max_scale_error'] = min(1.0, float(current_config['max_scale_error']) / max(float(current_config.get('relax_threshold', 0.85)), 1e-6))
+
+    return best_result['groups'], best_result['layer_summary']
 
 
 def select_group_prototype(pattern_list, scale_candidates=None):
@@ -1714,6 +2163,311 @@ def _build_layer_ft_groups(pattern_list, min_group_size, target_group_size, sim_
         scaled_group_count=scaled_group_count,
     )
     return layer_groups, layer_summary
+
+
+def _build_layer_budgeted_groups_from_packed(packed: Dict[str, Any],
+                                             weight_name: str,
+                                             min_group_size: int,
+                                             exact_threshold: float,
+                                             scale_candidates,
+                                             budget_config: Dict[str, Any]):
+    layer_groups = []
+    group_id = 0
+    budgeted_layer_summaries = []
+    layer_config = _resolve_budgeted_layer_config(budget_config, weight_name)
+    bucket_mode = str(layer_config.get('bucket_mode', 'nonzero_count'))
+
+    for block_index in range(0, packed['num_blocks']):
+        bucketed_patterns: Dict[Any, List[Dict[str, Any]]] = {}
+        for out_idx in range(0, packed['out_channel']):
+            pattern = _pattern_from_packed_block(packed, out_idx, block_index)
+            bucket_key = _budget_bucket_key_from_pattern(pattern, bucket_mode)
+            bucketed_patterns.setdefault(bucket_key, []).append(pattern)
+
+        for bucket_key, bucket_patterns in sorted(
+            bucketed_patterns.items(),
+            key=lambda item: str(_normalize_budget_bucket_key(item[0])),
+        ):
+            bucket_groups, bucket_summary = _build_budgeted_groups_for_patterns(
+                pattern_list=bucket_patterns,
+                min_group_size=min_group_size,
+                exact_threshold=exact_threshold,
+                scale_candidates=scale_candidates,
+                config=layer_config,
+                bucket_key=bucket_key,
+            )
+            budgeted_layer_summaries.append(bucket_summary)
+
+            for group in bucket_groups:
+                normalized_members = []
+                for member in group['members']:
+                    pattern = member['pattern']
+                    normalized_members.append({
+                        'out_ch': pattern['out_ch'],
+                        'in_ch_start': pattern['in_ch_start'],
+                        'channel_span': pattern['channel_span'],
+                        'mask_signature': pattern['mask_signature'].hex(),
+                        'multiplier': float(member['multiplier']),
+                        'similarity': float(member['similarity']),
+                        'normalized_error': float(member.get('normalized_error', 0.0)),
+                        'role': member['role'],
+                    })
+
+                member_count = len(normalized_members)
+                covered_ou_count = int(sum(member['channel_span'] for member in normalized_members))
+                layer_groups.append({
+                    'group_id': group_id,
+                    'prototype': {
+                        'out_ch': group['prototype']['out_ch'],
+                        'in_ch_start': group['prototype']['in_ch_start'],
+                        'channel_span': group['prototype']['channel_span'],
+                        'mask_signature': group['prototype']['mask_signature'].hex(),
+                        'multiplier': 1.0,
+                    },
+                    'members': normalized_members,
+                    'mask_signature': group['prototype']['mask_signature'].hex(),
+                    'group_size': member_count,
+                    'member_count': member_count,
+                    'covered_ou_count': covered_ou_count,
+                    'repair_mode': group['repair_mode'],
+                    'bucket_key': _normalize_budget_bucket_key(group.get('bucket_key')),
+                })
+                group_id += 1
+
+    total_block_count = packed['out_channel'] * packed['num_blocks']
+    total_ou_count = total_block_count * packed['channel_span']
+    repairable_block_count = 0
+    repairable_ou_count = 0
+    singleton_group_count = 0
+    exact_group_count = 0
+    scaled_group_count = 0
+    assignment_errors = []
+
+    for group in layer_groups:
+        if group['group_size'] >= min_group_size:
+            repairable_block_count += group['group_size']
+            repairable_ou_count += int(group['covered_ou_count'])
+            if group['repair_mode'] == 'exact':
+                exact_group_count += 1
+            else:
+                scaled_group_count += 1
+            assignment_errors.extend(
+                float(member.get('normalized_error', 0.0))
+                for member in group['members']
+                if member.get('role') != 'prototype'
+            )
+        else:
+            singleton_group_count += 1
+
+    layer_summary = _build_layer_group_summary(
+        layer_groups=layer_groups,
+        total_block_count=total_block_count,
+        total_ou_count=total_ou_count,
+        repairable_block_count=repairable_block_count,
+        repairable_ou_count=repairable_ou_count,
+        singleton_group_count=singleton_group_count,
+        exact_group_count=exact_group_count,
+        scaled_group_count=scaled_group_count,
+    )
+    aggregate_budget_config = layer_config
+    prototype_budget = int(sum(int(summary.get('prototype_budget', 0)) for summary in budgeted_layer_summaries))
+    prototype_count = len(layer_groups)
+    relaxed = any(int(summary.get('relaxed', 0)) for summary in budgeted_layer_summaries)
+    relax_steps = max((int(summary.get('relax_steps', 0)) for summary in budgeted_layer_summaries), default=0)
+    layer_summary.update(summarize_budgeted_grouping(
+        layer_summary=layer_summary,
+        assignment_errors=assignment_errors,
+        config=aggregate_budget_config,
+        prototype_budget=prototype_budget,
+        prototype_count=prototype_count,
+        relaxed=relaxed,
+        relax_steps=relax_steps,
+    ))
+    return layer_groups, layer_summary
+
+
+def _build_layer_budgeted_groups(pattern_list, weight_name, min_group_size, exact_threshold, scale_candidates, budget_config):
+    layer_config = _resolve_budgeted_layer_config(budget_config, weight_name)
+    bucket_mode = str(layer_config.get('bucket_mode', 'nonzero_count'))
+    block_map: Dict[Tuple[int, Any], List[Dict[str, Any]]] = {}
+    for pattern in pattern_list:
+        bucket_key = _budget_bucket_key_from_pattern(pattern, bucket_mode)
+        block_map.setdefault((pattern['in_ch_start'], bucket_key), []).append(pattern)
+
+    layer_groups = []
+    group_id = 0
+    budgeted_layer_summaries = []
+
+    for (block_start, bucket_key), block_patterns in sorted(block_map.items(), key=lambda item: (item[0][0], str(_normalize_budget_bucket_key(item[0][1])))):
+        block_groups, block_summary = _build_budgeted_groups_for_patterns(
+            pattern_list=block_patterns,
+            min_group_size=min_group_size,
+            exact_threshold=exact_threshold,
+            scale_candidates=scale_candidates,
+            config=layer_config,
+            bucket_key=bucket_key,
+        )
+        budgeted_layer_summaries.append(block_summary)
+
+        for group in block_groups:
+            normalized_members = []
+            for member in group['members']:
+                pattern = member['pattern']
+                normalized_members.append({
+                    'out_ch': pattern['out_ch'],
+                    'in_ch_start': pattern['in_ch_start'],
+                    'channel_span': pattern['channel_span'],
+                    'mask_signature': pattern['mask_signature'].hex(),
+                    'multiplier': float(member['multiplier']),
+                    'similarity': float(member['similarity']),
+                    'normalized_error': float(member.get('normalized_error', 0.0)),
+                    'role': member['role'],
+                })
+
+            member_count = len(normalized_members)
+            covered_ou_count = int(sum(member['channel_span'] for member in normalized_members))
+            layer_groups.append({
+                'group_id': group_id,
+                'prototype': {
+                    'out_ch': group['prototype']['out_ch'],
+                    'in_ch_start': group['prototype']['in_ch_start'],
+                    'channel_span': group['prototype']['channel_span'],
+                    'mask_signature': group['prototype']['mask_signature'].hex(),
+                    'multiplier': 1.0,
+                },
+                'members': normalized_members,
+                'mask_signature': group['prototype']['mask_signature'].hex(),
+                'group_size': member_count,
+                'member_count': member_count,
+                'covered_ou_count': covered_ou_count,
+                'repair_mode': group['repair_mode'],
+                'bucket_key': _normalize_budget_bucket_key(group.get('bucket_key')),
+            })
+            group_id += 1
+
+    repairable_block_count = 0
+    repairable_ou_count = 0
+    singleton_group_count = 0
+    exact_group_count = 0
+    scaled_group_count = 0
+    assignment_errors = []
+    for group in layer_groups:
+        if group['group_size'] >= min_group_size:
+            repairable_block_count += group['group_size']
+            repairable_ou_count += int(group['covered_ou_count'])
+            if group['repair_mode'] == 'exact':
+                exact_group_count += 1
+            else:
+                scaled_group_count += 1
+            assignment_errors.extend(
+                float(member.get('normalized_error', 0.0))
+                for member in group['members']
+                if member.get('role') != 'prototype'
+            )
+        else:
+            singleton_group_count += 1
+
+    total_block_count = len(pattern_list)
+    total_ou_count = int(sum(pattern['channel_span'] for pattern in pattern_list))
+    layer_summary = _build_layer_group_summary(
+        layer_groups=layer_groups,
+        total_block_count=total_block_count,
+        total_ou_count=total_ou_count,
+        repairable_block_count=repairable_block_count,
+        repairable_ou_count=repairable_ou_count,
+        singleton_group_count=singleton_group_count,
+        exact_group_count=exact_group_count,
+        scaled_group_count=scaled_group_count,
+    )
+    aggregate_budget_config = layer_config
+    prototype_budget = int(sum(int(summary.get('prototype_budget', 0)) for summary in budgeted_layer_summaries))
+    prototype_count = len(layer_groups)
+    relaxed = any(int(summary.get('relaxed', 0)) for summary in budgeted_layer_summaries)
+    relax_steps = max((int(summary.get('relax_steps', 0)) for summary in budgeted_layer_summaries), default=0)
+    layer_summary.update(summarize_budgeted_grouping(
+        layer_summary=layer_summary,
+        assignment_errors=assignment_errors,
+        config=aggregate_budget_config,
+        prototype_budget=prototype_budget,
+        prototype_count=prototype_count,
+        relaxed=relaxed,
+        relax_steps=relax_steps,
+    ))
+    return layer_groups, layer_summary
+
+
+def _materialize_layer_group_outputs(layer_groups, layer_summary, weight_name, in_channel, out_channel, kernel_size, grouping_mode='ftscore', extra_fields=None):
+    map_table = torch.full((in_channel, out_channel, 2), -1, dtype=torch.long)
+    if 'fc' in weight_name:
+        multiple_relationship_table = torch.ones(out_channel, in_channel)
+    else:
+        multiple_relationship_table = torch.ones(out_channel, in_channel, kernel_size, kernel_size)
+
+    write_cursors = [0] * in_channel
+    for group in layer_groups:
+        prototype = group['prototype']
+        proto_out = int(prototype['out_ch'])
+        proto_in = int(prototype['in_ch_start'])
+        proto_span = int(prototype.get('channel_span', 1))
+        proto_multiplier = float(prototype.get('multiplier', 1.0))
+
+        for offset in range(0, proto_span):
+            member_in = proto_in + offset
+            if 'fc' in weight_name:
+                multiple_relationship_table[proto_out][member_in] = 1.0
+            else:
+                multiple_relationship_table[proto_out][member_in] = torch.ones(kernel_size, kernel_size)
+
+        for member in group['members']:
+            member_out = int(member['out_ch'])
+            member_in = int(member['in_ch_start'])
+            member_span = int(member.get('channel_span', 1))
+            member_multiplier = float(member.get('multiplier', 1.0))
+
+            for offset in range(0, member_span):
+                target_in = member_in + offset
+                scale_value = member_multiplier / proto_multiplier if abs(proto_multiplier) > 1e-8 else member_multiplier
+                if 'fc' in weight_name:
+                    multiple_relationship_table[member_out][target_in] = scale_value
+                else:
+                    multiple_relationship_table[member_out][target_in] = torch.ones(kernel_size, kernel_size) * scale_value
+
+                if member.get('role') == 'prototype':
+                    continue
+                cursor = write_cursors[target_in]
+                if cursor < out_channel:
+                    map_table[target_in][cursor][0] = member_out
+                    map_table[target_in][cursor][1] = proto_out
+                    write_cursors[target_in] += 1
+
+    layer_group_information = {
+        'layer_name': weight_name,
+        'group_count': layer_summary['group_count'],
+        'block_count': layer_summary['block_count'],
+        'ou_count': layer_summary['ou_count'],
+        'repairable_block_count': layer_summary['repairable_block_count'],
+        'repairable_ou_count': layer_summary['repairable_ou_count'],
+        'coverage_ratio': layer_summary['coverage_ratio'],
+        'block_coverage_ratio': layer_summary['block_coverage_ratio'],
+        'singleton_group_count': layer_summary['singleton_group_count'],
+        'singleton_ratio': layer_summary['singleton_ratio'],
+        'avg_group_size': layer_summary['avg_group_size'],
+        'max_group_size': layer_summary.get('max_group_size', 0),
+        'exact_group_count': layer_summary['exact_group_count'],
+        'scaled_group_count': layer_summary['scaled_group_count'],
+        'exact_group_ratio': layer_summary['exact_group_ratio'],
+        'scaled_group_ratio': layer_summary['scaled_group_ratio'],
+        'zero_multiplier_count': layer_summary.get('zero_multiplier_count', 0),
+        'nonzero_multiplier_count': layer_summary.get('nonzero_multiplier_count', 0),
+        'zero_multiplier_ratio': layer_summary.get('zero_multiplier_ratio', 0.0),
+        'nonzero_multiplier_ratio': layer_summary.get('nonzero_multiplier_ratio', 0.0),
+        'scale_distribution': layer_summary.get('scale_distribution', {}),
+        'grouping_mode': grouping_mode,
+        'groups': layer_groups,
+    }
+    if extra_fields:
+        layer_group_information.update(extra_fields)
+    return map_table, multiple_relationship_table, layer_summary['coverage_ratio'], layer_group_information
 
 
 def summarize_group_information(group_information, layer_names=None, ft_layer_enabled=None):
@@ -2208,11 +2962,179 @@ def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size
     return best_mask, group_seed_info
 
 
+def _build_budgeted_mask_family_candidates(model, weight_name, in_channel, out_channel, kernel_size,
+                                           channel_number, pattern_value_number, pattern_shape_number,
+                                           OU_size, budget_config):
+    try:
+        shape_seed_mask = get_shape_mask(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            kernel_size=kernel_size,
+            channel_number=channel_number,
+            pattern_value_number=pattern_value_number,
+            pattern_shape_number=pattern_shape_number,
+            OU_size=OU_size,
+        )
+    except Exception:
+        shape_seed_mask = torch.ones_like(model.state_dict()[weight_name].detach().cpu())
+
+    raw_weight = model.state_dict()[weight_name].detach().cpu()
+    family = [item for item in budget_config.get('mask_family', ['shape_seed', 'shared_topk', 'per_out_topk']) if item]
+    keep_ratios = [max(0.05, min(1.0, float(ratio))) for ratio in budget_config.get('mask_keep_ratios', [0.6667, 0.4444])]
+    candidate_masks = []
+    if 'shape_seed' in family:
+        candidate_masks.append(('shape_seed_budgeted', shape_seed_mask))
+    for keep_ratio in keep_ratios:
+        if 'shared_topk' in family:
+            candidate_masks.append((f'shared_topk_{keep_ratio:.4f}_budgeted', _build_shared_topk_mask(
+                model=model,
+                weight_name=weight_name,
+                in_channel=in_channel,
+                out_channel=out_channel,
+                channel_number=channel_number,
+                keep_ratio=keep_ratio,
+            )))
+        if 'per_out_topk' in family:
+            candidate_masks.append((f'per_out_topk_{keep_ratio:.4f}_budgeted', _build_per_out_topk_mask(
+                model=model,
+                weight_name=weight_name,
+                in_channel=in_channel,
+                out_channel=out_channel,
+                channel_number=channel_number,
+                keep_ratio=keep_ratio,
+            )))
+    if not candidate_masks:
+        candidate_masks.append(('dense_mask_budgeted', torch.ones_like(raw_weight)))
+
+    deduplicated = []
+    for strategy_name, candidate_mask in candidate_masks:
+        if any(torch.equal(candidate_mask, existing_mask) for _, existing_mask in deduplicated):
+            continue
+        deduplicated.append((strategy_name, candidate_mask))
+    return deduplicated
+
+
+def _budgeted_candidate_selection_key(candidate_summary, prefer_sparser=True):
+    return (
+        max(float(candidate_summary.get('target_coverage', 0.0)) - float(candidate_summary.get('estimated_coverage', 0.0)), 0.0),
+        max(float(candidate_summary.get('estimated_singleton_ratio', 1.0)) - float(candidate_summary.get('budget_max_singleton', 1.0)), 0.0),
+        max(float(candidate_summary.get('budget_min_avg_group_size', 0.0)) - float(candidate_summary.get('estimated_avg_group_size', 0.0)), 0.0),
+        float(candidate_summary.get('estimated_assignment_error_p95', 0.0)),
+        float(candidate_summary.get('estimated_assignment_error_mean', 0.0)),
+        float(candidate_summary.get('mask_density', 0.0)) if prefer_sparser else 0.0,
+        -float(candidate_summary.get('estimated_coverage', 0.0)),
+        float(candidate_summary.get('estimated_singleton_ratio', 1.0)),
+        -float(candidate_summary.get('estimated_avg_group_size', 0.0)),
+    )
+
+
+def ft_budgeted_select_mask_candidate(model, weight_name, in_channel, out_channel, kernel_size,
+                                      channel_number, pattern_value_number, pattern_shape_number,
+                                      OU_size, min_group_size=2, exact_threshold=0.98,
+                                      scale_candidates=None, budget_config=None):
+    if scale_candidates is None:
+        scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+    budget_config = dict(budget_config or {})
+    raw_weight = model.state_dict()[weight_name].detach().cpu()
+    candidate_masks = _build_budgeted_mask_family_candidates(
+        model=model,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        channel_number=channel_number,
+        pattern_value_number=pattern_value_number,
+        pattern_shape_number=pattern_shape_number,
+        OU_size=OU_size,
+        budget_config=budget_config,
+    )
+
+    valid_candidates = []
+    candidate_summaries = []
+    for strategy_name, candidate_mask in candidate_masks:
+        map_info, multiple_info, coverage_ratio, group_info = ft_budgeted_group_translate(
+            model=model,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            weight_name=weight_name,
+            kernel_size=kernel_size,
+            channel_number=channel_number,
+            mask=candidate_mask,
+            min_group_size=min_group_size,
+            exact_threshold=exact_threshold,
+            scale_candidates=scale_candidates,
+            budget_config=budget_config,
+        )
+        pruning_distortion = float((raw_weight - raw_weight * candidate_mask).abs().sum().item() / (raw_weight.abs().sum().item() + 1e-8))
+        mask_density = float(candidate_mask.sum().item() / max(candidate_mask.numel(), 1))
+        candidate_summary = {
+            'strategy': strategy_name,
+            'mask_density': mask_density,
+            'estimated_coverage': float(group_info.get('coverage_ratio', coverage_ratio)),
+            'estimated_block_coverage': float(group_info.get('block_coverage_ratio', 0.0)),
+            'estimated_repairable_ou_ratio': float(group_info.get('coverage_ratio', coverage_ratio)),
+            'estimated_avg_group_size': float(group_info.get('avg_group_size', 0.0)),
+            'estimated_group_count': int(group_info.get('group_count', 0)),
+            'estimated_singleton_ratio': float(group_info.get('singleton_ratio', 1.0)),
+            'estimated_zero_multiplier_ratio': float(group_info.get('zero_multiplier_ratio', 0.0)),
+            'estimated_exact_group_ratio': float(group_info.get('exact_group_ratio', 0.0)),
+            'estimated_scaled_group_ratio': float(group_info.get('scaled_group_ratio', 0.0)),
+            'estimated_max_group_size': int(group_info.get('max_group_size', 0)),
+            'estimated_scale_distribution': group_info.get('scale_distribution', {}),
+            'estimated_assignment_error_mean': float(group_info.get('assignment_error_mean', 0.0)),
+            'estimated_assignment_error_p95': float(group_info.get('assignment_error_p95', 0.0)),
+            'pruning_distortion': pruning_distortion,
+            'target_coverage': float(group_info.get('target_coverage', budget_config.get('target_coverage', 0.0))),
+            'budget_max_singleton': float(group_info.get('budget_max_singleton', budget_config.get('max_singleton', 0.5))),
+            'budget_min_avg_group_size': float(group_info.get('budget_min_avg_group_size', budget_config.get('min_avg_group_size', 2.0))),
+            'target_coverage_satisfied': bool(float(group_info.get('coverage_ratio', coverage_ratio)) >= float(budget_config.get('target_coverage', 0.0))),
+            'target_singleton_satisfied': bool(float(group_info.get('singleton_ratio', 1.0)) <= float(budget_config.get('max_singleton', 1.0))),
+            'target_avg_group_size_satisfied': bool(float(group_info.get('avg_group_size', 0.0)) >= float(budget_config.get('min_avg_group_size', 0.0))),
+            'selected': False,
+        }
+        candidate_summaries.append(candidate_summary)
+        valid_candidates.append((candidate_summary, candidate_mask, (map_info, multiple_info, coverage_ratio, group_info)))
+
+    best_summary, best_mask, best_outputs = min(
+        valid_candidates,
+        key=lambda item: _budgeted_candidate_selection_key(item[0]),
+    )
+    for summary in candidate_summaries:
+        if summary['strategy'] == best_summary['strategy']:
+            summary['selected'] = True
+
+    group_seed_info = {
+        'selected_strategy': best_summary['strategy'],
+        'estimated_coverage': best_summary['estimated_coverage'],
+        'estimated_block_coverage': best_summary['estimated_block_coverage'],
+        'estimated_avg_group_size': best_summary['estimated_avg_group_size'],
+        'estimated_group_count': best_summary['estimated_group_count'],
+        'estimated_singleton_ratio': best_summary['estimated_singleton_ratio'],
+        'estimated_zero_multiplier_ratio': best_summary['estimated_zero_multiplier_ratio'],
+        'estimated_exact_group_ratio': best_summary['estimated_exact_group_ratio'],
+        'estimated_scaled_group_ratio': best_summary['estimated_scaled_group_ratio'],
+        'estimated_max_group_size': best_summary['estimated_max_group_size'],
+        'estimated_scale_distribution': best_summary['estimated_scale_distribution'],
+        'mask_density': best_summary['mask_density'],
+        'avg_intra_group_similarity': 0.0,
+        'pruning_distortion': best_summary['pruning_distortion'],
+        'candidate_count': len(candidate_summaries),
+        'fallback_used': False,
+        'candidate_summaries': candidate_summaries,
+        'budgeted_mask_family': list(budget_config.get('mask_family', [])),
+        'budgeted_mask_keep_ratios': [float(value) for value in budget_config.get('mask_keep_ratios', [])],
+        'budgeted_bucket_mode': str(budget_config.get('bucket_mode', 'nonzero_count')),
+    }
+    return best_mask, group_seed_info, best_outputs
+
+
 def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
                                kernel_size, channel_number, mask,
                                min_group_size=2, target_group_size=4,
                                sim_threshold=0.85, exact_threshold=0.98,
-                               scale_candidates=None):
+                               scale_candidates=None, grouping_mode='ftscore', budget_config=None):
     """构建FT-oriented group，并输出兼容旧接口的map/multiple文件。"""
     if scale_candidates is None:
         scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -2256,73 +3178,96 @@ def ft_group_cluster_translate(model, in_channel, out_channel, weight_name,
             scale_candidates=scale_candidates,
         )
 
-    map_table = torch.full((in_channel, out_channel, 2), -1, dtype=torch.long)
-    if 'fc' in weight_name:
-        multiple_relationship_table = torch.ones(out_channel, in_channel)
+    return _materialize_layer_group_outputs(
+        layer_groups=layer_groups,
+        layer_summary=layer_summary,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        grouping_mode='ftscore',
+    )
+
+
+def ft_budgeted_group_translate(model, in_channel, out_channel, weight_name,
+                                kernel_size, channel_number, mask,
+                                min_group_size=2, target_group_size=4,
+                                sim_threshold=0.85, exact_threshold=0.98,
+                                scale_candidates=None, grouping_mode='budgeted',
+                                budget_config=None):
+    """Active redundancy grouping with prototype budgets and bounded assignment error."""
+    if scale_candidates is None:
+        scale_candidates = [0.25, 0.5, 1.0, 2.0, 4.0]
+
+    weight_tensor = model.state_dict()[weight_name].detach().cpu()
+    mask_tensor = mask.detach().cpu() if mask is not None else torch.ones_like(weight_tensor)
+    packed = _pack_even_layer_blocks(
+        weight_tensor=weight_tensor,
+        mask_tensor=mask_tensor,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        channel_number=channel_number,
+    )
+    if packed is not None:
+        layer_groups, layer_summary = _build_layer_budgeted_groups_from_packed(
+            packed=packed,
+            weight_name=weight_name,
+            min_group_size=min_group_size,
+            exact_threshold=exact_threshold,
+            scale_candidates=scale_candidates,
+            budget_config=budget_config or {},
+        )
     else:
-        multiple_relationship_table = torch.ones(out_channel, in_channel, kernel_size, kernel_size)
+        pattern_list = extract_ou_patterns(
+            model=model,
+            weight_name=weight_name,
+            in_channel=in_channel,
+            out_channel=out_channel,
+            kernel_size=kernel_size,
+            channel_number=channel_number,
+            mask=mask,
+        )
+        layer_groups, layer_summary = _build_layer_budgeted_groups(
+            pattern_list=pattern_list,
+            weight_name=weight_name,
+            min_group_size=min_group_size,
+            exact_threshold=exact_threshold,
+            scale_candidates=scale_candidates,
+            budget_config=budget_config or {},
+        )
 
-    write_cursors = [0] * in_channel
-    for group in layer_groups:
-        prototype = group['prototype']
-        proto_out = int(prototype['out_ch'])
-        proto_in = int(prototype['in_ch_start'])
-        proto_span = int(prototype.get('channel_span', 1))
-
-        for offset in range(0, proto_span):
-            member_in = proto_in + offset
-            if 'fc' in weight_name:
-                multiple_relationship_table[proto_out][member_in] = 1.0
-            else:
-                multiple_relationship_table[proto_out][member_in] = torch.ones(kernel_size, kernel_size)
-
-        for member in group['members']:
-            member_out = int(member['out_ch'])
-            member_in = int(member['in_ch_start'])
-            member_span = int(member.get('channel_span', 1))
-            multiplier = float(member.get('multiplier', 1.0))
-
-            for offset in range(0, member_span):
-                target_in = member_in + offset
-                if 'fc' in weight_name:
-                    multiple_relationship_table[member_out][target_in] = multiplier
-                else:
-                    multiple_relationship_table[member_out][target_in] = torch.ones(kernel_size, kernel_size) * multiplier
-
-                if member.get('role') == 'prototype':
-                    continue
-
-                cursor = write_cursors[target_in]
-                if cursor < out_channel:
-                    map_table[target_in][cursor][0] = member_out
-                    map_table[target_in][cursor][1] = proto_out
-                    write_cursors[target_in] += 1
-
-    layer_group_information = {
-        'layer_name': weight_name,
-        'group_count': layer_summary['group_count'],
-        'block_count': layer_summary['block_count'],
-        'ou_count': layer_summary['ou_count'],
-        'repairable_block_count': layer_summary['repairable_block_count'],
-        'repairable_ou_count': layer_summary['repairable_ou_count'],
-        'coverage_ratio': layer_summary['coverage_ratio'],
-        'block_coverage_ratio': layer_summary['block_coverage_ratio'],
-        'singleton_group_count': layer_summary['singleton_group_count'],
-        'singleton_ratio': layer_summary['singleton_ratio'],
-        'avg_group_size': layer_summary['avg_group_size'],
-        'max_group_size': layer_summary.get('max_group_size', 0),
-        'exact_group_count': layer_summary['exact_group_count'],
-        'scaled_group_count': layer_summary['scaled_group_count'],
-        'exact_group_ratio': layer_summary['exact_group_ratio'],
-        'scaled_group_ratio': layer_summary['scaled_group_ratio'],
-        'zero_multiplier_count': layer_summary.get('zero_multiplier_count', 0),
-        'nonzero_multiplier_count': layer_summary.get('nonzero_multiplier_count', 0),
-        'zero_multiplier_ratio': layer_summary.get('zero_multiplier_ratio', 0.0),
-        'nonzero_multiplier_ratio': layer_summary.get('nonzero_multiplier_ratio', 0.0),
-        'scale_distribution': layer_summary.get('scale_distribution', {}),
-        'groups': layer_groups,
-    }
-    return map_table, multiple_relationship_table, layer_summary['coverage_ratio'], layer_group_information
+    return _materialize_layer_group_outputs(
+        layer_groups=layer_groups,
+        layer_summary=layer_summary,
+        weight_name=weight_name,
+        in_channel=in_channel,
+        out_channel=out_channel,
+        kernel_size=kernel_size,
+        grouping_mode='budgeted',
+        extra_fields={
+            'bucket_mode': layer_summary.get('bucket_mode', 'nonzero_count'),
+            'prototype_budget': int(layer_summary.get('prototype_budget', 0)),
+            'prototype_budget_ratio': float(layer_summary.get('prototype_budget_ratio', 0.0)),
+            'prototype_count': int(layer_summary.get('prototype_count', len(layer_groups))),
+            'target_coverage': float(layer_summary.get('target_coverage', 0.0)),
+            'achieved_coverage': float(layer_summary.get('achieved_coverage', layer_summary.get('coverage_ratio', 0.0))),
+            'coverage_gap': float(layer_summary.get('coverage_gap', 0.0)),
+            'assignment_error_mean': float(layer_summary.get('assignment_error_mean', 0.0)),
+            'assignment_error_p95': float(layer_summary.get('assignment_error_p95', 0.0)),
+            'max_scale_error': float(layer_summary.get('max_scale_error', 0.0)),
+            'budget_max_singleton': float(layer_summary.get('budget_max_singleton', 0.0)),
+            'budget_min_avg_group_size': float(layer_summary.get('budget_min_avg_group_size', 0.0)),
+            'prototype_budget_min': int(layer_summary.get('prototype_budget_min', 0)),
+            'prototype_budget_max': int(layer_summary.get('prototype_budget_max', 0)),
+            'relax_threshold': float(layer_summary.get('relax_threshold', 0.0)),
+            'mask_family': list(layer_summary.get('mask_family', [])),
+            'mask_keep_ratios': [float(value) for value in layer_summary.get('mask_keep_ratios', [])],
+            'relaxed': int(layer_summary.get('relaxed', 0)),
+            'relax_steps': int(layer_summary.get('relax_steps', 0)),
+        },
+    )
 
 
 def _get_group_member_entries(layer_group_information):
@@ -2474,6 +3419,8 @@ def ft_group_translate_train(model, model_name, translate_name,
                              ft_reg_min_coverage=0.0,
                              ft_reg_min_groups=1,
                              ft_reg_boost_after_refresh=False,
+                             ft_grouping_mode='ftscore',
+                             ft_budget_config=None,
                              ft_mask_density_sweep=False,
                              ft_mask_keep_ratios=None,
                              ft_target_coverage=None,
@@ -2682,7 +3629,8 @@ def ft_group_translate_train(model, model_name, translate_name,
                         zero_scale_penalty=ft_score_zero_scale_penalty,
                     )
                     print('[FT refresh] epoch {} layer {} regroup'.format(epoch + 1, weight_name[i]))
-                    candidate_map_information[weight_name[i]], candidate_multiple_relationship_information[weight_name[i]], candidate_reuse_ratio_information[weight_name[i]], candidate_group_information[weight_name[i]] = ft_group_cluster_translate(
+                    grouping_fn = ft_budgeted_group_translate if ft_grouping_mode == 'budgeted' else ft_group_cluster_translate
+                    candidate_map_information[weight_name[i]], candidate_multiple_relationship_information[weight_name[i]], candidate_reuse_ratio_information[weight_name[i]], candidate_group_information[weight_name[i]] = grouping_fn(
                         model=model,
                         in_channel=in_channel[i],
                         out_channel=out_channel[i],
@@ -2695,8 +3643,11 @@ def ft_group_translate_train(model, model_name, translate_name,
                         sim_threshold=sim_threshold_list[i],
                         exact_threshold=exact_threshold,
                         scale_candidates=scale_candidates,
+                        grouping_mode=ft_grouping_mode,
+                        budget_config=ft_budget_config,
                     )
                     candidate_group_information[weight_name[i]]['seed_info'] = group_seed_info
+                    candidate_group_information[weight_name[i]]['grouping_mode'] = ft_grouping_mode
 
                 after_summary = summarize_group_information(candidate_group_information, weight_name, ft_layer_enabled)
                 accepted = _refresh_acceptance_score(after_summary) + 1e-8 >= _refresh_acceptance_score(before_summary)

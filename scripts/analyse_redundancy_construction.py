@@ -87,6 +87,7 @@ def _layer_diag_from_group_info(layer_name: str, layer_group_info: Dict[str, Any
     diagnostics = {
         'layer': layer_name,
         'data_source': 'group_information',
+        'grouping_mode': layer_group_info.get('grouping_mode', 'ftscore'),
         'selected_mask_strategy': seed_info.get('selected_strategy', ''),
         'mask_density': _mask_density(layer_mask),
         'pattern_value_number': _infer_pattern_value_number(layer_mask),
@@ -111,6 +112,20 @@ def _layer_diag_from_group_info(layer_name: str, layer_group_info: Dict[str, Any
         'target_ratio': float(layer_group_info.get('target_ratio', 0.0)),
         'candidate_count': int(seed_info.get('candidate_count', 0)),
         'candidate_summaries': seed_info.get('candidate_summaries', []),
+        'prototype_budget_ratio': float(layer_group_info.get('prototype_budget_ratio', 0.0)),
+        'prototype_budget': int(layer_group_info.get('prototype_budget', 0)),
+        'prototype_count': int(layer_group_info.get('prototype_count', layer_group_info.get('group_count', len(groups)))),
+        'bucket_mode': str(layer_group_info.get('bucket_mode', '')),
+        'mask_family': layer_group_info.get('mask_family', []),
+        'mask_keep_ratios': layer_group_info.get('mask_keep_ratios', []),
+        'target_coverage': float(layer_group_info.get('target_coverage', 0.0)),
+        'achieved_coverage': float(layer_group_info.get('achieved_coverage', layer_group_info.get('coverage_ratio', 0.0))),
+        'coverage_gap': float(layer_group_info.get('coverage_gap', 0.0)),
+        'assignment_error_mean': float(layer_group_info.get('assignment_error_mean', 0.0)),
+        'assignment_error_p95': float(layer_group_info.get('assignment_error_p95', 0.0)),
+        'max_scale_error': float(layer_group_info.get('max_scale_error', 0.0)),
+        'relaxed': int(layer_group_info.get('relaxed', 0)),
+        'relax_steps': int(layer_group_info.get('relax_steps', 0)),
     }
     diagnostics['issue_tags'] = _infer_issue_tags(diagnostics)
     return diagnostics
@@ -149,6 +164,7 @@ def _layer_diag_from_parser(layer_name: str, groups, loader: PatternDataLoader) 
     diagnostics = {
         'layer': layer_name,
         'data_source': 'map_information_fallback',
+        'grouping_mode': 'legacy_prap_fallback',
         'selected_mask_strategy': 'legacy_prap_fallback',
         'mask_density': _mask_density(layer_mask),
         'pattern_value_number': _infer_pattern_value_number(layer_mask),
@@ -173,6 +189,20 @@ def _layer_diag_from_parser(layer_name: str, groups, loader: PatternDataLoader) 
         'target_ratio': 0.0,
         'candidate_count': 0,
         'candidate_summaries': [],
+        'prototype_budget_ratio': 0.0,
+        'prototype_budget': 0,
+        'prototype_count': len(groups),
+        'bucket_mode': '',
+        'mask_family': [],
+        'mask_keep_ratios': [],
+        'target_coverage': 0.0,
+        'achieved_coverage': _safe_ratio(repairable_ous, total_ous),
+        'coverage_gap': 0.0,
+        'assignment_error_mean': 0.0,
+        'assignment_error_p95': 0.0,
+        'max_scale_error': 0.0,
+        'relaxed': 0,
+        'relax_steps': 0,
     }
     diagnostics['issue_tags'] = _infer_issue_tags(diagnostics)
     return diagnostics
@@ -189,7 +219,7 @@ def _infer_issue_tags(row: Dict[str, Any]) -> List[str]:
 
     if mask_density >= 0.9 and singleton_ratio >= 0.8:
         tags.append('dense_mask_high_singleton')
-    if strategy in ('dense_mask', 'shape_seed') or strategy.startswith('shared_topk_1.0000'):
+    if strategy in ('dense_mask', 'shape_seed') or 'shape_seed' in strategy or strategy.startswith('shared_topk_1.0000'):
         tags.append('weak_pruning_strategy')
     if zero_multiplier_ratio >= 0.05:
         tags.append('zero_multiplier_issue')
@@ -234,6 +264,8 @@ def build_redundancy_construction_report(model_name: str, translate_name: str, d
         'avg_group_size': _mean_or_zero([row['avg_group_size'] for row in layer_rows]),
         'avg_repairable_ou_ratio': _mean_or_zero([row['repairable_ou_ratio'] for row in layer_rows]),
         'avg_singleton_ratio': _mean_or_zero([row['singleton_ratio'] for row in layer_rows]),
+        'avg_assignment_error_mean': _mean_or_zero([row['assignment_error_mean'] for row in layer_rows]),
+        'avg_assignment_error_p95': _mean_or_zero([row['assignment_error_p95'] for row in layer_rows]),
         'mask_density_vs_repairable_ratio_corr': correlation,
         'singleton_topk_layers': singleton_topk,
     }
@@ -266,6 +298,8 @@ def _write_markdown(report: Dict[str, Any], output_path: Path):
         handle.write(f"- avg_group_size: {global_summary['avg_group_size']:.4f}\n")
         handle.write(f"- avg_repairable_ou_ratio: {global_summary['avg_repairable_ou_ratio']:.4f}\n")
         handle.write(f"- avg_singleton_ratio: {global_summary['avg_singleton_ratio']:.4f}\n")
+        handle.write(f"- avg_assignment_error_mean: {global_summary['avg_assignment_error_mean']:.4f}\n")
+        handle.write(f"- avg_assignment_error_p95: {global_summary['avg_assignment_error_p95']:.4f}\n")
         handle.write(f"- mask_density_vs_repairable_ratio_corr: {global_summary['mask_density_vs_repairable_ratio_corr']:.4f}\n\n")
 
         handle.write('## Singleton Top-K Layers\n\n')
@@ -280,13 +314,13 @@ def _write_markdown(report: Dict[str, Any], output_path: Path):
         handle.write('\n')
 
         handle.write('## Layer Diagnostics\n\n')
-        handle.write('| layer | strategy | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | max_group_size | zero_multiplier_ratio |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| layer | grouping_mode | strategy | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | assignment_error_p95 | zero_multiplier_ratio |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in report['layers']:
             handle.write(
-                f"| {row['layer']} | {row['selected_mask_strategy']} | {row['mask_density']:.4f} | "
+                f"| {row['layer']} | {row['grouping_mode']} | {row['selected_mask_strategy']} | {row['mask_density']:.4f} | "
                 f"{row['repairable_ou_ratio']:.4f} | {row['singleton_ratio']:.4f} | "
-                f"{row['avg_group_size']:.4f} | {row['max_group_size']} | {row['zero_multiplier_ratio']:.4f} |\n"
+                f"{row['avg_group_size']:.4f} | {row['assignment_error_p95']:.4f} | {row['zero_multiplier_ratio']:.4f} |\n"
             )
 
 
@@ -356,10 +390,19 @@ def main():
     pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
     _write_markdown(report, md_path)
+    budget_csv_path = output_dir / f'model_{args.model}_{args.translate}_budgeted_diagnostics.csv'
+    budget_json_path = output_dir / f'model_{args.model}_{args.translate}_budgeted_diagnostics.json'
+    budget_md_path = output_dir / f'model_{args.model}_{args.translate}_budgeted_diagnostics.md'
+    pd.DataFrame(csv_rows).to_csv(budget_csv_path, index=False)
+    budget_json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
+    _write_markdown(report, budget_md_path)
 
     print(f'saved csv -> {csv_path}')
     print(f'saved json -> {json_path}')
     print(f'saved md -> {md_path}')
+    print(f'saved budgeted csv -> {budget_csv_path}')
+    print(f'saved budgeted json -> {budget_json_path}')
+    print(f'saved budgeted md -> {budget_md_path}')
     print('top singleton layers:')
     for row in report['global']['singleton_topk_layers'][:5]:
         print('  - {} strategy={} mask_density={:.4f} singleton_ratio={:.4f} repairable_ou_ratio={:.4f} tags={}'.format(
