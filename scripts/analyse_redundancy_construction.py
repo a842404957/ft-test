@@ -74,6 +74,23 @@ def _compute_scale_stats_from_group_members(groups: List[Dict[str, Any]]) -> Dic
     }
 
 
+def _load_projection_metrics(model_name: str, translate_name: str, data_dir: str) -> Dict[str, Any]:
+    metrics_path = Path(data_dir) / f'model_{model_name}_{translate_name}_projection_metrics.json'
+    if not metrics_path.exists():
+        return {
+            'projection_strength': 0.0,
+            'projected_accuracy': None,
+            'projected_accuracy_drop': None,
+        }
+    with open(metrics_path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+    return {
+        'projection_strength': float(payload.get('projection_strength', 0.0)),
+        'projected_accuracy': payload.get('projected_accuracy'),
+        'projected_accuracy_drop': payload.get('projected_accuracy_drop'),
+    }
+
+
 def _layer_diag_from_group_info(layer_name: str, layer_group_info: Dict[str, Any], layer_mask) -> Dict[str, Any]:
     groups = layer_group_info.get('groups', [])
     group_sizes = [
@@ -122,8 +139,26 @@ def _layer_diag_from_group_info(layer_name: str, layer_group_info: Dict[str, Any
         'achieved_coverage': float(layer_group_info.get('achieved_coverage', layer_group_info.get('coverage_ratio', 0.0))),
         'coverage_gap': float(layer_group_info.get('coverage_gap', 0.0)),
         'assignment_error_mean': float(layer_group_info.get('assignment_error_mean', 0.0)),
+        'assignment_error_p50': float(layer_group_info.get('assignment_error_p50', 0.0)),
         'assignment_error_p95': float(layer_group_info.get('assignment_error_p95', 0.0)),
+        'direction_error_mean': float(layer_group_info.get('direction_error_mean', 0.0)),
+        'direction_error_p50': float(layer_group_info.get('direction_error_p50', 0.0)),
+        'direction_error_p95': float(layer_group_info.get('direction_error_p95', 0.0)),
+        'raw_error_mean': float(layer_group_info.get('raw_error_mean', 0.0)),
+        'raw_error_p50': float(layer_group_info.get('raw_error_p50', 0.0)),
+        'raw_error_p95': float(layer_group_info.get('raw_error_p95', 0.0)),
         'max_scale_error': float(layer_group_info.get('max_scale_error', 0.0)),
+        'max_singleton_error': float(layer_group_info.get('max_singleton_error', 0.0)),
+        'mask_codebook_size': int(layer_group_info.get('mask_codebook_size', 0)),
+        'mask_keep_count_distribution': layer_group_info.get('mask_keep_count_distribution', {}),
+        'mask_codebook_entropy': float(layer_group_info.get('mask_codebook_entropy', 0.0)),
+        'mask_codebook_id_distribution': layer_group_info.get('mask_codebook_id_distribution', {}),
+        'mask_codebook_source': str(layer_group_info.get('mask_codebook_source', '')),
+        'mask_codebook_assign': str(layer_group_info.get('mask_codebook_assign', '')),
+        'prototype_space': str(layer_group_info.get('prototype_space', '')),
+        'forced_assignment_count': int(layer_group_info.get('forced_assignment_count', 0)),
+        'singleton_due_to_high_error': int(layer_group_info.get('singleton_due_to_high_error', 0)),
+        'force_prototype_assignment': int(layer_group_info.get('force_prototype_assignment', 0)),
         'relaxed': int(layer_group_info.get('relaxed', 0)),
         'relax_steps': int(layer_group_info.get('relax_steps', 0)),
     }
@@ -199,8 +234,26 @@ def _layer_diag_from_parser(layer_name: str, groups, loader: PatternDataLoader) 
         'achieved_coverage': _safe_ratio(repairable_ous, total_ous),
         'coverage_gap': 0.0,
         'assignment_error_mean': 0.0,
+        'assignment_error_p50': 0.0,
         'assignment_error_p95': 0.0,
+        'direction_error_mean': 0.0,
+        'direction_error_p50': 0.0,
+        'direction_error_p95': 0.0,
+        'raw_error_mean': 0.0,
+        'raw_error_p50': 0.0,
+        'raw_error_p95': 0.0,
         'max_scale_error': 0.0,
+        'max_singleton_error': 0.0,
+        'mask_codebook_size': 0,
+        'mask_keep_count_distribution': {},
+        'mask_codebook_entropy': 0.0,
+        'mask_codebook_id_distribution': {},
+        'mask_codebook_source': '',
+        'mask_codebook_assign': '',
+        'prototype_space': '',
+        'forced_assignment_count': 0,
+        'singleton_due_to_high_error': 0,
+        'force_prototype_assignment': 0,
         'relaxed': 0,
         'relax_steps': 0,
     }
@@ -249,6 +302,12 @@ def build_redundancy_construction_report(model_name: str, translate_name: str, d
         for layer_name in loader.get_all_layer_names():
             layer_rows.append(_layer_diag_from_parser(layer_name, parser.get_layer_groups(layer_name), loader))
 
+    projection_metrics = _load_projection_metrics(model_name, translate_name, data_dir)
+    for row in layer_rows:
+        row['projection_strength'] = float(projection_metrics.get('projection_strength', 0.0))
+        row['projected_accuracy'] = projection_metrics.get('projected_accuracy')
+        row['projected_accuracy_drop'] = projection_metrics.get('projected_accuracy_drop')
+
     sorted_singleton = sorted(layer_rows, key=lambda row: (row['singleton_ratio'], row['singleton_groups']), reverse=True)
     singleton_topk = sorted_singleton[: min(8, len(sorted_singleton))]
     correlation = 0.0
@@ -265,8 +324,12 @@ def build_redundancy_construction_report(model_name: str, translate_name: str, d
         'avg_repairable_ou_ratio': _mean_or_zero([row['repairable_ou_ratio'] for row in layer_rows]),
         'avg_singleton_ratio': _mean_or_zero([row['singleton_ratio'] for row in layer_rows]),
         'avg_assignment_error_mean': _mean_or_zero([row['assignment_error_mean'] for row in layer_rows]),
+        'avg_assignment_error_p50': _mean_or_zero([row['assignment_error_p50'] for row in layer_rows]),
         'avg_assignment_error_p95': _mean_or_zero([row['assignment_error_p95'] for row in layer_rows]),
         'mask_density_vs_repairable_ratio_corr': correlation,
+        'projection_strength': float(projection_metrics.get('projection_strength', 0.0)),
+        'projected_accuracy': projection_metrics.get('projected_accuracy'),
+        'projected_accuracy_drop': projection_metrics.get('projected_accuracy_drop'),
         'singleton_topk_layers': singleton_topk,
     }
 
@@ -299,28 +362,35 @@ def _write_markdown(report: Dict[str, Any], output_path: Path):
         handle.write(f"- avg_repairable_ou_ratio: {global_summary['avg_repairable_ou_ratio']:.4f}\n")
         handle.write(f"- avg_singleton_ratio: {global_summary['avg_singleton_ratio']:.4f}\n")
         handle.write(f"- avg_assignment_error_mean: {global_summary['avg_assignment_error_mean']:.4f}\n")
+        handle.write(f"- avg_assignment_error_p50: {global_summary['avg_assignment_error_p50']:.4f}\n")
         handle.write(f"- avg_assignment_error_p95: {global_summary['avg_assignment_error_p95']:.4f}\n")
         handle.write(f"- mask_density_vs_repairable_ratio_corr: {global_summary['mask_density_vs_repairable_ratio_corr']:.4f}\n\n")
+        if global_summary.get('projected_accuracy') is not None:
+            handle.write(f"- projection_strength: {global_summary['projection_strength']:.4f}\n")
+            handle.write(f"- projected_accuracy: {global_summary['projected_accuracy']:.4f}\n")
+            handle.write(f"- projected_accuracy_drop: {global_summary['projected_accuracy_drop']:.4f}\n\n")
 
         handle.write('## Singleton Top-K Layers\n\n')
-        handle.write('| layer | strategy | mask_density | singleton_ratio | repairable_ou_ratio | zero_multiplier_ratio | issue_tags |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| layer | strategy | mask_density | singleton_ratio | repairable_ou_ratio | assignment_error_p95 | zero_multiplier_ratio | issue_tags |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in global_summary['singleton_topk_layers']:
             handle.write(
                 f"| {row['layer']} | {row['selected_mask_strategy']} | {row['mask_density']:.4f} | "
-                f"{row['singleton_ratio']:.4f} | {row['repairable_ou_ratio']:.4f} | "
+                f"{row['singleton_ratio']:.4f} | {row['repairable_ou_ratio']:.4f} | {row['assignment_error_p95']:.4f} | "
                 f"{row['zero_multiplier_ratio']:.4f} | {', '.join(row['issue_tags'])} |\n"
             )
         handle.write('\n')
 
         handle.write('## Layer Diagnostics\n\n')
-        handle.write('| layer | grouping_mode | strategy | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | assignment_error_p95 | zero_multiplier_ratio |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| layer | grouping_mode | strategy | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | assignment_error_p95 | prototype_count | codebook_size | projected_accuracy_drop |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in report['layers']:
+            projected_drop = '' if row['projected_accuracy_drop'] is None else f"{row['projected_accuracy_drop']:.4f}"
             handle.write(
                 f"| {row['layer']} | {row['grouping_mode']} | {row['selected_mask_strategy']} | {row['mask_density']:.4f} | "
                 f"{row['repairable_ou_ratio']:.4f} | {row['singleton_ratio']:.4f} | "
-                f"{row['avg_group_size']:.4f} | {row['assignment_error_p95']:.4f} | {row['zero_multiplier_ratio']:.4f} |\n"
+                f"{row['avg_group_size']:.4f} | {row['assignment_error_p95']:.4f} | {row['prototype_count']} | {row['mask_codebook_size']} | "
+                f"{projected_drop} |\n"
             )
 
 
@@ -385,6 +455,10 @@ def main():
         csv_row = dict(row)
         csv_row['scale_distribution'] = json.dumps(csv_row['scale_distribution'], ensure_ascii=False)
         csv_row['candidate_summaries'] = json.dumps(csv_row['candidate_summaries'], ensure_ascii=False)
+        csv_row['mask_keep_count_distribution'] = json.dumps(csv_row.get('mask_keep_count_distribution', {}), ensure_ascii=False)
+        csv_row['mask_codebook_id_distribution'] = json.dumps(csv_row.get('mask_codebook_id_distribution', {}), ensure_ascii=False)
+        csv_row['mask_family'] = json.dumps(csv_row.get('mask_family', []), ensure_ascii=False)
+        csv_row['mask_keep_ratios'] = json.dumps(csv_row.get('mask_keep_ratios', []), ensure_ascii=False)
         csv_row['issue_tags'] = ','.join(csv_row['issue_tags'])
         csv_rows.append(csv_row)
     pd.DataFrame(csv_rows).to_csv(csv_path, index=False)

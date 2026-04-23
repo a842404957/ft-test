@@ -16,16 +16,21 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from cut import (
     _compile_ft_regularization_state,
+    apply_ft_group_projection,
+    assign_ou_to_mask_codebook,
+    build_redundancy_mask_codebook,
     budgeted_assign_members,
     budgeted_select_prototypes,
     extract_ou_patterns,
+    ft_codebook_budgeted_select_mask_candidate,
+    ft_codebook_budgeted_translate,
     ft_budgeted_select_mask_candidate,
     ft_budgeted_group_translate,
     ft_group_score_mask,
     ft_group_translate_train,
 )
 from fault_tolerance_analyse import analyse
-from main import prepare_ft_artifacts, resolve_ft_training_config
+from main import prepare_ft_artifacts, resolve_ft_training_config, save_ft_build_only_projection
 from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
 from scripts.analyse_redundancy_construction import build_redundancy_construction_report
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
@@ -213,9 +218,12 @@ def _make_budget_pattern(out_ch: int, values, mask_signature: bytes = b'shared')
         'out_ch': out_ch,
         'in_ch_start': 0,
         'channel_span': masked.numel(),
+        'raw': masked.clone(),
         'masked': masked,
         'norm1': float(masked.abs().sum().item()),
         'mask_signature': mask_signature,
+        'mask_nonzero_count': int(masked.numel()),
+        'mask_channel_counts': (int(masked.numel()),),
     }
 
 
@@ -1106,6 +1114,334 @@ class TestFTRegression(unittest.TestCase):
             self.assertIn('target_coverage', layer)
             self.assertIn('coverage_gap', layer)
             self.assertEqual(layer['bucket_mode'], 'shape_family')
+
+    def test_mask_codebook_is_deterministic(self):
+        patterns = [
+            _make_budget_pattern(0, [4.0, 3.0, 0.1, 0.0]),
+            _make_budget_pattern(1, [4.1, 2.9, 0.0, 0.1]),
+            _make_budget_pattern(2, [0.1, 0.0, 3.0, 4.0]),
+            _make_budget_pattern(3, [0.0, 0.1, 2.9, 4.1]),
+        ]
+        first = build_redundancy_mask_codebook(patterns, codebook_size=2, keep_counts=[2, 1], codebook_source='mixed')
+        second = build_redundancy_mask_codebook(patterns, codebook_size=2, keep_counts=[2, 1], codebook_source='mixed')
+        self.assertEqual(
+            [(entry['keep_count'], entry['mask'].tolist()) for entry in first],
+            [(entry['keep_count'], entry['mask'].tolist()) for entry in second],
+        )
+
+    def test_codebook_assignment_reduces_mask_signature_fragmentation(self):
+        patterns = [
+            _make_budget_pattern(0, [5.0, 4.0, 0.2, 0.1]),
+            _make_budget_pattern(1, [4.9, 4.1, 0.1, 0.2]),
+            _make_budget_pattern(2, [0.2, 0.1, 5.0, 4.0]),
+            _make_budget_pattern(3, [0.1, 0.2, 4.9, 4.1]),
+        ]
+        codebook = build_redundancy_mask_codebook(patterns, codebook_size=2, keep_counts=[2], codebook_source='mixed')
+        assigned_patterns, _, stats = assign_ou_to_mask_codebook(patterns, codebook, assign_mode='mixed')
+        self.assertLessEqual(stats['mask_codebook_size'], 2)
+        self.assertLess(len({pattern['mask_codebook_id'] for pattern in assigned_patterns}), len(assigned_patterns))
+
+    def test_codebook_budgeted_grouping_reduces_singletons_on_synthetic_data(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            model.fc.weight.copy_(torch.tensor([
+                [4.0, 4.0, 0.1, 0.0, 4.0, 4.0, 0.1, 0.0],
+                [8.0, 8.0, 0.2, 0.0, 8.0, 8.0, 0.2, 0.0],
+                [3.8, 4.1, 0.0, 0.1, 3.8, 4.1, 0.0, 0.1],
+                [0.1, 0.0, 5.0, 5.0, 0.1, 0.0, 5.0, 5.0],
+                [0.2, 0.0, 10.0, 10.0, 0.2, 0.0, 10.0, 10.0],
+                [0.0, 0.1, 4.8, 5.2, 0.0, 0.1, 4.8, 5.2],
+                [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+                [2.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0],
+            ], dtype=torch.float32))
+
+        layer_mask, _, _, coverage_ratio, group_info = ft_codebook_budgeted_translate(
+            model=model,
+            in_channel=8,
+            out_channel=8,
+            weight_name='fc.weight',
+            kernel_size=1,
+            channel_number=8,
+            mask=None,
+            min_group_size=2,
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            budget_config={
+                'target_coverage': 0.6,
+                'max_singleton': 0.5,
+                'min_avg_group_size': 2.0,
+                'prototype_budget_ratio': 0.25,
+                'prototype_budget_min': 1,
+                'prototype_budget_max': 4,
+                'relax_threshold': 0.85,
+                'max_scale_error': 0.25,
+                'max_singleton_error': 1.5,
+                'mask_codebook_size': 2,
+                'mask_codebook_keep_counts': [2],
+                'mask_codebook_source': 'mixed',
+                'mask_codebook_assign': 'mixed',
+                'force_prototype_assignment': True,
+                'normalize_prototype_vectors': True,
+                'prototype_space': 'normalized_direction',
+            },
+        )
+        self.assertEqual(group_info['grouping_mode'], 'codebook_budgeted')
+        self.assertGreater(coverage_ratio, 0.0)
+        self.assertLess(group_info['singleton_ratio'], 1.0)
+        self.assertGreaterEqual(group_info['mask_codebook_size'], 1)
+        self.assertEqual(layer_mask.shape, model.fc.weight.shape)
+
+    def test_codebook_grouping_avoids_zero_scale_valid_members(self):
+        model = TinyFCModel()
+        with torch.no_grad():
+            model.fc.weight.copy_(torch.tensor([
+                [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+                [2.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0],
+                [3.0, 3.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0],
+                [4.0, 4.0, 0.0, 0.0, 4.0, 4.0, 0.0, 0.0],
+                [5.0, 5.0, 0.0, 0.0, 5.0, 5.0, 0.0, 0.0],
+                [6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 0.0, 0.0],
+                [7.0, 7.0, 0.0, 0.0, 7.0, 7.0, 0.0, 0.0],
+                [8.0, 8.0, 0.0, 0.0, 8.0, 8.0, 0.0, 0.0],
+            ], dtype=torch.float32))
+        _, _, _, _, group_info = ft_codebook_budgeted_translate(
+            model=model,
+            in_channel=8,
+            out_channel=8,
+            weight_name='fc.weight',
+            kernel_size=1,
+            channel_number=8,
+            mask=None,
+            min_group_size=2,
+            exact_threshold=0.98,
+            scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+            budget_config={
+                'target_coverage': 0.6,
+                'max_singleton': 0.5,
+                'min_avg_group_size': 2.0,
+                'prototype_budget_ratio': 0.25,
+                'prototype_budget_min': 1,
+                'prototype_budget_max': 4,
+                'relax_threshold': 0.85,
+                'max_scale_error': 0.25,
+                'max_singleton_error': 1.5,
+                'mask_codebook_size': 2,
+                'mask_codebook_keep_counts': [2],
+                'mask_codebook_source': 'mixed',
+                'mask_codebook_assign': 'mixed',
+                'force_prototype_assignment': True,
+                'normalize_prototype_vectors': True,
+                'prototype_space': 'normalized_direction',
+            },
+        )
+        for group in group_info['groups']:
+            for member in group['members']:
+                if member['role'] == 'prototype':
+                    continue
+                self.assertGreater(abs(float(member['multiplier'])), 1e-8)
+
+    def test_projection_strength_zero_keeps_model_unchanged(self):
+        model = TinyTrainModel()
+        with torch.no_grad():
+            model.conv.weight.copy_(torch.arange(8, dtype=torch.float32).reshape(2, 4, 1, 1))
+        original = model.conv.weight.detach().clone()
+        mask = {'conv.weight': torch.ones_like(model.conv.weight)}
+        group_information = {
+            'conv.weight': {
+                'groups': [{
+                    'prototype': {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 2, 'multiplier': 1.0},
+                    'members': [
+                        {'out_ch': 0, 'in_ch_start': 0, 'channel_span': 2, 'multiplier': 1.0, 'role': 'prototype'},
+                        {'out_ch': 1, 'in_ch_start': 0, 'channel_span': 2, 'multiplier': 2.0, 'role': 'member'},
+                    ],
+                }],
+            },
+        }
+        apply_ft_group_projection(model, ['conv.weight'], mask, group_information, projection_strength=0.0)
+        self.assertTrue(torch.allclose(model.conv.weight.detach(), original))
+
+    def test_codebook_projection_artifacts_exist(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            model = TinyTrainModel()
+            optimizer = optim.SGD(model.parameters(), lr=0.01)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_schedule': scheduler.state_dict(),
+                'epoch': 0,
+            }
+            torch.save(checkpoint, temp_dir / 'model_ToyCodebook_original_parameter_epoch0_ckpt.pth')
+            with _working_directory(temp_dir):
+                layer_mask, _, _, _, group_info = ft_codebook_budgeted_translate(
+                    model=model,
+                    in_channel=4,
+                    out_channel=2,
+                    weight_name='conv.weight',
+                    kernel_size=1,
+                    channel_number=2,
+                    mask=None,
+                    min_group_size=2,
+                    exact_threshold=0.98,
+                    scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+                    budget_config={
+                        'target_coverage': 0.6,
+                        'max_singleton': 0.5,
+                        'min_avg_group_size': 2.0,
+                        'prototype_budget_ratio': 0.25,
+                        'prototype_budget_min': 1,
+                        'prototype_budget_max': 4,
+                        'relax_threshold': 0.85,
+                        'max_scale_error': 0.25,
+                        'max_singleton_error': 1.5,
+                        'mask_codebook_size': 2,
+                        'mask_codebook_keep_counts': [1],
+                        'mask_codebook_source': 'mixed',
+                        'mask_codebook_assign': 'mixed',
+                        'force_prototype_assignment': True,
+                        'normalize_prototype_vectors': True,
+                        'prototype_space': 'normalized_direction',
+                    },
+                )
+                save_ft_build_only_projection(
+                    model=model,
+                    model_name='ToyCodebook',
+                    translate_name='ft_codebook_budgeted_translate',
+                    weight_name=['conv.weight'],
+                    mask={'conv.weight': layer_mask},
+                    group_information={'conv.weight': group_info},
+                    checkpoint_epoch=0,
+                    artifact_dir=str(artifact_dir),
+                    projection_strength=0.5,
+                    evaluate_projected=False,
+                )
+            self.assertTrue((artifact_dir / 'model_ToyCodebook_ft_codebook_budgeted_translate_projected_parameters.pth').exists())
+            self.assertTrue((artifact_dir / 'model_ToyCodebook_ft_codebook_budgeted_translate_after_translate_parameters.pth').exists())
+            self.assertTrue((artifact_dir / 'model_ToyCodebook_ft_codebook_budgeted_translate_projection_metrics.json').exists())
+
+    def test_diagnostics_include_projected_accuracy_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            model = TinyTrainModel()
+            layer_mask, _, _, coverage_ratio, group_info = ft_codebook_budgeted_translate(
+                model=model,
+                in_channel=4,
+                out_channel=2,
+                weight_name='conv.weight',
+                kernel_size=1,
+                channel_number=2,
+                mask=None,
+                min_group_size=2,
+                exact_threshold=0.98,
+                scale_candidates=[0.25, 0.5, 1.0, 2.0, 4.0],
+                budget_config={
+                    'target_coverage': 0.6,
+                    'max_singleton': 0.5,
+                    'min_avg_group_size': 2.0,
+                    'prototype_budget_ratio': 0.25,
+                    'prototype_budget_min': 1,
+                    'prototype_budget_max': 4,
+                    'relax_threshold': 0.85,
+                    'max_scale_error': 0.25,
+                    'max_singleton_error': 1.5,
+                    'mask_codebook_size': 2,
+                    'mask_codebook_keep_counts': [1],
+                    'mask_codebook_source': 'mixed',
+                    'mask_codebook_assign': 'mixed',
+                    'force_prototype_assignment': True,
+                    'normalize_prototype_vectors': True,
+                    'prototype_space': 'normalized_direction',
+                },
+            )
+            _write_pkl(temp_dir / 'model_ToyCodebookDiag_ft_codebook_budgeted_translate_group_information.pkl', {'conv.weight': group_info})
+            _write_pkl(temp_dir / 'model_ToyCodebookDiag_ft_codebook_budgeted_translate_mask.pkl', {'conv.weight': layer_mask})
+            _write_pkl(temp_dir / 'model_ToyCodebookDiag_ft_codebook_budgeted_translate_coverage_ratio_information.pkl', {'conv.weight': coverage_ratio})
+            _write_pkl(temp_dir / 'model_ToyCodebookDiag_ft_codebook_budgeted_translate_reuse_ratio_information.pkl', {'conv.weight': coverage_ratio})
+            with open(temp_dir / 'model_ToyCodebookDiag_ft_codebook_budgeted_translate_projection_metrics.json', 'w', encoding='utf-8') as handle:
+                json.dump({
+                    'projection_strength': 0.5,
+                    'projected_accuracy': 0.91,
+                    'projected_accuracy_drop': 0.03,
+                }, handle)
+
+            report = build_redundancy_construction_report('ToyCodebookDiag', 'ft_codebook_budgeted_translate', str(temp_dir))
+            layer = report['layers'][0]
+            self.assertEqual(layer['grouping_mode'], 'codebook_budgeted')
+            self.assertIn('mask_codebook_size', layer)
+            self.assertIn('assignment_error_p50', layer)
+            self.assertIn('projected_accuracy', layer)
+            self.assertIn('projected_accuracy_drop', layer)
+            self.assertEqual(report['global']['projected_accuracy'], 0.91)
+
+    def test_codebook_build_only_artifact_protocol_works(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            model = TinyTrainModel()
+            optimizer = optim.SGD(model.parameters(), lr=0.01)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_schedule': scheduler.state_dict(),
+                'epoch': 0,
+            }
+            torch.save(checkpoint, temp_dir / 'model_ToyCodebookBuild_original_parameter_epoch0_ckpt.pth')
+            mask = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+            map_information = {'conv.weight': torch.zeros((4, 2, 2), dtype=torch.long)}
+            multiple_relationship_information = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+            reuse_ratio_information = {'conv.weight': 0.0}
+            with _working_directory(temp_dir):
+                mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information = prepare_ft_artifacts(
+                    model_original=model,
+                    model_name='ToyCodebookBuild',
+                    translate_name='ft_codebook_budgeted_translate',
+                    weight_name=['conv.weight'],
+                    layer_in_channel=[4],
+                    layer_out_channel=[2],
+                    kernel_size=[1],
+                    channel_number=[2],
+                    pattern_value_number=[1],
+                    mask=mask,
+                    map_information=map_information,
+                    multiple_relationship_information=multiple_relationship_information,
+                    reuse_ratio_information=reuse_ratio_information,
+                    ft_layer_enabled=[True],
+                    ft_group_target_ratio=[0.75],
+                    ft_target_group_size=[2],
+                    ft_similarity_threshold=[0.85],
+                    checkpoint_epoch=0,
+                    force_rebuild=True,
+                    artifact_dir=str(artifact_dir),
+                    ft_grouping_mode='codebook_budgeted',
+                    ft_budget_config={
+                        'grouping_mode': 'codebook_budgeted',
+                        'target_coverage': 0.6,
+                        'max_singleton': 0.5,
+                        'min_avg_group_size': 2.0,
+                        'prototype_budget_ratio': 0.25,
+                        'prototype_budget_min': 1,
+                        'prototype_budget_max': 4,
+                        'relax_threshold': 0.85,
+                        'max_scale_error': 0.25,
+                        'max_singleton_error': 1.5,
+                        'mask_codebook_size': 2,
+                        'mask_codebook_keep_counts': [1],
+                        'mask_codebook_source': 'mixed',
+                        'mask_codebook_assign': 'mixed',
+                        'force_prototype_assignment': True,
+                        'normalize_prototype_vectors': True,
+                        'prototype_space': 'normalized_direction',
+                        'layer_overrides': {},
+                    },
+                )
+            self.assertTrue((artifact_dir / 'model_ToyCodebookBuild_ft_codebook_budgeted_translate_group_information.pkl').exists())
+            self.assertTrue((artifact_dir / 'model_ToyCodebookBuild_ft_codebook_budgeted_translate_mask.pkl').exists())
+            self.assertEqual(group_information['conv.weight']['grouping_mode'], 'codebook_budgeted')
+            self.assertIn('mask_codebook_size', group_information['conv.weight'])
+            self.assertIn('forced_assignment_count', group_information['conv.weight'])
 
 
 if __name__ == '__main__':

@@ -25,6 +25,8 @@ from cut import (
     ft_group_cluster_translate,
     ft_budgeted_group_translate,
     ft_budgeted_select_mask_candidate,
+    ft_codebook_budgeted_translate,
+    ft_codebook_budgeted_select_mask_candidate,
     ft_group_translate_train,
     write_mask_sweep_report,
 )
@@ -94,7 +96,17 @@ ft_budget_max_scale_error_default = 0.25
 ft_budget_bucket_mode_default = 'nonzero_count'
 ft_budget_mask_family_default = 'shape_seed,shared_topk,per_out_topk'
 ft_budget_mask_keep_ratios_default = '0.6667,0.4444'
-ft_grouping_translate_names = {'ft_group_cluster_translate', 'ft_budgeted_group_translate'}
+ft_mask_codebook_size_default = 4
+ft_mask_codebook_keep_counts_default = '4,2'
+ft_mask_codebook_source_default = 'mixed'
+ft_mask_codebook_assign_default = 'mixed'
+ft_force_prototype_assignment_default = True
+ft_max_singleton_error_default = 1.5
+ft_projection_strength_default = 1.0
+ft_evaluate_projected_default = True
+ft_normalize_prototype_vectors_default = True
+ft_prototype_space_default = 'normalized_direction'
+ft_grouping_translate_names = {'ft_group_cluster_translate', 'ft_budgeted_group_translate', 'ft_codebook_budgeted_translate'}
 
 
 def get_dataloader(data_name):
@@ -124,7 +136,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='FT-oriented grouping training entry')
     parser.add_argument('--model', type=str, default=model_name, choices=['Vgg16', 'Res18', 'Res50', 'WRN'], help='model name')
     parser.add_argument('--translate', type=str, default=translate_name, help='translate method name')
-    parser.add_argument('--ft-grouping-mode', type=str, default=ft_grouping_mode_default, choices=['ftscore', 'budgeted'], help='FT grouping mode used by FT-oriented translate paths')
+    parser.add_argument('--ft-grouping-mode', type=str, default=ft_grouping_mode_default, choices=['ftscore', 'budgeted', 'codebook_budgeted'], help='FT grouping mode used by FT-oriented translate paths')
     parser.add_argument('--run-tag', type=str, default='', help='optional run tag; when set without --artifact-dir, artifacts are written to results/ft_runs/<model>/<translate>/<run-tag>/artifacts')
     parser.add_argument('--artifact-dir', type=str, default='', help='optional artifact directory for FT outputs; overrides the default run-tag-derived artifact location')
     parser.add_argument('--build-only', action='store_true', help='only build FT grouping artifacts and projected parameters; skip FT fine-tuning')
@@ -153,6 +165,16 @@ def parse_args():
     parser.add_argument('--ft-budget-bucket-mode', type=str, default=ft_budget_bucket_mode_default, choices=['exact_mask', 'nonzero_count', 'shape_family'], help='bucket granularity for budgeted grouping before prototype assignment')
     parser.add_argument('--ft-budget-mask-family', type=str, default=ft_budget_mask_family_default, help='comma-separated lightweight mask family used by budgeted build-only selection')
     parser.add_argument('--ft-budget-mask-keep-ratios', type=str, default=ft_budget_mask_keep_ratios_default, help='comma-separated keep ratios for budgeted sparse mask family candidates')
+    parser.add_argument('--ft-mask-codebook-size', type=int, default=ft_mask_codebook_size_default, help='maximum mask codebook size per layer/block bucket for codebook-budgeted grouping')
+    parser.add_argument('--ft-mask-codebook-keep-counts', type=str, default=ft_mask_codebook_keep_counts_default, help='comma-separated keep counts for mask codebook candidates, e.g. 4,2')
+    parser.add_argument('--ft-mask-codebook-source', type=str, default=ft_mask_codebook_source_default, choices=['importance', 'frequency', 'mixed'], help='source used to build the redundancy-inducing mask codebook')
+    parser.add_argument('--ft-mask-codebook-assign', type=str, default=ft_mask_codebook_assign_default, choices=['min_distortion', 'max_redundancy', 'mixed'], help='assignment objective used when mapping OUs to the mask codebook')
+    parser.add_argument('--ft-force-prototype-assignment', action=argparse.BooleanOptionalAction, default=ft_force_prototype_assignment_default, help='force every OU into the nearest prototype group unless assignment error exceeds --ft-max-singleton-error')
+    parser.add_argument('--ft-max-singleton-error', type=float, default=ft_max_singleton_error_default, help='hard upper bound on normalized assignment error before an OU is left as singleton in codebook-budgeted grouping')
+    parser.add_argument('--ft-projection-strength', type=float, default=ft_projection_strength_default, help='blend factor for projected codebook-budgeted weights during build-only projection')
+    parser.add_argument('--ft-evaluate-projected', action=argparse.BooleanOptionalAction, default=ft_evaluate_projected_default, help='evaluate projected build-only model immediately after writing artifacts')
+    parser.add_argument('--ft-normalize-prototype-vectors', action=argparse.BooleanOptionalAction, default=ft_normalize_prototype_vectors_default, help='normalize prototype selection vectors before deterministic prototype search')
+    parser.add_argument('--ft-prototype-space', type=str, default=ft_prototype_space_default, choices=['raw', 'normalized_direction', 'quantized_direction'], help='feature space used for codebook-budgeted prototype selection')
     parser.add_argument('--ft-budget-layer-config', type=str, default='', help='optional JSON file with per-layer budgeted grouping overrides')
     parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
     parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
@@ -208,6 +230,8 @@ def is_ft_grouping_translate(translate_name):
 def resolve_ft_grouping_mode(translate_name, requested_mode):
     if translate_name == 'ft_budgeted_group_translate':
         return 'budgeted'
+    if translate_name == 'ft_codebook_budgeted_translate':
+        return 'codebook_budgeted'
     return requested_mode
 
 
@@ -258,6 +282,19 @@ def build_budgeted_grouping_config(args, translate_name):
         raise ValueError('--ft-budget-relax-threshold must be within (0, 1)')
     if args.ft_budget_max_scale_error <= 0.0:
         raise ValueError('--ft-budget-max-scale-error must be positive')
+    if args.ft_mask_codebook_size <= 0:
+        raise ValueError('--ft-mask-codebook-size must be positive')
+    mask_codebook_keep_counts = [int(value) for value in _parse_float_list(
+        args.ft_mask_codebook_keep_counts,
+        option_name='--ft-mask-codebook-keep-counts',
+        allow_empty=False,
+    )]
+    if any(value <= 0 for value in mask_codebook_keep_counts):
+        raise ValueError('--ft-mask-codebook-keep-counts values must be positive integers')
+    if args.ft_max_singleton_error <= 0.0:
+        raise ValueError('--ft-max-singleton-error must be positive')
+    if args.ft_projection_strength < 0.0 or args.ft_projection_strength > 1.0:
+        raise ValueError('--ft-projection-strength must be within [0, 1]')
     budget_mask_family = [item.strip() for item in str(args.ft_budget_mask_family).split(',') if item.strip()]
     if not budget_mask_family:
         raise ValueError('--ft-budget-mask-family must contain at least one candidate family')
@@ -287,6 +324,16 @@ def build_budgeted_grouping_config(args, translate_name):
         'bucket_mode': str(args.ft_budget_bucket_mode),
         'mask_family': budget_mask_family,
         'mask_keep_ratios': [float(ratio) for ratio in budget_mask_keep_ratios],
+        'mask_codebook_size': int(args.ft_mask_codebook_size),
+        'mask_codebook_keep_counts': mask_codebook_keep_counts,
+        'mask_codebook_source': str(args.ft_mask_codebook_source),
+        'mask_codebook_assign': str(args.ft_mask_codebook_assign),
+        'force_prototype_assignment': bool(args.ft_force_prototype_assignment),
+        'max_singleton_error': float(args.ft_max_singleton_error),
+        'projection_strength': float(args.ft_projection_strength),
+        'evaluate_projected': bool(args.ft_evaluate_projected),
+        'normalize_prototype_vectors': bool(args.ft_normalize_prototype_vectors),
+        'prototype_space': str(args.ft_prototype_space),
         'layer_overrides': layer_overrides,
         'layer_config_path': os.path.abspath(args.ft_budget_layer_config) if args.ft_budget_layer_config else '',
     }
@@ -454,6 +501,7 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
             target_group_size = ft_target_group_size[i]
             similarity_threshold = ft_similarity_threshold[i]
             selected_group_outputs = None
+            use_codebook_budgeted = ft_grouping_mode == 'codebook_budgeted'
             use_budgeted_mask_family = (
                 ft_grouping_mode == 'budgeted'
                 and not ft_mask_density_sweep
@@ -461,7 +509,23 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                 and ft_target_coverage is None
                 and not ft_prefer_sparser_mask
             )
-            if use_budgeted_mask_family:
+            if use_codebook_budgeted:
+                mask[weight_name[i]], group_seed_info, selected_group_outputs = ft_codebook_budgeted_select_mask_candidate(
+                    model=model_original,
+                    weight_name=weight_name[i],
+                    in_channel=layer_in_channel[i],
+                    out_channel=layer_out_channel[i],
+                    kernel_size=kernel_size[i],
+                    channel_number=channel_number[i],
+                    pattern_value_number=pattern_value_number[i],
+                    pattern_shape_number=pattern_shape_number,
+                    OU_size=OU_size,
+                    min_group_size=ft_min_group_size,
+                    exact_threshold=ft_exact_similarity_threshold,
+                    scale_candidates=ft_scale_candidates,
+                    budget_config=ft_budget_config,
+                )
+            elif use_budgeted_mask_family:
                 mask[weight_name[i]], group_seed_info, selected_group_outputs = ft_budgeted_select_mask_candidate(
                     model=model_original,
                     weight_name=weight_name[i],
@@ -507,8 +571,13 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
             if selected_group_outputs is not None:
                 map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = selected_group_outputs
             else:
-                grouping_fn = ft_budgeted_group_translate if ft_grouping_mode == 'budgeted' else ft_group_cluster_translate
-                map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = grouping_fn(
+                if ft_grouping_mode == 'budgeted':
+                    grouping_fn = ft_budgeted_group_translate
+                elif ft_grouping_mode == 'codebook_budgeted':
+                    grouping_fn = ft_codebook_budgeted_translate
+                else:
+                    grouping_fn = ft_group_cluster_translate
+                grouping_outputs = grouping_fn(
                     model=model_original,
                     in_channel=layer_in_channel[i],
                     out_channel=layer_out_channel[i],
@@ -524,6 +593,10 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
                     grouping_mode=ft_grouping_mode,
                     budget_config=ft_budget_config,
                 )
+                if ft_grouping_mode == 'codebook_budgeted':
+                    mask[weight_name[i]], map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = grouping_outputs
+                else:
+                    map_information[weight_name[i]], multiple_relationship_information[weight_name[i]], reuse_ratio_information[weight_name[i]], group_information[weight_name[i]] = grouping_outputs
             group_information[weight_name[i]]['target_ratio'] = ft_group_target_ratio[i]
             group_information[weight_name[i]]['seed_info'] = group_seed_info
             group_information[weight_name[i]]['grouping_mode'] = ft_grouping_mode
@@ -561,14 +634,40 @@ def prepare_ft_artifacts(model_original, model_name, translate_name, weight_name
     return mask, map_information, multiple_relationship_information, reuse_ratio_information, group_information
 
 
-def save_ft_build_only_projection(model, model_name, translate_name, weight_name, mask, group_information, checkpoint_epoch, artifact_dir='.'):
+def save_ft_build_only_projection(model, model_name, translate_name, weight_name, mask, group_information, checkpoint_epoch,
+                                  artifact_dir='.', projection_strength=1.0, evaluate_projected=False,
+                                  device='cpu', test_loader=None, original_accuracy=None):
     os.makedirs(artifact_dir, exist_ok=True)
     checkpoint_path = 'model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth'
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint['model'])
-    apply_ft_group_projection(model, weight_name, mask, group_information)
-    torch.save(model.state_dict(), os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth'))
+    apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=projection_strength)
+    projected_parameters_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_projected_parameters.pth')
+    after_translate_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
+    torch.save(model.state_dict(), projected_parameters_path)
+    torch.save(model.state_dict(), after_translate_path)
     parameters_to_txt(model, model_name, translate_name, output_dir=artifact_dir)
+    projection_metrics = {
+        'projection_strength': float(projection_strength),
+        'projected_parameters_path': projected_parameters_path,
+        'after_translate_parameters_path': after_translate_path,
+    }
+    if evaluate_projected and test_loader is not None:
+        projected_accuracy, projected_loss = test(model, device, test_loader)
+        projection_metrics['projected_accuracy'] = float(projected_accuracy)
+        projection_metrics['projected_loss'] = float(projected_loss)
+        if original_accuracy is not None:
+            projection_metrics['projected_accuracy_drop'] = float(original_accuracy - projected_accuracy)
+        else:
+            projection_metrics['projected_accuracy_drop'] = None
+        print('[FT build-only] projected_accuracy={:.4f} projected_loss={:.4f} projected_accuracy_drop={}'.format(
+            projected_accuracy,
+            projected_loss,
+            'n/a' if projection_metrics['projected_accuracy_drop'] is None else f"{projection_metrics['projected_accuracy_drop']:.4f}",
+        ))
+    metrics_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_projection_metrics.json')
+    with open(metrics_path, 'w', encoding='utf-8') as handle:
+        json.dump(projection_metrics, handle, indent=2, ensure_ascii=False)
     print('[FT build-only] saved projected parameters from epoch {} -> {}'.format(checkpoint_epoch, artifact_dir))
 
 
@@ -613,7 +712,7 @@ if __name__ == '__main__':
         args.ft_score_singleton_penalty,
         args.ft_score_zero_scale_penalty,
     ))
-    print('[FT grouping] mode={} target_coverage={:.3f} max_singleton={:.3f} min_avg_group_size={:.3f} prototype_budget_ratio={:.3f} prototype_budget=[{}, {}] relax_threshold={:.3f} max_scale_error={:.3f} bucket_mode={} mask_family={} keep_ratios={} layer_config={}'.format(
+    print('[FT grouping] mode={} target_coverage={:.3f} max_singleton={:.3f} min_avg_group_size={:.3f} prototype_budget_ratio={:.3f} prototype_budget=[{}, {}] relax_threshold={:.3f} max_scale_error={:.3f} bucket_mode={} mask_family={} keep_ratios={} codebook_size={} codebook_keep_counts={} codebook_source={} codebook_assign={} force_assignment={} max_singleton_error={:.3f} projection_strength={:.3f} evaluate_projected={} normalize_vectors={} prototype_space={} layer_config={}'.format(
         ft_budget_config['grouping_mode'],
         ft_budget_config['target_coverage'],
         ft_budget_config['max_singleton'],
@@ -626,6 +725,16 @@ if __name__ == '__main__':
         ft_budget_config['bucket_mode'],
         ft_budget_config['mask_family'],
         ft_budget_config['mask_keep_ratios'],
+        ft_budget_config['mask_codebook_size'],
+        ft_budget_config['mask_codebook_keep_counts'],
+        ft_budget_config['mask_codebook_source'],
+        ft_budget_config['mask_codebook_assign'],
+        ft_budget_config['force_prototype_assignment'],
+        ft_budget_config['max_singleton_error'],
+        ft_budget_config['projection_strength'],
+        ft_budget_config['evaluate_projected'],
+        ft_budget_config['normalize_prototype_vectors'],
+        ft_budget_config['prototype_space'],
         ft_budget_config['layer_config_path'] or '-',
     ))
 
@@ -764,6 +873,11 @@ if __name__ == '__main__':
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
                     artifact_dir=artifact_dir,
+                    projection_strength=ft_budget_config['projection_strength'],
+                    evaluate_projected=ft_budget_config['evaluate_projected'],
+                    device=device,
+                    test_loader=test_loader,
+                    original_accuracy=original_accuracy,
                 )
                 raise SystemExit(0)
 
@@ -1149,6 +1263,11 @@ if __name__ == '__main__':
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
                     artifact_dir=artifact_dir,
+                    projection_strength=ft_budget_config['projection_strength'],
+                    evaluate_projected=ft_budget_config['evaluate_projected'],
+                    device=device,
+                    test_loader=test_loader,
+                    original_accuracy=original_accuracy,
                 )
                 raise SystemExit(0)
 
@@ -1572,6 +1691,11 @@ if __name__ == '__main__':
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
                     artifact_dir=artifact_dir,
+                    projection_strength=ft_budget_config['projection_strength'],
+                    evaluate_projected=ft_budget_config['evaluate_projected'],
+                    device=device,
+                    test_loader=test_loader,
+                    original_accuracy=original_accuracy,
                 )
                 raise SystemExit(0)
 
@@ -1943,6 +2067,11 @@ if __name__ == '__main__':
                     group_information=group_information,
                     checkpoint_epoch=base_checkpoint_epoch,
                     artifact_dir=artifact_dir,
+                    projection_strength=ft_budget_config['projection_strength'],
+                    evaluate_projected=ft_budget_config['evaluate_projected'],
+                    device=device,
+                    test_loader=test_loader,
+                    original_accuracy=original_accuracy,
                 )
                 raise SystemExit(0)
 

@@ -1,8 +1,9 @@
-# ft-test V1.3.8
+# ft-test V1.3.9
 
-V1.3.8 进入 `Redundancy-Budgeted OU Grouping` 原型阶段：`V1.3.6` 的诊断基线已经固定，当前目标不再是继续烧全量 mask sweep，而是验证“主动预算式构组能否把 repairable coverage 和 singleton ratio 拉到可用区间”。
+V1.3.9 进入 `Mask Codebook + Forced Projection` 原型阶段：`V1.3.6` 的诊断基线已经固定，`V1.3.8-b` 的 budgeted 参数搜索也已经收口。当前目标不再继续调旧 budgeted 路径，而是验证“有限 mask codebook + 强制 assignment + 投影约束”能否制造可用 OU 冗余。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
+`V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
 
 ## 环境前提
 
@@ -56,6 +57,30 @@ python main.py \
   --ft-budget-max-scale-error 0.25
 ```
 
+如果要验证新的 codebook-budgeted 原型，同样先跑 build-only：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --build-only \
+  --force-rebuild \
+  --run-tag res18_codebook_budget_build \
+  --ft-grouping-mode codebook_budgeted \
+  --ft-mask-codebook-size 4 \
+  --ft-mask-codebook-keep-counts 4,2 \
+  --ft-mask-codebook-source mixed \
+  --ft-mask-codebook-assign mixed \
+  --ft-prototype-budget-ratio 0.25 \
+  --ft-budget-target-coverage 0.6 \
+  --ft-max-singleton-error 1.5 \
+  --ft-force-prototype-assignment \
+  --ft-normalize-prototype-vectors \
+  --ft-prototype-space normalized_direction \
+  --ft-projection-strength 0.5 \
+  --ft-evaluate-projected
+```
+
 如果要忽略已有缓存、强制重新构建 artifacts：
 
 ```bash
@@ -89,7 +114,7 @@ FT 主路径现在支持：
 - `--translate-epochs`：控制 FT 训练期间做 before/after translate 评估的 epoch，默认 `200`
 - `--refresh-epochs`：控制动态重分组 refresh 节点，默认 `190,200`
 - `--base-checkpoint-epoch`：控制 FT 构建/训练的起始原始 checkpoint，默认 `150`
-- `--ft-grouping-mode {ftscore,budgeted}`：FT-oriented grouping 的主模式；`--translate ft_budgeted_group_translate` 会自动启用 `budgeted`
+- `--ft-grouping-mode {ftscore,budgeted,codebook_budgeted}`：FT-oriented grouping 的主模式；`--translate ft_budgeted_group_translate` 会自动启用 `budgeted`，`--translate ft_codebook_budgeted_translate` 会自动启用 `codebook_budgeted`
 - `--ft-budget-target-coverage`：budgeted grouping 的目标 repairable coverage
 - `--ft-budget-max-singleton`：budgeted grouping 允许的最大 singleton ratio
 - `--ft-budget-min-avg-group-size`：budgeted grouping 期望的最小平均组大小
@@ -100,6 +125,16 @@ FT 主路径现在支持：
 - `--ft-budget-mask-family`：budgeted build-only 的轻量 mask family；默认 `shape_seed,shared_topk,per_out_topk`
 - `--ft-budget-mask-keep-ratios`：budgeted 固定稀疏 mask family 的 keep ratio；默认 `0.6667,0.4444`
 - `--ft-budget-layer-config`：按层覆盖 budgeted grouping 参数的 JSON 文件
+- `--ft-mask-codebook-size`：codebook-budgeted 每个 block 的 mask codebook 上限
+- `--ft-mask-codebook-keep-counts`：codebook mask 的 keep-count 候选，例如 `4,2`
+- `--ft-mask-codebook-source {importance,frequency,mixed}`：codebook 来源
+- `--ft-mask-codebook-assign {min_distortion,max_redundancy,mixed}`：OU 指派到 codebook mask 的目标
+- `--ft-force-prototype-assignment`：是否强制 OU 先进入最近 prototype group
+- `--ft-max-singleton-error`：只有误差超过该值才允许保留 singleton
+- `--ft-projection-strength`：projected model 的投影强度
+- `--ft-evaluate-projected`：build-only 后立刻评估 projected model accuracy
+- `--ft-normalize-prototype-vectors`：prototype 选择前是否归一化向量
+- `--ft-prototype-space {raw,normalized_direction,quantized_direction}`：prototype selection 的空间
 
 cost preset 建议：
 
