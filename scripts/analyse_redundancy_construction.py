@@ -24,6 +24,16 @@ def _mean_or_zero(values: List[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _dominant_keep_count(distribution: Dict[str, Any]) -> int:
+    if not distribution:
+        return 0
+    dominant_key, _ = max(
+        distribution.items(),
+        key=lambda item: (int(item[1]), -int(item[0])),
+    )
+    return int(dominant_key)
+
+
 def _format_multiplier_key(multiplier: float) -> str:
     rounded = round(float(multiplier), 6)
     if abs(rounded) <= 1e-8:
@@ -81,6 +91,7 @@ def _load_projection_metrics(model_name: str, translate_name: str, data_dir: str
             'projection_strength': 0.0,
             'projected_accuracy': None,
             'projected_accuracy_drop': None,
+            'layer_projection_deltas': [],
         }
     with open(metrics_path, 'r', encoding='utf-8') as handle:
         payload = json.load(handle)
@@ -88,6 +99,7 @@ def _load_projection_metrics(model_name: str, translate_name: str, data_dir: str
         'projection_strength': float(payload.get('projection_strength', 0.0)),
         'projected_accuracy': payload.get('projected_accuracy'),
         'projected_accuracy_drop': payload.get('projected_accuracy_drop'),
+        'layer_projection_deltas': payload.get('layer_projection_deltas', []),
     }
 
 
@@ -151,11 +163,14 @@ def _layer_diag_from_group_info(layer_name: str, layer_group_info: Dict[str, Any
         'max_singleton_error': float(layer_group_info.get('max_singleton_error', 0.0)),
         'mask_codebook_size': int(layer_group_info.get('mask_codebook_size', 0)),
         'mask_keep_count_distribution': layer_group_info.get('mask_keep_count_distribution', {}),
+        'dominant_mask_keep_count': int(layer_group_info.get('dominant_mask_keep_count', _dominant_keep_count(layer_group_info.get('mask_keep_count_distribution', {})))),
         'mask_codebook_entropy': float(layer_group_info.get('mask_codebook_entropy', 0.0)),
         'mask_codebook_id_distribution': layer_group_info.get('mask_codebook_id_distribution', {}),
         'mask_codebook_source': str(layer_group_info.get('mask_codebook_source', '')),
         'mask_codebook_assign': str(layer_group_info.get('mask_codebook_assign', '')),
         'prototype_space': str(layer_group_info.get('prototype_space', '')),
+        'projection_cap': float(layer_group_info.get('projection_cap', 1.0)),
+        'projection_lambda': float(layer_group_info.get('projection_lambda', 1.0)),
         'forced_assignment_count': int(layer_group_info.get('forced_assignment_count', 0)),
         'singleton_due_to_high_error': int(layer_group_info.get('singleton_due_to_high_error', 0)),
         'force_prototype_assignment': int(layer_group_info.get('force_prototype_assignment', 0)),
@@ -246,11 +261,14 @@ def _layer_diag_from_parser(layer_name: str, groups, loader: PatternDataLoader) 
         'max_singleton_error': 0.0,
         'mask_codebook_size': 0,
         'mask_keep_count_distribution': {},
+        'dominant_mask_keep_count': 0,
         'mask_codebook_entropy': 0.0,
         'mask_codebook_id_distribution': {},
         'mask_codebook_source': '',
         'mask_codebook_assign': '',
         'prototype_space': '',
+        'projection_cap': 1.0,
+        'projection_lambda': 1.0,
         'forced_assignment_count': 0,
         'singleton_due_to_high_error': 0,
         'force_prototype_assignment': 0,
@@ -303,10 +321,15 @@ def build_redundancy_construction_report(model_name: str, translate_name: str, d
             layer_rows.append(_layer_diag_from_parser(layer_name, parser.get_layer_groups(layer_name), loader))
 
     projection_metrics = _load_projection_metrics(model_name, translate_name, data_dir)
+    delta_by_layer = {
+        str(item.get('layer')): float(item.get('relative_weight_delta', 0.0))
+        for item in projection_metrics.get('layer_projection_deltas', []) or []
+    }
     for row in layer_rows:
         row['projection_strength'] = float(projection_metrics.get('projection_strength', 0.0))
         row['projected_accuracy'] = projection_metrics.get('projected_accuracy')
         row['projected_accuracy_drop'] = projection_metrics.get('projected_accuracy_drop')
+        row['projection_layer_delta'] = float(delta_by_layer.get(row['layer'], 0.0))
 
     sorted_singleton = sorted(layer_rows, key=lambda row: (row['singleton_ratio'], row['singleton_groups']), reverse=True)
     singleton_topk = sorted_singleton[: min(8, len(sorted_singleton))]
@@ -326,6 +349,7 @@ def build_redundancy_construction_report(model_name: str, translate_name: str, d
         'avg_assignment_error_mean': _mean_or_zero([row['assignment_error_mean'] for row in layer_rows]),
         'avg_assignment_error_p50': _mean_or_zero([row['assignment_error_p50'] for row in layer_rows]),
         'avg_assignment_error_p95': _mean_or_zero([row['assignment_error_p95'] for row in layer_rows]),
+        'avg_projection_layer_delta': _mean_or_zero([row['projection_layer_delta'] for row in layer_rows]),
         'mask_density_vs_repairable_ratio_corr': correlation,
         'projection_strength': float(projection_metrics.get('projection_strength', 0.0)),
         'projected_accuracy': projection_metrics.get('projected_accuracy'),
@@ -364,6 +388,7 @@ def _write_markdown(report: Dict[str, Any], output_path: Path):
         handle.write(f"- avg_assignment_error_mean: {global_summary['avg_assignment_error_mean']:.4f}\n")
         handle.write(f"- avg_assignment_error_p50: {global_summary['avg_assignment_error_p50']:.4f}\n")
         handle.write(f"- avg_assignment_error_p95: {global_summary['avg_assignment_error_p95']:.4f}\n")
+        handle.write(f"- avg_projection_layer_delta: {global_summary['avg_projection_layer_delta']:.4f}\n")
         handle.write(f"- mask_density_vs_repairable_ratio_corr: {global_summary['mask_density_vs_repairable_ratio_corr']:.4f}\n\n")
         if global_summary.get('projected_accuracy') is not None:
             handle.write(f"- projection_strength: {global_summary['projection_strength']:.4f}\n")
@@ -382,14 +407,14 @@ def _write_markdown(report: Dict[str, Any], output_path: Path):
         handle.write('\n')
 
         handle.write('## Layer Diagnostics\n\n')
-        handle.write('| layer | grouping_mode | strategy | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | assignment_error_p95 | prototype_count | codebook_size | projected_accuracy_drop |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| layer | grouping_mode | strategy | keep_count | projection_cap | mask_density | repairable_ou_ratio | singleton_ratio | avg_group_size | assignment_error_p95 | projection_layer_delta | projected_accuracy_drop |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in report['layers']:
             projected_drop = '' if row['projected_accuracy_drop'] is None else f"{row['projected_accuracy_drop']:.4f}"
             handle.write(
-                f"| {row['layer']} | {row['grouping_mode']} | {row['selected_mask_strategy']} | {row['mask_density']:.4f} | "
+                f"| {row['layer']} | {row['grouping_mode']} | {row['selected_mask_strategy']} | {row['dominant_mask_keep_count']} | {row['projection_cap']:.4f} | {row['mask_density']:.4f} | "
                 f"{row['repairable_ou_ratio']:.4f} | {row['singleton_ratio']:.4f} | "
-                f"{row['avg_group_size']:.4f} | {row['assignment_error_p95']:.4f} | {row['prototype_count']} | {row['mask_codebook_size']} | "
+                f"{row['avg_group_size']:.4f} | {row['assignment_error_p95']:.4f} | {row['projection_layer_delta']:.4f} | "
                 f"{projected_drop} |\n"
             )
 

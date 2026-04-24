@@ -106,6 +106,16 @@ ft_projection_strength_default = 1.0
 ft_evaluate_projected_default = True
 ft_normalize_prototype_vectors_default = True
 ft_prototype_space_default = 'normalized_direction'
+ft_projection_ramp_start_default = 0.0
+ft_projection_ramp_end_default = 0.1
+ft_projection_ramp_epochs_default = '151,160'
+ft_projection_loss_lambda_default = 1e-4
+ft_projection_reg_max_links_default = 8192
+ft_codebook_adapt_epochs_default = 10
+ft_codebook_freeze_grouping_default = True
+ft_codebook_refresh_epochs_default = ''
+ft_codebook_adapt_reg_interval_default = 10
+ft_codebook_use_legacy_regularization_default = False
 ft_grouping_translate_names = {'ft_group_cluster_translate', 'ft_budgeted_group_translate', 'ft_codebook_budgeted_translate'}
 
 
@@ -176,6 +186,16 @@ def parse_args():
     parser.add_argument('--ft-normalize-prototype-vectors', action=argparse.BooleanOptionalAction, default=ft_normalize_prototype_vectors_default, help='normalize prototype selection vectors before deterministic prototype search')
     parser.add_argument('--ft-prototype-space', type=str, default=ft_prototype_space_default, choices=['raw', 'normalized_direction', 'quantized_direction'], help='feature space used for codebook-budgeted prototype selection')
     parser.add_argument('--ft-budget-layer-config', type=str, default='', help='optional JSON file with per-layer budgeted grouping overrides')
+    parser.add_argument('--ft-codebook-layer-config', type=str, default='', help='optional JSON file with per-layer codebook-budgeted overrides such as keep_counts, target_coverage, projection_cap, and projection_lambda')
+    parser.add_argument('--ft-projection-ramp-start', type=float, default=ft_projection_ramp_start_default, help='starting projection strength for codebook-aware short adaptation training')
+    parser.add_argument('--ft-projection-ramp-end', type=float, default=ft_projection_ramp_end_default, help='ending projection strength for codebook-aware short adaptation training')
+    parser.add_argument('--ft-projection-ramp-epochs', type=str, default=ft_projection_ramp_epochs_default, help='comma-separated projection ramp start/end epochs, e.g. 151,160')
+    parser.add_argument('--ft-projection-loss-lambda', type=float, default=ft_projection_loss_lambda_default, help='weight for projection consistency regularization during codebook-aware short training')
+    parser.add_argument('--ft-projection-reg-max-links', type=int, default=ft_projection_reg_max_links_default, help='maximum sampled member links used by projection consistency regularization per reg batch; 0 disables sampling')
+    parser.add_argument('--ft-codebook-adapt-epochs', type=int, default=ft_codebook_adapt_epochs_default, help='short adaptation length in epochs for codebook-aware training')
+    parser.add_argument('--ft-codebook-freeze-grouping', action=argparse.BooleanOptionalAction, default=ft_codebook_freeze_grouping_default, help='freeze codebook grouping during short adaptation unless refresh epochs are explicitly enabled')
+    parser.add_argument('--ft-codebook-refresh-epochs', type=str, default=ft_codebook_refresh_epochs_default, help='comma-separated refresh epochs for codebook-aware short adaptation; empty keeps grouping frozen by default')
+    parser.add_argument('--ft-codebook-use-legacy-regularization', action=argparse.BooleanOptionalAction, default=ft_codebook_use_legacy_regularization_default, help='include legacy FT mask/prototype regularization during codebook-aware short adaptation; disabled by default so short adaptation focuses on CE + projection consistency')
     parser.add_argument('--base-checkpoint-epoch', type=int, default=base_checkpoint_epoch, help='checkpoint epoch used as FT build/training start point')
     parser.add_argument('--translate-epochs', type=str, default=','.join(str(epoch) for epoch in ft_translate_epoch), help='comma-separated evaluation/projection epochs during FT training')
     parser.add_argument('--refresh-epochs', type=str, default=','.join(str(epoch) for epoch in ft_group_refresh_epoch), help='comma-separated group refresh epochs; empty disables refresh')
@@ -240,11 +260,47 @@ def _load_budget_layer_config(layer_config_path):
         return {}
     with open(layer_config_path, 'r', encoding='utf-8') as handle:
         payload = json.load(handle)
-    if isinstance(payload, dict) and 'layers' in payload and isinstance(payload['layers'], dict):
-        return payload['layers']
-    if isinstance(payload, dict):
-        return payload
-    raise ValueError('--ft-budget-layer-config must be a JSON object or contain a top-level "layers" object')
+    if not isinstance(payload, dict):
+        raise ValueError('layer config must be a JSON object')
+
+    normalized = {}
+    direct_layers = payload.get('layers', {})
+    if isinstance(direct_layers, dict):
+        for selector, override in direct_layers.items():
+            if isinstance(override, dict):
+                normalized[str(selector)] = dict(override)
+
+    group_entries = payload.get('groups', [])
+    if isinstance(group_entries, list):
+        for index, entry in enumerate(group_entries):
+            if not isinstance(entry, dict):
+                continue
+            selector = entry.get('layers') or entry.get('selector') or entry.get('match') or entry.get('name')
+            if not selector:
+                raise ValueError(f'layer config group entry #{index} must provide "layers", "selector", or "match"')
+            override = {key: value for key, value in entry.items() if key not in {'layers', 'selector', 'match', 'name'}}
+            normalized[str(selector)] = override
+
+    for selector, override in payload.items():
+        if selector in {'layers', 'groups'}:
+            continue
+        if isinstance(override, dict):
+            selector_key = str(override.get('layers') or override.get('selector') or override.get('match') or selector)
+            normalized[selector_key] = {
+                key: value for key, value in override.items()
+                if key not in {'layers', 'selector', 'match'}
+            }
+    return normalized
+
+
+def _merge_layer_override_maps(*override_maps):
+    merged = {}
+    for override_map in override_maps:
+        for selector, override in (override_map or {}).items():
+            base_override = dict(merged.get(selector, {}))
+            base_override.update(dict(override))
+            merged[selector] = base_override
+    return merged
 
 
 def _parse_float_list(raw_value, *, option_name, allow_empty=False):
@@ -310,7 +366,15 @@ def build_budgeted_grouping_config(args, translate_name):
         if keep_ratio <= 0.0 or keep_ratio > 1.0:
             raise ValueError('--ft-budget-mask-keep-ratios values must be within (0, 1]')
 
-    layer_overrides = _load_budget_layer_config(args.ft_budget_layer_config)
+    layer_overrides = _merge_layer_override_maps(
+        _load_budget_layer_config(args.ft_budget_layer_config),
+        _load_budget_layer_config(args.ft_codebook_layer_config),
+    )
+    layer_config_paths = []
+    if args.ft_budget_layer_config:
+        layer_config_paths.append(os.path.abspath(args.ft_budget_layer_config))
+    if args.ft_codebook_layer_config:
+        layer_config_paths.append(os.path.abspath(args.ft_codebook_layer_config))
     return {
         'grouping_mode': grouping_mode,
         'target_coverage': float(args.ft_budget_target_coverage),
@@ -334,8 +398,179 @@ def build_budgeted_grouping_config(args, translate_name):
         'evaluate_projected': bool(args.ft_evaluate_projected),
         'normalize_prototype_vectors': bool(args.ft_normalize_prototype_vectors),
         'prototype_space': str(args.ft_prototype_space),
+        'projection_cap': 1.0,
+        'projection_lambda': 1.0,
         'layer_overrides': layer_overrides,
-        'layer_config_path': os.path.abspath(args.ft_budget_layer_config) if args.ft_budget_layer_config else '',
+        'layer_config_path': ','.join(layer_config_paths),
+    }
+
+
+def build_codebook_adaptation_config(args, translate_name, checkpoint_epoch, ft_training_config, grouping_mode, argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    refresh_explicit = _flag_present(argv, '--ft-codebook-refresh-epochs')
+    reg_interval_explicit = _flag_present(argv, '--ft-reg-interval')
+
+    if args.ft_projection_ramp_start < 0.0 or args.ft_projection_ramp_start > 1.0:
+        raise ValueError('--ft-projection-ramp-start must be within [0, 1]')
+    if args.ft_projection_ramp_end < 0.0 or args.ft_projection_ramp_end > 1.0:
+        raise ValueError('--ft-projection-ramp-end must be within [0, 1]')
+    if args.ft_projection_loss_lambda < 0.0:
+        raise ValueError('--ft-projection-loss-lambda must be >= 0')
+    if args.ft_projection_reg_max_links < 0:
+        raise ValueError('--ft-projection-reg-max-links must be >= 0')
+    if args.ft_codebook_adapt_epochs <= 0:
+        raise ValueError('--ft-codebook-adapt-epochs must be positive')
+
+    enabled = grouping_mode == 'codebook_budgeted'
+    effective_end_epoch = ft_training_config['ft_end_epoch']
+    effective_translate_epochs = list(ft_training_config['ft_translate_epoch'])
+    effective_refresh_epochs = list(ft_training_config['ft_group_refresh_epoch'])
+    effective_reg_interval = int(ft_training_config['ft_reg_interval'])
+
+    if enabled:
+        effective_end_epoch = min(ft_training_config['ft_end_epoch'], checkpoint_epoch + int(args.ft_codebook_adapt_epochs))
+        if not reg_interval_explicit and args.ft_cost_preset == 'none' and not args.ft_low_cost:
+            effective_reg_interval = max(effective_reg_interval, ft_codebook_adapt_reg_interval_default)
+        effective_translate_epochs = normalize_schedule_epochs(
+            effective_translate_epochs,
+            checkpoint_epoch=checkpoint_epoch,
+            end_epoch=effective_end_epoch,
+            ensure_final=True,
+        )
+        if args.ft_codebook_freeze_grouping and not refresh_explicit:
+            effective_refresh_epochs = []
+        elif refresh_explicit:
+            effective_refresh_epochs = normalize_schedule_epochs(
+                parse_epoch_list(args.ft_codebook_refresh_epochs, allow_empty=True),
+                checkpoint_epoch=checkpoint_epoch,
+                end_epoch=effective_end_epoch,
+                ensure_final=False,
+            )
+        else:
+            effective_refresh_epochs = normalize_schedule_epochs(
+                effective_refresh_epochs,
+                checkpoint_epoch=checkpoint_epoch,
+                end_epoch=effective_end_epoch,
+                ensure_final=False,
+            )
+
+    ramp_epochs = normalize_schedule_epochs(
+        parse_epoch_list(args.ft_projection_ramp_epochs, allow_empty=False),
+        checkpoint_epoch=checkpoint_epoch,
+        end_epoch=effective_end_epoch,
+        ensure_final=True,
+    )
+    if not ramp_epochs:
+        ramp_epochs = [effective_end_epoch]
+    return {
+        'enabled': enabled,
+        'projection_ramp_start': float(args.ft_projection_ramp_start),
+        'projection_ramp_end': float(args.ft_projection_ramp_end),
+        'projection_ramp_epochs': ramp_epochs,
+        'projection_loss_lambda': float(args.ft_projection_loss_lambda),
+        'projection_reg_max_links': int(args.ft_projection_reg_max_links),
+        'codebook_adapt_epochs': int(args.ft_codebook_adapt_epochs),
+        'codebook_freeze_grouping': bool(args.ft_codebook_freeze_grouping),
+        'codebook_use_legacy_regularization': bool(args.ft_codebook_use_legacy_regularization),
+        'effective_end_epoch': int(effective_end_epoch),
+        'effective_translate_epochs': effective_translate_epochs,
+        'effective_refresh_epochs': effective_refresh_epochs,
+        'effective_reg_interval': int(effective_reg_interval),
+    }
+
+
+def _projection_sanity_record(model_name, translate_name, projection_metrics, group_information):
+    layer_rows = []
+    for layer_name, layer_info in (group_information or {}).items():
+        if not isinstance(layer_info, dict):
+            continue
+        layer_rows.append({
+            'layer': layer_name,
+            'assignment_error_p95': float(layer_info.get('assignment_error_p95', 0.0)),
+            'singleton_ratio': float(layer_info.get('singleton_ratio', 0.0)),
+            'repairable_ou_ratio': float(layer_info.get('coverage_ratio', 0.0)),
+            'projection_cap': float(layer_info.get('projection_cap', 1.0)),
+            'relative_weight_delta': 0.0,
+        })
+    delta_by_layer = {
+        str(item.get('layer')): float(item.get('relative_weight_delta', 0.0))
+        for item in projection_metrics.get('layer_projection_deltas', []) or []
+    }
+    for row in layer_rows:
+        row['relative_weight_delta'] = delta_by_layer.get(row['layer'], 0.0)
+    top_damaged_layers = sorted(
+        layer_rows,
+        key=lambda item: (
+            item['relative_weight_delta'],
+            item['assignment_error_p95'],
+            item['singleton_ratio'],
+        ),
+        reverse=True,
+    )[:5]
+    return {
+        'projection_strength': float(projection_metrics.get('projection_strength', 0.0)),
+        'projected_accuracy': projection_metrics.get('projected_accuracy'),
+        'projected_accuracy_drop': projection_metrics.get('projected_accuracy_drop'),
+        'top_damaged_layers': top_damaged_layers,
+        'model_name': model_name,
+        'translate_name': translate_name,
+    }
+
+
+def _update_projection_sanity_report(model_name, translate_name, artifact_dir, projection_metrics, group_information):
+    record = _projection_sanity_record(model_name, translate_name, projection_metrics, group_information)
+    report_prefix = os.path.join(artifact_dir, f'model_{model_name}_{translate_name}_projection_sanity')
+    json_path = report_prefix + '.json'
+    csv_path = report_prefix + '.csv'
+    md_path = report_prefix + '.md'
+
+    existing_records = []
+    if os.path.exists(json_path):
+        with open(json_path, 'r', encoding='utf-8') as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, list):
+            existing_records = loaded
+    existing_by_strength = {
+        round(float(item.get('projection_strength', 0.0)), 6): item
+        for item in existing_records
+    }
+    existing_by_strength[round(record['projection_strength'], 6)] = record
+    merged_records = [existing_by_strength[key] for key in sorted(existing_by_strength.keys())]
+
+    with open(json_path, 'w', encoding='utf-8') as handle:
+        json.dump(merged_records, handle, indent=2, ensure_ascii=False)
+
+    csv_rows = []
+    for item in merged_records:
+        top_layers = item.get('top_damaged_layers', [])
+        csv_rows.append({
+            'projection_strength': item.get('projection_strength'),
+            'projected_accuracy': item.get('projected_accuracy'),
+            'projected_accuracy_drop': item.get('projected_accuracy_drop'),
+            'top_damaged_layers': ','.join(layer.get('layer', '') for layer in top_layers),
+            'top_damaged_layer_deltas': json.dumps(top_layers, ensure_ascii=False),
+        })
+    import pandas as pd
+    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+
+    with open(md_path, 'w', encoding='utf-8') as handle:
+        handle.write('# Projection Sanity Sweep\n\n')
+        handle.write('| projection_strength | projected_accuracy | projected_accuracy_drop | top_damaged_layers |\n')
+        handle.write('| --- | --- | --- | --- |\n')
+        for item in merged_records:
+            projected_accuracy = item.get('projected_accuracy')
+            projected_accuracy_drop = item.get('projected_accuracy_drop')
+            handle.write(
+                f"| {float(item.get('projection_strength', 0.0)):.4f} | "
+                f"{'' if projected_accuracy is None else f'{float(projected_accuracy):.4f}'} | "
+                f"{'' if projected_accuracy_drop is None else f'{float(projected_accuracy_drop):.4f}'} | "
+                f"{', '.join(layer.get('layer', '') for layer in item.get('top_damaged_layers', []))} |\n"
+            )
+
+    return {
+        'json_path': json_path,
+        'csv_path': csv_path,
+        'md_path': md_path,
     }
 
 
@@ -641,6 +876,11 @@ def save_ft_build_only_projection(model, model_name, translate_name, weight_name
     checkpoint_path = 'model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth'
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint['model'])
+    original_weights = {
+        layer_name: model.state_dict()[layer_name].detach().clone()
+        for layer_name in weight_name
+        if layer_name in model.state_dict()
+    }
     apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=projection_strength)
     projected_parameters_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_projected_parameters.pth')
     after_translate_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_after_translate_parameters.pth')
@@ -652,6 +892,22 @@ def save_ft_build_only_projection(model, model_name, translate_name, weight_name
         'projected_parameters_path': projected_parameters_path,
         'after_translate_parameters_path': after_translate_path,
     }
+    layer_projection_deltas = []
+    for layer_name in weight_name:
+        if layer_name not in original_weights or layer_name not in model.state_dict():
+            continue
+        original_layer = original_weights[layer_name].float()
+        projected_layer = model.state_dict()[layer_name].detach().float()
+        original_norm = float(torch.norm(original_layer.reshape(-1), p=2).item())
+        delta_norm = float(torch.norm((projected_layer - original_layer).reshape(-1), p=2).item())
+        layer_projection_deltas.append({
+            'layer': layer_name,
+            'relative_weight_delta': float(delta_norm / (original_norm + 1e-8)),
+            'projection_cap': float((group_information.get(layer_name) or {}).get('projection_cap', 1.0)),
+            'assignment_error_p95': float((group_information.get(layer_name) or {}).get('assignment_error_p95', 0.0)),
+            'singleton_ratio': float((group_information.get(layer_name) or {}).get('singleton_ratio', 0.0)),
+        })
+    projection_metrics['layer_projection_deltas'] = layer_projection_deltas
     if evaluate_projected and test_loader is not None:
         projected_accuracy, projected_loss = test(model, device, test_loader)
         projection_metrics['projected_accuracy'] = float(projected_accuracy)
@@ -668,6 +924,18 @@ def save_ft_build_only_projection(model, model_name, translate_name, weight_name
     metrics_path = os.path.join(artifact_dir, 'model_' + model_name + '_' + translate_name + '_projection_metrics.json')
     with open(metrics_path, 'w', encoding='utf-8') as handle:
         json.dump(projection_metrics, handle, indent=2, ensure_ascii=False)
+    sanity_report_paths = _update_projection_sanity_report(
+        model_name=model_name,
+        translate_name=translate_name,
+        artifact_dir=artifact_dir,
+        projection_metrics=projection_metrics,
+        group_information=group_information,
+    )
+    print('[FT build-only] projection_sanity_report csv={} json={} md={}'.format(
+        sanity_report_paths['csv_path'],
+        sanity_report_paths['json_path'],
+        sanity_report_paths['md_path'],
+    ))
     print('[FT build-only] saved projected parameters from epoch {} -> {}'.format(checkpoint_epoch, artifact_dir))
 
 
@@ -692,6 +960,17 @@ if __name__ == '__main__':
         raise ValueError('--ft-target-coverage must be within [0, 1]')
     artifact_dir = resolve_artifact_dir(args)
     ft_budget_config = build_budgeted_grouping_config(args, translate_name)
+    ft_codebook_adapt_config = build_codebook_adaptation_config(
+        args=args,
+        translate_name=translate_name,
+        checkpoint_epoch=base_checkpoint_epoch,
+        ft_training_config=ft_config,
+        grouping_mode=ft_budget_config['grouping_mode'],
+    )
+    ft_end_epoch = ft_codebook_adapt_config['effective_end_epoch']
+    ft_translate_epoch = ft_codebook_adapt_config['effective_translate_epochs']
+    ft_group_refresh_epoch = ft_codebook_adapt_config['effective_refresh_epochs']
+    ft_reg_interval = ft_codebook_adapt_config['effective_reg_interval']
     print('[FT schedule] preset={} low_cost={} end_epoch={} translate_epochs={} refresh_epochs={} reg_interval={} reg_min_coverage={:.3f} reg_min_groups={} reg_boost_after_refresh={} artifact_dir={}'.format(
         ft_config['selected_preset'],
         ft_low_cost,
@@ -736,6 +1015,21 @@ if __name__ == '__main__':
         ft_budget_config['normalize_prototype_vectors'],
         ft_budget_config['prototype_space'],
         ft_budget_config['layer_config_path'] or '-',
+    ))
+    print('[FT adapt] enabled={} codebook_adapt_epochs={} projection_ramp_start={:.3f} projection_ramp_end={:.3f} projection_ramp_epochs={} projection_loss_lambda={:.6f} projection_reg_max_links={} freeze_grouping={} refresh_epochs={}'.format(
+        ft_codebook_adapt_config['enabled'],
+        ft_codebook_adapt_config['codebook_adapt_epochs'],
+        ft_codebook_adapt_config['projection_ramp_start'],
+        ft_codebook_adapt_config['projection_ramp_end'],
+        ft_codebook_adapt_config['projection_ramp_epochs'],
+        ft_codebook_adapt_config['projection_loss_lambda'],
+        ft_codebook_adapt_config['projection_reg_max_links'],
+        ft_codebook_adapt_config['codebook_freeze_grouping'],
+        ft_group_refresh_epoch,
+    ))
+    print('[FT adapt objective] legacy_regularization={} effective_reg_interval={}'.format(
+        ft_codebook_adapt_config['codebook_use_legacy_regularization'],
+        ft_reg_interval,
     ))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1102,6 +1396,13 @@ if __name__ == '__main__':
                 ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
                 ft_score_singleton_penalty=args.ft_score_singleton_penalty,
                 ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
+                ft_projection_ramp_start=ft_codebook_adapt_config['projection_ramp_start'],
+                ft_projection_ramp_end=ft_codebook_adapt_config['projection_ramp_end'],
+                ft_projection_ramp_epochs=ft_codebook_adapt_config['projection_ramp_epochs'],
+                ft_projection_loss_lambda=ft_codebook_adapt_config['projection_loss_lambda'],
+                ft_projection_reg_max_links=ft_codebook_adapt_config['projection_reg_max_links'],
+                ft_codebook_freeze_grouping=ft_codebook_adapt_config['codebook_freeze_grouping'],
+                ft_codebook_use_legacy_regularization=ft_codebook_adapt_config['codebook_use_legacy_regularization'],
                 output_dir=artifact_dir,
             )
         else:
@@ -1492,6 +1793,13 @@ if __name__ == '__main__':
                 ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
                 ft_score_singleton_penalty=args.ft_score_singleton_penalty,
                 ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
+                ft_projection_ramp_start=ft_codebook_adapt_config['projection_ramp_start'],
+                ft_projection_ramp_end=ft_codebook_adapt_config['projection_ramp_end'],
+                ft_projection_ramp_epochs=ft_codebook_adapt_config['projection_ramp_epochs'],
+                ft_projection_loss_lambda=ft_codebook_adapt_config['projection_loss_lambda'],
+                ft_projection_reg_max_links=ft_codebook_adapt_config['projection_reg_max_links'],
+                ft_codebook_freeze_grouping=ft_codebook_adapt_config['codebook_freeze_grouping'],
+                ft_codebook_use_legacy_regularization=ft_codebook_adapt_config['codebook_use_legacy_regularization'],
                 output_dir=artifact_dir,
             )
         else:
@@ -1920,6 +2228,13 @@ if __name__ == '__main__':
                 ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
                 ft_score_singleton_penalty=args.ft_score_singleton_penalty,
                 ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
+                ft_projection_ramp_start=ft_codebook_adapt_config['projection_ramp_start'],
+                ft_projection_ramp_end=ft_codebook_adapt_config['projection_ramp_end'],
+                ft_projection_ramp_epochs=ft_codebook_adapt_config['projection_ramp_epochs'],
+                ft_projection_loss_lambda=ft_codebook_adapt_config['projection_loss_lambda'],
+                ft_projection_reg_max_links=ft_codebook_adapt_config['projection_reg_max_links'],
+                ft_codebook_freeze_grouping=ft_codebook_adapt_config['codebook_freeze_grouping'],
+                ft_codebook_use_legacy_regularization=ft_codebook_adapt_config['codebook_use_legacy_regularization'],
                 output_dir=artifact_dir,
             )
         else:
@@ -2296,6 +2611,13 @@ if __name__ == '__main__':
                 ft_prefer_sparser_mask=args.ft_prefer_sparser_mask,
                 ft_score_singleton_penalty=args.ft_score_singleton_penalty,
                 ft_score_zero_scale_penalty=args.ft_score_zero_scale_penalty,
+                ft_projection_ramp_start=ft_codebook_adapt_config['projection_ramp_start'],
+                ft_projection_ramp_end=ft_codebook_adapt_config['projection_ramp_end'],
+                ft_projection_ramp_epochs=ft_codebook_adapt_config['projection_ramp_epochs'],
+                ft_projection_loss_lambda=ft_codebook_adapt_config['projection_loss_lambda'],
+                ft_projection_reg_max_links=ft_codebook_adapt_config['projection_reg_max_links'],
+                ft_codebook_freeze_grouping=ft_codebook_adapt_config['codebook_freeze_grouping'],
+                ft_codebook_use_legacy_regularization=ft_codebook_adapt_config['codebook_use_legacy_regularization'],
                 output_dir=artifact_dir,
             )
         else:

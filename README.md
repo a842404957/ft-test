@@ -1,9 +1,10 @@
-# ft-test V1.3.9
+# ft-test V1.3.10
 
-V1.3.9 进入 `Mask Codebook + Forced Projection` 原型阶段：`V1.3.6` 的诊断基线已经固定，`V1.3.8-b` 的 budgeted 参数搜索也已经收口。当前目标不再继续调旧 budgeted 路径，而是验证“有限 mask codebook + 强制 assignment + 投影约束”能否制造可用 OU 冗余。
+V1.3.10 进入 `Projection-Aware Adaptation Training` 阶段：`V1.3.9` 已经证明 `codebook + forced assignment` 能制造强冗余结构，但一次性强投影会直接打崩模型精度。当前目标不再继续调旧 structure 参数，而是验证“layer-aware keep_count + projection sanity + short aware training”能否让投影后的模型重新可用。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 `V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
+`V1.3.10` 为什么转向短阶段适配训练，见 [docs/v1_3_10_projection_adaptation_notes.md](docs/v1_3_10_projection_adaptation_notes.md)。
 
 ## 环境前提
 
@@ -81,6 +82,77 @@ python main.py \
   --ft-evaluate-projected
 ```
 
+如果只想做 `projection sanity`，不要 `--force-rebuild`，直接复用已有 artifacts 重新投影：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --build-only \
+  --artifact-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_budget_build/artifacts \
+  --ft-grouping-mode codebook_budgeted \
+  --ft-projection-strength 0.05 \
+  --ft-evaluate-projected
+```
+
+同一 artifact 目录下会自动累积：
+
+- `model_<model>_<translate>_projection_sanity.csv`
+- `model_<model>_<translate>_projection_sanity.json`
+- `model_<model>_<translate>_projection_sanity.md`
+
+如果要验证 layer-aware codebook，先用默认模板：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --build-only \
+  --force-rebuild \
+  --run-tag res18_codebook_layeraware \
+  --ft-grouping-mode codebook_budgeted \
+  --ft-codebook-layer-config ft_codebook_layer_config_res18.json \
+  --ft-mask-codebook-size 4 \
+  --ft-mask-codebook-keep-counts 4,2 \
+  --ft-mask-codebook-source mixed \
+  --ft-mask-codebook-assign mixed \
+  --ft-prototype-budget-ratio 0.25 \
+  --ft-budget-target-coverage 0.6 \
+  --ft-max-singleton-error 1.5 \
+  --ft-force-prototype-assignment \
+  --ft-normalize-prototype-vectors \
+  --ft-prototype-space normalized_direction \
+  --ft-projection-strength 0.1 \
+  --ft-evaluate-projected
+```
+
+如果 build-only 的 `0.05 / 0.1` projection sanity 基本可用，再进入短阶段 aware training：
+
+```bash
+python main.py \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --run-tag res18_codebook_adapt \
+  --ft-grouping-mode codebook_budgeted \
+  --ft-codebook-layer-config ft_codebook_layer_config_res18.json \
+  --ft-mask-codebook-size 4 \
+  --ft-mask-codebook-keep-counts 4,2 \
+  --ft-mask-codebook-source mixed \
+  --ft-mask-codebook-assign mixed \
+  --ft-prototype-budget-ratio 0.25 \
+  --ft-budget-target-coverage 0.6 \
+  --ft-max-singleton-error 1.5 \
+  --ft-force-prototype-assignment \
+  --ft-normalize-prototype-vectors \
+  --ft-prototype-space normalized_direction \
+  --ft-codebook-adapt-epochs 10 \
+  --ft-projection-ramp-start 0.0 \
+  --ft-projection-ramp-end 0.1 \
+  --ft-projection-ramp-epochs 151,160 \
+  --ft-projection-loss-lambda 1e-4 \
+  --ft-codebook-freeze-grouping
+```
+
 如果要忽略已有缓存、强制重新构建 artifacts：
 
 ```bash
@@ -135,6 +207,13 @@ FT 主路径现在支持：
 - `--ft-evaluate-projected`：build-only 后立刻评估 projected model accuracy
 - `--ft-normalize-prototype-vectors`：prototype 选择前是否归一化向量
 - `--ft-prototype-space {raw,normalized_direction,quantized_direction}`：prototype selection 的空间
+- `--ft-codebook-layer-config`：按层覆盖 codebook keep-count、projection cap、target coverage、projection lambda 的 JSON 文件
+- `--ft-projection-ramp-start` / `--ft-projection-ramp-end`：短阶段 codebook-aware training 的 projection ramp 起止值
+- `--ft-projection-ramp-epochs`：projection ramp 的 epoch 区间
+- `--ft-projection-loss-lambda`：projection consistency regularization 权重
+- `--ft-codebook-adapt-epochs`：短阶段 codebook-aware training 的 epoch 数
+- `--ft-codebook-freeze-grouping`：默认冻结 codebook grouping，不频繁 refresh
+- `--ft-codebook-refresh-epochs`：如果要显式 refresh codebook grouping，用该参数给出 epoch 列表
 
 cost preset 建议：
 

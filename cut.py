@@ -1,6 +1,7 @@
 import copy
 import json
 import math
+import re
 import time
 import pickle as pkl
 from pathlib import Path
@@ -1357,6 +1358,48 @@ def search_best_power_of_two_scale(source_tensor, target_tensor, scale_candidate
     return best_scale, best_error, best_similarity
 
 
+_LAYER_RANGE_PATTERN = re.compile(r'^([A-Za-z_]+)(\d+)-([A-Za-z_]+)?(\d+)$')
+
+
+def _canonical_layer_name(layer_name: str) -> str:
+    if layer_name.endswith('.weight'):
+        return layer_name[:-7]
+    if layer_name.endswith('.bias'):
+        return layer_name[:-5]
+    return layer_name
+
+
+def _layer_selector_matches(layer_name: str, selector: str) -> bool:
+    layer_key = _canonical_layer_name(str(layer_name))
+    for raw_part in str(selector).split(','):
+        part = raw_part.strip()
+        if not part:
+            continue
+        part_key = _canonical_layer_name(part)
+        if part_key == layer_key:
+            return True
+        range_match = _LAYER_RANGE_PATTERN.match(part_key)
+        if range_match:
+            prefix_start, start_index, prefix_end, end_index = range_match.groups()
+            prefix_end = prefix_end or prefix_start
+            layer_match = re.match(r'^([A-Za-z_]+)(\d+)$', layer_key)
+            if layer_match:
+                layer_prefix, layer_index = layer_match.groups()
+                if layer_prefix == prefix_start == prefix_end and int(start_index) <= int(layer_index) <= int(end_index):
+                    return True
+    return False
+
+
+def _dominant_distribution_key(distribution: Dict[str, Any]) -> int:
+    if not distribution:
+        return 0
+    dominant_key, _ = max(
+        distribution.items(),
+        key=lambda item: (int(item[1]), -int(item[0])),
+    )
+    return int(dominant_key)
+
+
 def _resolve_budgeted_layer_config(budget_config: Optional[Dict[str, Any]], layer_name: str) -> Dict[str, Any]:
     budget_config = budget_config or {}
     resolved = {
@@ -1381,28 +1424,35 @@ def _resolve_budgeted_layer_config(budget_config: Optional[Dict[str, Any]], laye
         'evaluate_projected': bool(budget_config.get('evaluate_projected', True)),
         'normalize_prototype_vectors': bool(budget_config.get('normalize_prototype_vectors', True)),
         'prototype_space': str(budget_config.get('prototype_space', 'normalized_direction')),
+        'projection_cap': float(budget_config.get('projection_cap', 1.0)),
+        'projection_lambda': float(budget_config.get('projection_lambda', 1.0)),
     }
     layer_overrides = budget_config.get('layer_overrides', {}) or {}
-    layer_override = layer_overrides.get(layer_name, {})
-    if isinstance(layer_override, dict):
+    matched_overrides = []
+    for selector, override in layer_overrides.items():
+        if isinstance(override, dict) and _layer_selector_matches(layer_name, str(selector)):
+            matched_overrides.append((str(selector), override))
+    matched_overrides.sort(key=lambda item: (0 if _canonical_layer_name(item[0]) == _canonical_layer_name(layer_name) else 1, len(item[0])))
+    for _, layer_override in matched_overrides:
         for key in resolved:
-            if key in layer_override:
-                if key.endswith('_min') or key.endswith('_max'):
-                    resolved[key] = int(layer_override[key])
-                elif key == 'bucket_mode':
-                    resolved[key] = str(layer_override[key])
-                elif key in {'mask_family'}:
-                    resolved[key] = [str(value) for value in layer_override[key]]
-                elif key in {'mask_keep_ratios'}:
-                    resolved[key] = [float(value) for value in layer_override[key]]
-                elif key in {'mask_codebook_keep_counts'}:
-                    resolved[key] = [int(value) for value in layer_override[key]]
-                elif key in {'mask_codebook_source', 'mask_codebook_assign', 'prototype_space'}:
-                    resolved[key] = str(layer_override[key])
-                elif key in {'force_prototype_assignment', 'evaluate_projected', 'normalize_prototype_vectors'}:
-                    resolved[key] = bool(layer_override[key])
-                else:
-                    resolved[key] = float(layer_override[key])
+            if key not in layer_override:
+                continue
+            if key.endswith('_min') or key.endswith('_max'):
+                resolved[key] = int(layer_override[key])
+            elif key == 'bucket_mode':
+                resolved[key] = str(layer_override[key])
+            elif key in {'mask_family'}:
+                resolved[key] = [str(value) for value in layer_override[key]]
+            elif key in {'mask_keep_ratios'}:
+                resolved[key] = [float(value) for value in layer_override[key]]
+            elif key in {'mask_codebook_keep_counts'}:
+                resolved[key] = [int(value) for value in layer_override[key]]
+            elif key in {'mask_codebook_source', 'mask_codebook_assign', 'prototype_space'}:
+                resolved[key] = str(layer_override[key])
+            elif key in {'force_prototype_assignment', 'evaluate_projected', 'normalize_prototype_vectors'}:
+                resolved[key] = bool(layer_override[key])
+            else:
+                resolved[key] = float(layer_override[key])
     return resolved
 
 
@@ -2215,17 +2265,23 @@ def _build_layer_codebook_budgeted_groups(pattern_list, weight_name, weight_shap
         'prototype_budget': int(prototype_budget_total),
         'prototype_count': int(prototype_count_total if prototype_count_total > 0 else len(layer_groups)),
         'prototype_space': str(layer_config.get('prototype_space', 'normalized_direction')),
+        'bucket_mode': str(layer_config.get('bucket_mode', 'nonzero_count')),
+        'mask_family': list(layer_config.get('mask_family', [])),
+        'mask_keep_ratios': [float(value) for value in layer_config.get('mask_keep_ratios', [])],
         'target_coverage': float(layer_config.get('target_coverage', 0.6)),
         'achieved_coverage': float(layer_summary.get('coverage_ratio', 0.0)),
         'coverage_gap': max(float(layer_config.get('target_coverage', 0.6)) - float(layer_summary.get('coverage_ratio', 0.0)), 0.0),
         'max_scale_error': float(layer_config.get('max_scale_error', 0.25)),
         'max_singleton_error': float(layer_config.get('max_singleton_error', 1.5)),
+        'projection_cap': float(layer_config.get('projection_cap', 1.0)),
+        'projection_lambda': float(layer_config.get('projection_lambda', 1.0)),
         'forced_assignment_count': int(forced_assignment_count),
         'singleton_due_to_high_error': int(singleton_due_to_high_error),
         'relaxed': int(relaxed),
         'relax_steps': int(relax_steps),
         'mask_codebook_size': max(mask_codebook_sizes) if mask_codebook_sizes else 0,
         'mask_keep_count_distribution': aggregate_keep_count_distribution,
+        'dominant_mask_keep_count': _dominant_distribution_key(aggregate_keep_count_distribution),
         'mask_codebook_entropy': float(np.mean(codebook_entropies)) if codebook_entropies else 0.0,
         'mask_codebook_id_distribution': aggregate_codebook_id_distribution,
         'mask_codebook_source': str(layer_config.get('mask_codebook_source', 'mixed')),
@@ -3498,6 +3554,47 @@ def _write_regularization_layers_report(model_name, translate_name, regularizati
     return str(report_path)
 
 
+def _sample_regularization_state_links(regularization_state, max_links):
+    if regularization_state is None:
+        return None
+    max_links = int(max_links or 0)
+    total_links = int(regularization_state.get('summary', {}).get('member_link_count', 0))
+    if max_links <= 0 or total_links <= max_links:
+        return regularization_state
+
+    stride = max(1, int(math.ceil(float(total_links) / float(max_links))))
+    sampled_layers = {}
+    sampled_link_count = 0
+    seen_link_count = 0
+
+    for layer_name, layer_groups in regularization_state.get('layers', {}).items():
+        sampled_groups = []
+        for group in layer_groups:
+            sampled_members = []
+            for member in group.get('members', []):
+                if seen_link_count % stride == 0 and sampled_link_count < max_links:
+                    sampled_members.append(member)
+                    sampled_link_count += 1
+                seen_link_count += 1
+            if sampled_members:
+                sampled_groups.append({
+                    'prototype': group['prototype'],
+                    'members': sampled_members,
+                })
+        if sampled_groups:
+            sampled_layers[layer_name] = sampled_groups
+
+    summary = dict(regularization_state.get('summary', {}))
+    summary['projection_sampled_member_link_count'] = sampled_link_count
+    summary['projection_original_member_link_count'] = total_links
+    summary['projection_sample_stride'] = stride
+    return {
+        'layers': sampled_layers,
+        'summary': summary,
+        'layer_rows': regularization_state.get('layer_rows', []),
+    }
+
+
 def write_mask_sweep_report(model_name, translate_name, group_information, output_dir='.'):
     rows = []
     for layer_name, layer_group_info in (group_information or {}).items():
@@ -3557,6 +3654,21 @@ def _effective_ft_reg_interval(epoch_number, base_interval, refresh_epochs, boos
     if epoch_number in refresh_set or (epoch_number - 1) in refresh_set:
         return max(1, int(base_interval) // 2)
     return max(int(base_interval), 1)
+
+
+def _projection_strength_for_epoch(epoch_number, ramp_start, ramp_end, ramp_epochs):
+    if not ramp_epochs:
+        return float(ramp_end)
+    start_epoch = int(ramp_epochs[0])
+    end_epoch = int(ramp_epochs[-1])
+    if end_epoch <= start_epoch:
+        return float(ramp_end)
+    if epoch_number <= start_epoch:
+        return float(ramp_start)
+    if epoch_number >= end_epoch:
+        return float(ramp_end)
+    progress = float(epoch_number - start_epoch) / float(end_epoch - start_epoch)
+    return float(ramp_start + (ramp_end - ramp_start) * progress)
 
 
 def ft_group_score_mask(model, weight_name, in_channel, out_channel, kernel_size,
@@ -4207,11 +4319,16 @@ def ft_codebook_budgeted_translate(model, in_channel, out_channel, weight_name,
             'prototype_budget': int(layer_summary.get('prototype_budget', 0)),
             'prototype_count': int(layer_summary.get('prototype_count', len(layer_groups))),
             'prototype_space': str(layer_summary.get('prototype_space', 'normalized_direction')),
+            'bucket_mode': str(layer_summary.get('bucket_mode', 'nonzero_count')),
+            'mask_family': list(layer_summary.get('mask_family', [])),
+            'mask_keep_ratios': [float(value) for value in layer_summary.get('mask_keep_ratios', [])],
             'target_coverage': float(layer_summary.get('target_coverage', 0.0)),
             'achieved_coverage': float(layer_summary.get('achieved_coverage', layer_summary.get('coverage_ratio', 0.0))),
             'coverage_gap': float(layer_summary.get('coverage_gap', 0.0)),
             'max_scale_error': float(layer_summary.get('max_scale_error', 0.0)),
             'max_singleton_error': float(layer_summary.get('max_singleton_error', 0.0)),
+            'projection_cap': float(layer_summary.get('projection_cap', 1.0)),
+            'projection_lambda': float(layer_summary.get('projection_lambda', 1.0)),
             'assignment_error_mean': float(layer_summary.get('assignment_error_mean', 0.0)),
             'assignment_error_p50': float(layer_summary.get('assignment_error_p50', 0.0)),
             'assignment_error_p95': float(layer_summary.get('assignment_error_p95', 0.0)),
@@ -4227,6 +4344,7 @@ def ft_codebook_budgeted_translate(model, in_channel, out_channel, weight_name,
             'relax_steps': int(layer_summary.get('relax_steps', 0)),
             'mask_codebook_size': int(layer_summary.get('mask_codebook_size', 0)),
             'mask_keep_count_distribution': layer_summary.get('mask_keep_count_distribution', {}),
+            'dominant_mask_keep_count': int(layer_summary.get('dominant_mask_keep_count', 0)),
             'mask_codebook_entropy': float(layer_summary.get('mask_codebook_entropy', 0.0)),
             'mask_codebook_id_distribution': layer_summary.get('mask_codebook_id_distribution', {}),
             'mask_codebook_source': str(layer_summary.get('mask_codebook_source', 'mixed')),
@@ -4260,6 +4378,12 @@ def _apply_ft_group_projection(model, weight_name, mask, group_information, proj
             layer_group_information = group_information.get(layer_name)
             if not layer_group_information:
                 continue
+            layer_projection_strength = min(
+                float(projection_strength),
+                float(layer_group_information.get('projection_cap', 1.0)),
+            )
+            if layer_projection_strength <= 0.0:
+                continue
 
             projected_layer = original_layer.clone()
             for group in _get_group_member_entries(layer_group_information):
@@ -4291,7 +4415,7 @@ def _apply_ft_group_projection(model, weight_name, mask, group_information, proj
                         member_mask = _extract_block_tensor(layer_mask_tensor, member_out, member_in, member_span)
                         projected_block = projected_block * member_mask
                     original_block = _extract_block_tensor(original_layer, member_out, member_in, member_span)
-                    final_block = original_block * (1.0 - float(projection_strength)) + projected_block * float(projection_strength)
+                    final_block = original_block * (1.0 - float(layer_projection_strength)) + projected_block * float(layer_projection_strength)
                     _assign_block_tensor(projected_layer, member_out, member_in, member_span, final_block)
             layer_weight.copy_(projected_layer)
 
@@ -4299,6 +4423,86 @@ def _apply_ft_group_projection(model, weight_name, mask, group_information, proj
 def apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=1.0):
     """Public wrapper for projecting a model to the current FT grouping state."""
     _apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=projection_strength)
+
+
+def _compute_projection_consistency_regularization(model, weight_name, ft_layer_enabled, mask, group_information,
+                                                   device, projection_strength, regularization_state=None):
+    if projection_strength <= 0.0:
+        return torch.zeros(1, device=device)
+
+    loss_proj = torch.zeros(1, device=device)
+    parameter_map = dict(model.named_parameters())
+    compiled_layers = regularization_state.get('layers', {}) if regularization_state is not None else None
+    for layer_index, layer_name in enumerate(weight_name):
+        if not ft_layer_enabled[layer_index] or layer_name not in parameter_map:
+            continue
+
+        layer_group_information = group_information.get(layer_name)
+        if not layer_group_information:
+            continue
+
+        layer_projection_strength = min(
+            float(projection_strength),
+            float(layer_group_information.get('projection_cap', 1.0)),
+        )
+        if layer_projection_strength <= 0.0:
+            continue
+        layer_projection_lambda = float(layer_group_information.get('projection_lambda', 1.0))
+        if layer_projection_lambda <= 0.0:
+            continue
+
+        layer_param = parameter_map[layer_name]
+        layer_mask = mask.get(layer_name)
+        layer_mask_tensor = None
+        if layer_mask is not None and layer_mask.shape == layer_param.shape:
+            layer_mask_tensor = layer_mask.to(device)
+
+        if compiled_layers is not None:
+            layer_groups = compiled_layers.get(layer_name, [])
+        else:
+            layer_groups = _get_group_member_entries(layer_group_information)
+
+        for group in layer_groups:
+            if compiled_layers is None:
+                group_size = int(group.get('group_size', len(group.get('members', []))))
+                if group_size < 2:
+                    continue
+
+            prototype = group['prototype']
+            proto_out = int(prototype['out_ch'])
+            proto_in = int(prototype['in_ch_start'])
+            proto_span = int(prototype.get('channel_span', 1))
+            prototype_multiplier = float(prototype.get('multiplier', 1.0))
+            prototype_weight = _extract_block_tensor(layer_param, proto_out, proto_in, proto_span)
+            if layer_mask_tensor is not None:
+                prototype_mask = _extract_block_tensor(layer_mask_tensor, proto_out, proto_in, proto_span)
+                prototype_weight = prototype_weight * prototype_mask
+
+            for member in group['members']:
+                if compiled_layers is None and member.get('role') == 'prototype':
+                    continue
+                member_out = int(member['out_ch'])
+                member_in = int(member['in_ch_start'])
+                member_span = int(member.get('channel_span', 1))
+                member_multiplier = float(member.get('multiplier', 1.0))
+                if member_span != proto_span:
+                    continue
+                if abs(prototype_multiplier) > 1e-8:
+                    scale = member_multiplier / prototype_multiplier
+                else:
+                    scale = member_multiplier
+                if not np.isfinite(scale) or abs(scale) <= 1e-8:
+                    continue
+
+                projected_block = prototype_weight * scale
+                if layer_mask_tensor is not None:
+                    member_mask = _extract_block_tensor(layer_mask_tensor, member_out, member_in, member_span)
+                    projected_block = projected_block * member_mask
+                member_weight = _extract_block_tensor(layer_param, member_out, member_in, member_span)
+                blended_target = member_weight * (1.0 - layer_projection_strength) + projected_block * layer_projection_strength
+                loss_proj = loss_proj + layer_projection_lambda * torch.sum(torch.pow(member_weight - blended_target, 2))
+
+    return loss_proj
 
 
 def _compute_ft_regularization(model, weight_name, ft_layer_enabled, mask, group_information, device,
@@ -4409,6 +4613,13 @@ def ft_group_translate_train(model, model_name, translate_name,
                              ft_prefer_sparser_mask=False,
                              ft_score_singleton_penalty=0.18,
                              ft_score_zero_scale_penalty=0.12,
+                             ft_projection_ramp_start=0.0,
+                             ft_projection_ramp_end=0.0,
+                             ft_projection_ramp_epochs=None,
+                             ft_projection_loss_lambda=0.0,
+                             ft_projection_reg_max_links=0,
+                             ft_codebook_freeze_grouping=False,
+                             ft_codebook_use_legacy_regularization=False,
                              output_dir='.'):
     """最小可运行FT训练器。保持旧训练器不动，新方法单独落盘。"""
     if scale_candidates is None:
@@ -4417,6 +4628,8 @@ def ft_group_translate_train(model, model_name, translate_name,
         group_refresh_epoch = []
     if pattern_value_number is None:
         pattern_value_number = [OU_size] * len(weight_name)
+    if ft_projection_ramp_epochs is None:
+        ft_projection_ramp_epochs = [max_epoches]
     if isinstance(target_group_size, list):
         target_group_size_list = target_group_size
     else:
@@ -4440,6 +4653,8 @@ def ft_group_translate_train(model, model_name, translate_name,
     test_loss_record = [0.0] * max_epoches
 
     current_iteration = 0
+    last_projection_applied_epoch = None
+    last_projection_applied_strength = None
     start_time = time.time()
     checkpoint = torch.load('model_' + model_name + '_original_parameter_epoch' + str(checkpoint_epoch) + '_ckpt.pth')
     refresh_records = []
@@ -4453,6 +4668,10 @@ def ft_group_translate_train(model, model_name, translate_name,
         min_coverage=ft_reg_min_coverage,
         min_repairable_groups=ft_reg_min_groups,
     )
+    projection_regularization_state = _sample_regularization_state_links(
+        regularization_state,
+        ft_projection_reg_max_links if ft_grouping_mode == 'codebook_budgeted' else 0,
+    )
     regularization_report_path = _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
     write_mask_sweep_report(model_name, translate_name, group_information, output_dir=output_dir)
     print('[FT regularization] layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={} reg_interval={} report={}'.format(
@@ -4465,6 +4684,15 @@ def ft_group_translate_train(model, model_name, translate_name,
         ft_reg_interval,
         regularization_report_path,
     ))
+    if ft_grouping_mode == 'codebook_budgeted':
+        projection_summary = projection_regularization_state.get('summary', {}) if projection_regularization_state else {}
+        print('[FT adapt objective] legacy_regularization={} projection_only={} projection_links={}/{} stride={}'.format(
+            bool(ft_codebook_use_legacy_regularization),
+            int(not bool(ft_codebook_use_legacy_regularization)),
+            int(projection_summary.get('projection_sampled_member_link_count', projection_summary.get('member_link_count', 0))),
+            int(projection_summary.get('projection_original_member_link_count', projection_summary.get('member_link_count', 0))),
+            int(projection_summary.get('projection_sample_stride', 1)),
+        ))
 
     for epoch in range(checkpoint['epoch'], max_epoches):
         epoch_start_time = time.time()
@@ -4476,10 +4704,12 @@ def ft_group_translate_train(model, model_name, translate_name,
         proto_loss_sum = 0.0
         balance_loss_sum = 0.0
         sep_loss_sum = 0.0
+        projection_loss_sum = 0.0
         reg_batch_mask_loss_sum = 0.0
         reg_batch_proto_loss_sum = 0.0
         reg_batch_balance_loss_sum = 0.0
         reg_batch_sep_loss_sum = 0.0
+        reg_batch_projection_loss_sum = 0.0
         reg_batch_ft_reg_loss_sum = 0.0
         reg_time_sec = 0.0
         refresh_time_sec = 0.0
@@ -4490,6 +4720,19 @@ def ft_group_translate_train(model, model_name, translate_name,
             refresh_epochs=group_refresh_epoch,
             boost_after_refresh=ft_reg_boost_after_refresh,
         )
+        effective_projection_strength = (
+            _projection_strength_for_epoch(epoch + 1, ft_projection_ramp_start, ft_projection_ramp_end, ft_projection_ramp_epochs)
+            if ft_grouping_mode == 'codebook_budgeted'
+            else 1.0
+        )
+        if ft_grouping_mode == 'codebook_budgeted':
+            print('[FT adapt] epoch {} projection_strength={:.4f} freeze_grouping={} projection_loss_lambda={:.6f} legacy_regularization={}'.format(
+                epoch + 1,
+                effective_projection_strength,
+                bool(ft_codebook_freeze_grouping),
+                float(ft_projection_loss_lambda),
+                bool(ft_codebook_use_legacy_regularization),
+            ))
 
         if epoch == checkpoint['epoch']:
             model.load_state_dict(checkpoint['model'])
@@ -4511,15 +4754,31 @@ def ft_group_translate_train(model, model_name, translate_name,
                 apply_ft_reg = ((batch_idx % effective_reg_interval) == 0) or ((batch_idx + 1) == len(train_loader))
                 if apply_ft_reg:
                     reg_start_time = time.time()
-                    loss_mask, loss_proto, loss_balance, loss_sep = _compute_ft_regularization(
+                    if ft_grouping_mode == 'codebook_budgeted' and not ft_codebook_use_legacy_regularization:
+                        loss_mask = torch.zeros(1, device=device)
+                        loss_proto = torch.zeros(1, device=device)
+                        loss_balance = torch.zeros(1, device=device)
+                        loss_sep = torch.zeros(1, device=device)
+                    else:
+                        loss_mask, loss_proto, loss_balance, loss_sep = _compute_ft_regularization(
+                            model=model,
+                            weight_name=weight_name,
+                            ft_layer_enabled=ft_layer_enabled,
+                            mask=mask,
+                            group_information=group_information,
+                            device=device,
+                            regularization_state=regularization_state,
+                        )
+                    loss_proj = _compute_projection_consistency_regularization(
                         model=model,
                         weight_name=weight_name,
                         ft_layer_enabled=ft_layer_enabled,
                         mask=mask,
                         group_information=group_information,
                         device=device,
-                        regularization_state=regularization_state,
-                    )
+                        projection_strength=effective_projection_strength,
+                        regularization_state=projection_regularization_state,
+                    ) if ft_grouping_mode == 'codebook_budgeted' and ft_projection_loss_lambda > 0.0 else torch.zeros(1, device=device)
                     reg_time_sec += time.time() - reg_start_time
                     reg_batch_count += 1
                 else:
@@ -4527,12 +4786,20 @@ def ft_group_translate_train(model, model_name, translate_name,
                     loss_proto = torch.zeros(1, device=device)
                     loss_balance = torch.zeros(1, device=device)
                     loss_sep = torch.zeros(1, device=device)
+                    loss_proj = torch.zeros(1, device=device)
                 mask_loss_sum += float(loss_mask.item())
                 proto_loss_sum += float(loss_proto.item())
                 balance_loss_sum += float(loss_balance.item())
                 sep_loss_sum += float(loss_sep.item())
+                projection_loss_sum += float(loss_proj.item())
                 ft_reg_loss_value = float(
-                    (ft_mask_lambda * loss_mask + ft_proto_lambda * loss_proto + ft_balance_lambda * loss_balance + ft_sep_lambda * loss_sep).item()
+                    (
+                        ft_mask_lambda * loss_mask
+                        + ft_proto_lambda * loss_proto
+                        + ft_balance_lambda * loss_balance
+                        + ft_sep_lambda * loss_sep
+                        + ft_projection_loss_lambda * loss_proj
+                    ).item()
                 )
                 ft_reg_loss_sum += ft_reg_loss_value
                 if apply_ft_reg:
@@ -4540,6 +4807,7 @@ def ft_group_translate_train(model, model_name, translate_name,
                     reg_batch_proto_loss_sum += float(loss_proto.item())
                     reg_batch_balance_loss_sum += float(loss_balance.item())
                     reg_batch_sep_loss_sum += float(loss_sep.item())
+                    reg_batch_projection_loss_sum += float(loss_proj.item())
                     reg_batch_ft_reg_loss_sum += ft_reg_loss_value
                 loss = (
                     loss_ce
@@ -4547,6 +4815,7 @@ def ft_group_translate_train(model, model_name, translate_name,
                     + ft_proto_lambda * loss_proto
                     + ft_balance_lambda * loss_balance
                     + ft_sep_lambda * loss_sep
+                    + ft_projection_loss_lambda * loss_proj
                 )
                 loss.backward()
                 optimizer.step()
@@ -4568,6 +4837,14 @@ def ft_group_translate_train(model, model_name, translate_name,
                         float(loss_proto.item()),
                         float(loss_sep.item()),
                     ))
+                    if ft_grouping_mode == 'codebook_budgeted':
+                        print('[FT train] epoch {} batch {}/{} proj={:.4f} proj_strength={:.4f}'.format(
+                            epoch + 1,
+                            batch_idx + 1,
+                            len(train_loader),
+                            float(loss_proj.item()),
+                            float(effective_projection_strength),
+                        ))
 
             scheduler.step()
             train_accuracy_record[epoch] = correct / total
@@ -4692,6 +4969,10 @@ def ft_group_translate_train(model, model_name, translate_name,
                         min_coverage=ft_reg_min_coverage,
                         min_repairable_groups=ft_reg_min_groups,
                     )
+                    projection_regularization_state = _sample_regularization_state_links(
+                        regularization_state,
+                        ft_projection_reg_max_links if ft_grouping_mode == 'codebook_budgeted' else 0,
+                    )
                     _write_regularization_layers_report(model_name, translate_name, regularization_state, output_dir=output_dir)
                     write_mask_sweep_report(model_name, translate_name, group_information, output_dir=output_dir)
                     print('[FT regularization] epoch {} cache layers={} repairable_groups={} member_links={} singleton_groups_skipped={} low_coverage_layers_skipped={} small_group_layers_skipped={}'.format(
@@ -4746,8 +5027,10 @@ def ft_group_translate_train(model, model_name, translate_name,
             before_translate_accuracy[current_iteration], before_translate_loss[current_iteration] = test(model, device, test_loader)
             print('Before_translate_accuracy: ' + str(before_translate_accuracy[current_iteration]) + ' Before_translate_loss: ' + str(before_translate_loss[current_iteration]))
             projection_start_time = time.time()
-            _apply_ft_group_projection(model, weight_name, mask, group_information)
+            _apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=effective_projection_strength)
             projection_time_sec += time.time() - projection_start_time
+            last_projection_applied_epoch = epoch + 1
+            last_projection_applied_strength = effective_projection_strength
             after_translate_accuracy[current_iteration], after_translate_loss[current_iteration] = test(model, device, test_loader)
             print('After_translate_accuracy: ' + str(after_translate_accuracy[current_iteration]) + ' After_translate_loss: ' + str(after_translate_loss[current_iteration]))
             model_accuracy_difference[current_iteration] = before_translate_accuracy[current_iteration] - after_translate_accuracy[current_iteration]
@@ -4762,6 +5045,8 @@ def ft_group_translate_train(model, model_name, translate_name,
             'batch_count': batch_count,
             'reg_batch_count': reg_batch_count,
             'effective_reg_interval': effective_reg_interval,
+            'projection_sampled_member_links': int((projection_regularization_state or {}).get('summary', {}).get('projection_sampled_member_link_count', 0)),
+            'projection_original_member_links': int((projection_regularization_state or {}).get('summary', {}).get('projection_original_member_link_count', 0)),
             'active_reg_layers': regularization_state['summary']['layer_count'],
             'skipped_low_coverage_layers': regularization_state['summary']['skipped_low_coverage_layers'],
             'skipped_small_group_layers': regularization_state['summary']['skipped_small_group_layers'],
@@ -4776,6 +5061,10 @@ def ft_group_translate_train(model, model_name, translate_name,
             'balance_loss_reg_batch_avg': reg_batch_balance_loss_sum / reg_average_denominator,
             'sep_loss_avg': sep_loss_sum / average_denominator,
             'sep_loss_reg_batch_avg': reg_batch_sep_loss_sum / reg_average_denominator,
+            'projection_loss_avg': projection_loss_sum / average_denominator,
+            'projection_loss_reg_batch_avg': reg_batch_projection_loss_sum / reg_average_denominator,
+            'effective_projection_strength': effective_projection_strength,
+            'legacy_regularization_enabled': int(bool(ft_codebook_use_legacy_regularization)),
             'epoch_time_sec': epoch_time_sec,
             'reg_time_sec': reg_time_sec,
             'refresh_time_sec': refresh_time_sec,
@@ -4783,11 +5072,29 @@ def ft_group_translate_train(model, model_name, translate_name,
         })
         _write_training_profile(training_profile_records, training_profile_path)
 
-    final_projection_start_time = time.time()
-    _apply_ft_group_projection(model, weight_name, mask, group_information)
-    final_projection_time_sec = time.time() - final_projection_start_time
+    final_projection_strength = (
+        _projection_strength_for_epoch(max_epoches, ft_projection_ramp_start, ft_projection_ramp_end, ft_projection_ramp_epochs)
+        if ft_grouping_mode == 'codebook_budgeted'
+        else 1.0
+    )
+    already_projected_at_final_epoch = (
+        last_projection_applied_epoch == max_epoches
+        and last_projection_applied_strength is not None
+        and abs(float(last_projection_applied_strength) - float(final_projection_strength)) <= 1e-12
+    )
+    if already_projected_at_final_epoch:
+        final_projection_time_sec = 0.0
+        print('[FT final projection] skipped; epoch {} already applied projection_strength={:.4f}'.format(
+            max_epoches,
+            float(final_projection_strength),
+        ))
+    else:
+        final_projection_start_time = time.time()
+        _apply_ft_group_projection(model, weight_name, mask, group_information, projection_strength=final_projection_strength)
+        final_projection_time_sec = time.time() - final_projection_start_time
     if training_profile_records:
         training_profile_records[-1]['projection_time_sec'] = training_profile_records[-1].get('projection_time_sec', 0.0) + final_projection_time_sec
+        training_profile_records[-1]['effective_projection_strength'] = final_projection_strength
         _write_training_profile(training_profile_records, training_profile_path)
 
     time_now = time.time() - start_time
@@ -4821,6 +5128,11 @@ def ft_group_translate_train(model, model_name, translate_name,
     result_all['After_Translate_Accuracy'] = after_translate_accuracy
     result_all['After_Translate_Loss'] = after_translate_loss
     result_all['Model_Difference'] = model_accuracy_difference
+    result_all['Projection_Strength'] = [
+        _projection_strength_for_epoch(int(epoch_value), ft_projection_ramp_start, ft_projection_ramp_end, ft_projection_ramp_epochs)
+        if ft_grouping_mode == 'codebook_budgeted' else 1.0
+        for epoch_value in translate_epoch
+    ]
     result_all.to_csv(_artifact_output_path(output_dir, 'model_' + model_name + '_' + translate_name + '.csv'))
 
     result['Train_Accuracy'] = train_accuracy_record

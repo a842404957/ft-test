@@ -222,6 +222,10 @@ class FaultToleranceSimulator:
             for batch_idx, (data, target) in enumerate(test_loader):
                 if num_samples > 0 and total >= num_samples:
                     break
+                if num_samples > 0 and total + target.size(0) > num_samples:
+                    remaining = num_samples - total
+                    data = data[:remaining]
+                    target = target[:remaining]
                 
                 data, target = data.to(self.device), target.to(self.device)
                 output = self.model(data)
@@ -314,6 +318,10 @@ class FaultToleranceSimulator:
                 for batch_idx, (data, target) in enumerate(test_loader):
                     if num_samples > 0 and total >= num_samples:
                         break
+                    if num_samples > 0 and total + target.size(0) > num_samples:
+                        remaining = num_samples - total
+                        data = data[:remaining]
+                        target = target[:remaining]
                     
                     data, target = data.to(self.device), target.to(self.device)
                     output = self.model(data)

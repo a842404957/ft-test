@@ -1,0 +1,44 @@
+{
+  "groups": [
+    {
+      "name": "early_layers",
+      "layers": "conv1-conv5",
+      "mask_codebook_keep_counts": [8, 4],
+      "projection_cap": 0.05,
+      "target_coverage": 0.3,
+      "prototype_budget_ratio": 0.2,
+      "max_singleton_error": 1.2,
+      "projection_lambda": 0.5
+    },
+    {
+      "name": "mid_layers",
+      "layers": "conv6-conv13",
+      "mask_codebook_keep_counts": [4, 2],
+      "projection_cap": 0.15,
+      "target_coverage": 0.5,
+      "prototype_budget_ratio": 0.25,
+      "max_singleton_error": 1.5,
+      "projection_lambda": 1.0
+    },
+    {
+      "name": "late_layers",
+      "layers": "conv14-conv17,shortcut2,shortcut3,fc",
+      "mask_codebook_keep_counts": [2, 1],
+      "projection_cap": 0.3,
+      "target_coverage": 0.7,
+      "prototype_budget_ratio": 0.25,
+      "max_singleton_error": 1.5,
+      "projection_lambda": 1.0
+    },
+    {
+      "name": "shortcut1",
+      "layers": "shortcut1",
+      "mask_codebook_keep_counts": [4, 2],
+      "projection_cap": 0.1,
+      "target_coverage": 0.4,
+      "prototype_budget_ratio": 0.2,
+      "max_singleton_error": 1.3,
+      "projection_lambda": 0.75
+    }
+  ]
+}

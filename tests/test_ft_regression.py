@@ -16,6 +16,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from cut import (
     _compile_ft_regularization_state,
+    _projection_strength_for_epoch,
+    _resolve_budgeted_layer_config,
+    _sample_regularization_state_links,
     apply_ft_group_projection,
     assign_ou_to_mask_codebook,
     build_redundancy_mask_codebook,
@@ -30,7 +33,7 @@ from cut import (
     ft_group_translate_train,
 )
 from fault_tolerance_analyse import analyse
-from main import prepare_ft_artifacts, resolve_ft_training_config, save_ft_build_only_projection
+from main import build_budgeted_grouping_config, prepare_ft_artifacts, resolve_ft_training_config, save_ft_build_only_projection
 from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
 from scripts.analyse_redundancy_construction import build_redundancy_construction_report
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
@@ -212,6 +215,81 @@ def _build_zero_scale_ft_artifacts(temp_dir: Path, model_name: str = 'ToyZero'):
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_reuse_ratio_information.pkl', coverage_ratio)
 
 
+def _build_codebook_group_artifacts(temp_dir: Path, model_name: str = 'ToyCodebookTrain'):
+    mask = {'conv.weight': torch.ones((2, 4, 1, 1), dtype=torch.float32)}
+    group_information = {
+        'conv.weight': {
+            'layer_name': 'conv.weight',
+            'group_count': 1,
+            'block_count': 4,
+            'ou_count': 8,
+            'repairable_block_count': 2,
+            'repairable_ou_count': 4,
+            'coverage_ratio': 0.5,
+            'block_coverage_ratio': 0.5,
+            'singleton_group_count': 0,
+            'singleton_ratio': 0.0,
+            'avg_group_size': 2.0,
+            'exact_group_count': 0,
+            'scaled_group_count': 1,
+            'exact_group_ratio': 0.0,
+            'scaled_group_ratio': 1.0,
+            'grouping_mode': 'codebook_budgeted',
+            'projection_cap': 0.1,
+            'projection_lambda': 0.5,
+            'mask_codebook_size': 2,
+            'mask_keep_count_distribution': {'2': 2},
+            'dominant_mask_keep_count': 2,
+            'prototype_space': 'normalized_direction',
+            'assignment_error_mean': 0.05,
+            'assignment_error_p50': 0.05,
+            'assignment_error_p95': 0.08,
+            'groups': [
+                {
+                    'group_id': 0,
+                    'member_count': 2,
+                    'group_size': 2,
+                    'covered_ou_count': 4,
+                    'repair_mode': 'scaled',
+                    'prototype': {
+                        'out_ch': 0,
+                        'in_ch_start': 0,
+                        'channel_span': 2,
+                        'multiplier': 1.0,
+                        'role': 'prototype',
+                        'mask_signature': 'shared',
+                    },
+                    'members': [
+                        {
+                            'out_ch': 0,
+                            'in_ch_start': 0,
+                            'channel_span': 2,
+                            'multiplier': 1.0,
+                            'role': 'prototype',
+                            'mask_signature': 'shared',
+                            'similarity': 1.0,
+                        },
+                        {
+                            'out_ch': 1,
+                            'in_ch_start': 0,
+                            'channel_span': 2,
+                            'multiplier': 1.0,
+                            'role': 'member',
+                            'mask_signature': 'shared',
+                            'similarity': 0.99,
+                        },
+                    ],
+                }
+            ],
+        }
+    }
+    coverage_ratio = {'conv.weight': 0.5}
+    _write_pkl(temp_dir / f'model_{model_name}_ft_codebook_budgeted_translate_group_information.pkl', group_information)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_codebook_budgeted_translate_mask.pkl', mask)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_codebook_budgeted_translate_coverage_ratio_information.pkl', coverage_ratio)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_codebook_budgeted_translate_reuse_ratio_information.pkl', coverage_ratio)
+
+
 def _make_budget_pattern(out_ch: int, values, mask_signature: bytes = b'shared'):
     masked = torch.tensor(values, dtype=torch.float32)
     return {
@@ -245,7 +323,15 @@ def _read_csv_rows(path: Path):
 def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_name: str = 'ft_group_cluster_translate',
                        ft_reg_interval: int = 2, group_refresh_epoch=None, translate_epoch=None,
                        ft_reg_min_coverage: float = 0.0, ft_reg_min_groups: int = 1,
-                       ft_reg_boost_after_refresh: bool = False, output_dir: str = '.'):
+                       ft_reg_boost_after_refresh: bool = False, output_dir: str = '.',
+                       ft_grouping_mode: str = 'ftscore',
+                       ft_projection_ramp_start: float = 0.0,
+                       ft_projection_ramp_end: float = 0.0,
+                       ft_projection_ramp_epochs=None,
+                       ft_projection_loss_lambda: float = 0.0,
+                       ft_projection_reg_max_links: int = 0,
+                       ft_codebook_freeze_grouping: bool = False,
+                       ft_codebook_use_legacy_regularization: bool = True):
     if group_refresh_epoch is None:
         group_refresh_epoch = [2]
     if translate_epoch is None:
@@ -262,7 +348,10 @@ def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_n
     }
 
     torch.save(checkpoint, temp_dir / f'model_{model_name}_original_parameter_epoch0_ckpt.pth')
-    _build_ft_group_artifacts(temp_dir, model_name=model_name)
+    if translate_name == 'ft_codebook_budgeted_translate':
+        _build_codebook_group_artifacts(temp_dir, model_name=model_name)
+    else:
+        _build_ft_group_artifacts(temp_dir, model_name=model_name)
 
     inputs = torch.randn(8, 4, 4, 4)
     targets = torch.randint(0, 2, (8,))
@@ -319,6 +408,14 @@ def _run_tiny_ft_train(temp_dir: Path, model_name: str = 'ToyTrain', translate_n
             ft_reg_min_coverage=ft_reg_min_coverage,
             ft_reg_min_groups=ft_reg_min_groups,
             ft_reg_boost_after_refresh=ft_reg_boost_after_refresh,
+            ft_grouping_mode=ft_grouping_mode,
+            ft_projection_ramp_start=ft_projection_ramp_start,
+            ft_projection_ramp_end=ft_projection_ramp_end,
+            ft_projection_ramp_epochs=ft_projection_ramp_epochs or translate_epoch,
+            ft_projection_loss_lambda=ft_projection_loss_lambda,
+            ft_projection_reg_max_links=ft_projection_reg_max_links,
+            ft_codebook_freeze_grouping=ft_codebook_freeze_grouping,
+            ft_codebook_use_legacy_regularization=ft_codebook_use_legacy_regularization,
             output_dir=output_dir,
         )
 
@@ -1442,6 +1539,182 @@ class TestFTRegression(unittest.TestCase):
             self.assertEqual(group_information['conv.weight']['grouping_mode'], 'codebook_budgeted')
             self.assertIn('mask_codebook_size', group_information['conv.weight'])
             self.assertIn('forced_assignment_count', group_information['conv.weight'])
+
+    def test_projection_sanity_report_updates_without_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            model = TinyTrainModel()
+            optimizer = optim.SGD(model.parameters(), lr=0.01)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+            checkpoint = {
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_schedule': scheduler.state_dict(),
+                'epoch': 0,
+            }
+            torch.save(checkpoint, temp_dir / 'model_ToySanity_original_parameter_epoch0_ckpt.pth')
+            _build_codebook_group_artifacts(temp_dir, model_name='ToySanity')
+            with open(temp_dir / 'model_ToySanity_ft_codebook_budgeted_translate_group_information.pkl', 'rb') as handle:
+                group_information = pickle.load(handle)
+            with open(temp_dir / 'model_ToySanity_ft_codebook_budgeted_translate_mask.pkl', 'rb') as handle:
+                mask = pickle.load(handle)
+
+            with _working_directory(temp_dir):
+                save_ft_build_only_projection(
+                    model=model,
+                    model_name='ToySanity',
+                    translate_name='ft_codebook_budgeted_translate',
+                    weight_name=['conv.weight'],
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=0,
+                    artifact_dir=str(artifact_dir),
+                    projection_strength=0.0,
+                    evaluate_projected=False,
+                )
+                save_ft_build_only_projection(
+                    model=model,
+                    model_name='ToySanity',
+                    translate_name='ft_codebook_budgeted_translate',
+                    weight_name=['conv.weight'],
+                    mask=mask,
+                    group_information=group_information,
+                    checkpoint_epoch=0,
+                    artifact_dir=str(artifact_dir),
+                    projection_strength=0.1,
+                    evaluate_projected=False,
+                )
+
+            sanity_json = artifact_dir / 'model_ToySanity_ft_codebook_budgeted_translate_projection_sanity.json'
+            self.assertTrue(sanity_json.exists())
+            payload = json.loads(sanity_json.read_text(encoding='utf-8'))
+            strengths = [round(float(item['projection_strength']), 4) for item in payload]
+            self.assertEqual(strengths, [0.0, 0.1])
+
+    def test_codebook_layer_config_overrides_keep_counts_and_projection_cap(self):
+        config_payload = {
+            'groups': [
+                {
+                    'layers': 'conv1-conv5',
+                    'mask_codebook_keep_counts': [8, 4],
+                    'projection_cap': 0.05,
+                    'projection_lambda': 0.4,
+                }
+            ],
+            'layers': {
+                'conv14-conv17,shortcut2,shortcut3,fc': {
+                    'mask_codebook_keep_counts': [2, 1],
+                    'projection_cap': 0.3,
+                }
+            },
+        }
+        resolved = _resolve_budgeted_layer_config(
+            {
+                'layer_overrides': {
+                    'conv1-conv5': {
+                        'mask_codebook_keep_counts': [8, 4],
+                        'projection_cap': 0.05,
+                        'projection_lambda': 0.4,
+                    },
+                    'conv14-conv17,shortcut2,shortcut3,fc': {
+                        'mask_codebook_keep_counts': [2, 1],
+                        'projection_cap': 0.3,
+                    },
+                }
+            },
+            'conv3.weight',
+        )
+        self.assertEqual(resolved['mask_codebook_keep_counts'], [8, 4])
+        self.assertAlmostEqual(resolved['projection_cap'], 0.05)
+        self.assertAlmostEqual(resolved['projection_lambda'], 0.4)
+        late_resolved = _resolve_budgeted_layer_config(
+            {'layer_overrides': config_payload['layers']},
+            'conv15.weight',
+        )
+        self.assertEqual(late_resolved['mask_codebook_keep_counts'], [2, 1])
+        self.assertAlmostEqual(late_resolved['projection_cap'], 0.3)
+
+    def test_projection_ramp_schedule_monotonic_and_logged(self):
+        ramp_values = [
+            _projection_strength_for_epoch(epoch, 0.0, 0.1, [1, 3])
+            for epoch in [1, 2, 3, 4]
+        ]
+        self.assertLessEqual(ramp_values[0], ramp_values[1])
+        self.assertLessEqual(ramp_values[1], ramp_values[2])
+        self.assertEqual(ramp_values[2], ramp_values[3])
+
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _run_tiny_ft_train(
+                temp_dir=temp_dir,
+                model_name='ToyAdapt',
+                translate_name='ft_codebook_budgeted_translate',
+                group_refresh_epoch=[],
+                translate_epoch=[3],
+                output_dir='artifacts',
+                ft_grouping_mode='codebook_budgeted',
+                ft_projection_ramp_start=0.0,
+                ft_projection_ramp_end=0.1,
+                ft_projection_ramp_epochs=[1, 3],
+                ft_projection_loss_lambda=1e-4,
+                ft_codebook_freeze_grouping=True,
+                ft_codebook_use_legacy_regularization=False,
+            )
+            profile_path = temp_dir / 'artifacts' / 'model_ToyAdapt_ft_codebook_budgeted_translate_training_profile.csv'
+            rows = _read_csv_rows(profile_path)
+            strengths = [float(row['effective_projection_strength']) for row in rows]
+            self.assertGreaterEqual(strengths[-1], strengths[0])
+            self.assertTrue(all(int(row['legacy_regularization_enabled']) == 0 for row in rows))
+
+    def test_projection_regularization_state_can_sample_links(self):
+        groups = []
+        for group_index in range(4):
+            groups.append({
+                'prototype': {'out_ch': group_index, 'in_ch_start': 0, 'channel_span': 1, 'multiplier': 1.0},
+                'members': [
+                    {'out_ch': group_index, 'in_ch_start': member_index + 1, 'channel_span': 1, 'multiplier': 1.0}
+                    for member_index in range(8)
+                ],
+            })
+        state = {
+            'layers': {'conv.weight': groups},
+            'summary': {'member_link_count': 32},
+            'layer_rows': [],
+        }
+        sampled = _sample_regularization_state_links(state, max_links=5)
+        sampled_links = sum(
+            len(group['members'])
+            for layer_groups in sampled['layers'].values()
+            for group in layer_groups
+        )
+        self.assertLessEqual(sampled_links, 5)
+        self.assertEqual(sampled['summary']['projection_original_member_link_count'], 32)
+        self.assertEqual(sampled['summary']['projection_sampled_member_link_count'], sampled_links)
+
+    def test_codebook_short_training_saves_after_translate_parameters(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _run_tiny_ft_train(
+                temp_dir=temp_dir,
+                model_name='ToyAdaptSave',
+                translate_name='ft_codebook_budgeted_translate',
+                group_refresh_epoch=[],
+                translate_epoch=[2],
+                output_dir='artifacts',
+                ft_grouping_mode='codebook_budgeted',
+                ft_projection_ramp_start=0.0,
+                ft_projection_ramp_end=0.05,
+                ft_projection_ramp_epochs=[1, 2],
+                ft_projection_loss_lambda=1e-4,
+                ft_projection_reg_max_links=1,
+                ft_codebook_freeze_grouping=True,
+                ft_codebook_use_legacy_regularization=False,
+            )
+            self.assertTrue((temp_dir / 'artifacts' / 'model_ToyAdaptSave_ft_codebook_budgeted_translate_after_translate_parameters.pth').exists())
+            rows = _read_csv_rows(temp_dir / 'artifacts' / 'model_ToyAdaptSave_ft_codebook_budgeted_translate_training_profile.csv')
+            self.assertTrue(all(int(row['projection_sampled_member_links']) <= 1 for row in rows))
 
 
 if __name__ == '__main__':
