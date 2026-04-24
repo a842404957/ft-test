@@ -114,7 +114,8 @@ def load_test_data(batch_size=128, config_file=None):
     return test_loader
 
 
-def _build_runtime_config(base_config_file=None, config_overrides=None, report_output_dir=None, runtime_model_name=None):
+def _build_runtime_config(base_config_file=None, config_overrides=None, report_output_dir=None,
+                          runtime_model_name=None, fault_seed=None):
     base_config = {}
     if base_config_file and os.path.exists(base_config_file):
         with open(base_config_file, 'r', encoding='utf-8') as f:
@@ -174,6 +175,9 @@ def _build_runtime_config(base_config_file=None, config_overrides=None, report_o
     if runtime_model_name:
         final_config.setdefault('model', {})
         final_config['model']['name'] = runtime_model_name
+    if fault_seed is not None:
+        final_config.setdefault('fault_injection', {})
+        final_config['fault_injection']['random_seed'] = int(fault_seed)
 
     return final_config, base_config
 
@@ -257,7 +261,7 @@ def _export_compare_summary(all_results, output_dir):
 def run_simulation_with_config(model, test_loader, config_name, config_overrides=None,
                                 base_config_file=None, num_samples=1000, model_name=None,
                                 translate_name='ft_group_cluster_translate',
-                                report_output_dir=None, data_dir='.'):
+                                report_output_dir=None, data_dir='.', fault_seed=None):
     """运行带有特定配置的仿真"""
     print("=" * 80)
     print(f"🚀 运行仿真配置: {config_name}")
@@ -269,13 +273,14 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
         config_overrides=config_overrides,
         report_output_dir=report_output_dir,
         runtime_model_name=model_name,
+        fault_seed=fault_seed,
     )
 
     # 决定使用哪个配置文件
     config_file_path = None
     temp_file_path = None  # 临时文件路径（需要清理）
 
-    if config_overrides or report_output_dir or not (base_config_file and os.path.exists(base_config_file)):
+    if config_overrides or report_output_dir or fault_seed is not None or not (base_config_file and os.path.exists(base_config_file)):
         # 写入临时文件
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(final_config, f, indent=2)
@@ -288,6 +293,8 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
                 print(f"  {key}: {value}")
         if report_output_dir:
             print(f"🗂️  输出目录覆盖: {report_output_dir}")
+        if fault_seed is not None:
+            print(f"🎲 故障随机种子覆盖: {fault_seed}")
         print()
     elif base_config_file and os.path.exists(base_config_file):
         # 如果没有覆盖配置，直接使用原始配置文件
@@ -321,7 +328,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
 
 def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate',
                        model_name='Vgg16', report_output_dir=None, data_dir='.',
-                       repair_mode='normal', levels='all'):
+                       repair_mode='normal', levels='all', fault_seed=None):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -423,6 +430,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
             translate_name=translate_name,
             report_output_dir=report_output_dir,
             data_dir=data_dir,
+            fault_seed=fault_seed,
         )
         
         all_results.append({
@@ -524,6 +532,8 @@ def main():
                        help='可选：覆盖仿真报告输出目录；建议同一轮 single/compare 使用同一个目录')
     parser.add_argument('--artifact-dir', type=str, default='.',
                        help='artifact 目录；默认当前目录，可指向 results/ft_runs/<model>/<translate>/<tag>/artifacts')
+    parser.add_argument('--fault-seed', type=int, default=None,
+                       help='覆盖配置文件中的 fault_injection.random_seed，用于多 seed 容错实验')
     
     args = parser.parse_args()
     
@@ -538,6 +548,7 @@ def main():
             levels=args.levels,
             report_output_dir=args.output_dir or None,
             data_dir=args.artifact_dir,
+            fault_seed=args.fault_seed,
         )
     else:
         # 单次运行
@@ -573,6 +584,7 @@ def main():
             translate_name=args.translate,
             report_output_dir=args.output_dir or None,
             data_dir=args.artifact_dir,
+            fault_seed=args.fault_seed,
         )
 
 

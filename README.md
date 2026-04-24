@@ -1,10 +1,11 @@
-# ft-test V1.3.10
+# ft-test V1.3.11
 
-V1.3.10 进入 `Projection-Aware Adaptation Training` 阶段：`V1.3.9` 已经证明 `codebook + forced assignment` 能制造强冗余结构，但一次性强投影会直接打崩模型精度。当前目标不再继续调旧 structure 参数，而是验证“layer-aware keep_count + projection sanity + short aware training”能否让投影后的模型重新可用。
+V1.3.11 进入 `Res18 Evidence Package` 阶段：`V1.3.10` 已经证明 codebook-aware adaptation 后，Res18 在 `stress_3pct` 下只靠 Level 1 可以恢复大部分准确率损失。当前目标是把该结果做成可复现、可对照、可聚合的证据包，而不是继续改核心 grouping 算法。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 `V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
 `V1.3.10` 为什么转向短阶段适配训练，见 [docs/v1_3_10_projection_adaptation_notes.md](docs/v1_3_10_projection_adaptation_notes.md)。
+`V1.3.11` 的 Res18 证据包计划和当前结果，见 [docs/v1_3_11_res18_evidence.md](docs/v1_3_11_res18_evidence.md)。
 
 ## 环境前提
 
@@ -252,6 +253,7 @@ python run_hierarchical_fault_tolerance.py \
   --config fault_tolerance_config_low_fault_rate.json \
   --repair-mode normal \
   --levels all \
+  --fault-seed 42 \
   --samples 256 \
   --artifact-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/artifacts \
   --output-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim
@@ -306,6 +308,14 @@ python scripts/collect_ft_results.py \
   --report-dir results/ft_runs/Vgg16/ft_group_cluster_translate/vgg16_demo/sim \
   --results-root results/ft_runs \
   --tag vgg16_demo
+```
+
+如果要聚合同一 evidence 目录下的多个容错报告：
+
+```bash
+python scripts/collect_ft_results.py \
+  --aggregate-evidence-root results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt \
+  --evidence-output-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/evidence
 ```
 
 ## 本地 smoke 与真实实验

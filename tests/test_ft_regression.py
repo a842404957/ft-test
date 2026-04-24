@@ -36,6 +36,7 @@ from fault_tolerance_analyse import analyse
 from main import build_budgeted_grouping_config, prepare_ft_artifacts, resolve_ft_training_config, save_ft_build_only_projection
 from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
 from scripts.analyse_redundancy_construction import build_redundancy_construction_report
+from scripts.collect_ft_results import aggregate_evidence_reports, read_simulation_summary
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
 from simulator.Fault_Tolerance.fault_tolerance_simulation import resolve_excluded_critical_layers
 from simulator.Fault_Tolerance.config import FaultToleranceConfig
@@ -569,6 +570,23 @@ class TestFTRegression(unittest.TestCase):
             )
             self.assertEqual(runtime_config['model']['name'], 'Res18')
 
+    def test_runtime_config_overrides_fault_seed(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'fault_injection': {
+                    'random_seed': 42,
+                    'fault_rate': 0.03,
+                }
+            }), encoding='utf-8')
+            runtime_config, _ = _build_runtime_config(
+                base_config_file=str(config_path),
+                fault_seed=44,
+            )
+            self.assertEqual(runtime_config['fault_injection']['random_seed'], 44)
+            self.assertAlmostEqual(runtime_config['fault_injection']['fault_rate'], 0.03)
+
     def test_resolve_excluded_critical_layers_uses_first_and_last(self):
         layer_names = ['conv1.weight', 'layer1.0.conv1.weight', 'fc.weight']
         resolved = resolve_excluded_critical_layers(layer_names, ['__first__', '__last__'])
@@ -919,6 +937,56 @@ class TestFTRegression(unittest.TestCase):
         self.assertTrue(overrides['level1.enabled'])
         self.assertFalse(overrides['level2.enabled'])
         self.assertFalse(overrides['level3.enabled'])
+
+    def test_collect_ft_results_aggregates_evidence_reports(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            valid_dir = temp_dir / 'sim_stress_level1_full'
+            invalid_dir = temp_dir / 'sim_stress_level1'
+            valid_dir.mkdir()
+            invalid_dir.mkdir()
+
+            summary = (
+                'Category,Metric,Value\n'
+                'Reliability,Total Faults Injected,10\n'
+                'Reliability,Faults Corrected,9\n'
+                'Reliability,Faults Missed,1\n'
+                'Reliability,Fault Correction Rate,90.00%\n'
+                'Reliability,Level1 Corrections,9\n'
+                'Reliability,Level2 Corrections,0\n'
+                'Reliability,Level3 Corrections,0\n'
+                'Reliability,Level1 Zero Scale Failed,0\n'
+                'Reliability,Repair Mode,normal\n'
+                'RepairQuality,level1.attempted,9\n'
+                'RepairQuality,level1.effective_improved,8\n'
+                'RepairQuality,level1.exact_restored,1\n'
+                'RepairQuality,level1.avg_before_error,0.1\n'
+                'RepairQuality,level1.avg_after_error,0.02\n'
+                'RepairQuality,level1.improved_rate,88.89%\n'
+                'Accuracy,Baseline Accuracy,92.40%\n'
+                'Accuracy,Faulty Accuracy,84.21%\n'
+                'Accuracy,FT Accuracy,91.69%\n'
+                'Accuracy,Recovery Rate,91.33%\n'
+            )
+            for report_dir in [valid_dir, invalid_dir]:
+                (report_dir / 'fault_tolerance_summary_20260424_000000.csv').write_text(summary, encoding='utf-8')
+                (report_dir / 'fault_tolerance_report_20260424_000000.md').write_text(
+                    '- **随机种子**: 42\n',
+                    encoding='utf-8',
+                )
+
+            metrics = read_simulation_summary(valid_dir / 'fault_tolerance_summary_20260424_000000.csv')
+            self.assertAlmostEqual(metrics['baseline_accuracy'], 0.924)
+            self.assertAlmostEqual(metrics['repair_improved_rate'], 0.8889, places=4)
+
+            evidence = aggregate_evidence_reports(temp_dir, temp_dir / 'evidence')
+            rows = evidence['rows']
+            self.assertEqual(len(rows), 2)
+            by_name = {Path(row['report_dir']).name: row for row in rows}
+            self.assertEqual(by_name['sim_stress_level1_full']['validity'], 'valid')
+            self.assertEqual(by_name['sim_stress_level1']['validity'], 'invalid')
+            self.assertEqual(by_name['sim_stress_level1']['invalid_reason'], 'pre-fix twice-projected artifact')
+            self.assertTrue((temp_dir / 'evidence' / 'evidence_summary.csv').exists())
 
     def test_redundancy_construction_analysis_script_on_synthetic_data(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
