@@ -103,11 +103,19 @@ class ReportGenerator:
                 writer.writerow(['Reliability', 'Faults Corrected', rel.get('faults_corrected', 0)])
                 writer.writerow(['Reliability', 'Faults Missed', rel.get('faults_missed', 0)])
                 writer.writerow(['Reliability', 'Fault Correction Rate', f"{rel.get('fault_correction_rate', 0):.2%}"])
+                fault_detail = rel.get('fault_detail_stats', {})
+                fault_model_counts = fault_detail.get('fault_model_counts', rel.get('faults_by_model', {}))
+                writer.writerow(['Reliability', 'Affected Weight Count', fault_detail.get('affected_weight_count', 0)])
+                writer.writerow(['Reliability', 'Stuck At Zero Count', fault_model_counts.get('stuck_at_zero', 0)])
+                writer.writerow(['Reliability', 'Stuck At One Count', fault_model_counts.get('stuck_at_one', 0)])
+                for model_name, count in sorted(fault_model_counts.items()):
+                    writer.writerow(['FaultModel', model_name, count])
                 hierarchical = rel.get('hierarchical_correction', {})
                 if hierarchical:
                     writer.writerow(['Reliability', 'Level1 Corrections', hierarchical.get('level1_corrections', 0)])
                     writer.writerow(['Reliability', 'Level2 Corrections', hierarchical.get('level2_corrections', 0)])
                     writer.writerow(['Reliability', 'Level3 Corrections', hierarchical.get('level3_corrections', 0)])
+                    writer.writerow(['Reliability', 'Level1 Failed Singleton', hierarchical.get('level1_failed_singleton', 0)])
                     writer.writerow(['Reliability', 'Level1 Zero Scale Failed', hierarchical.get('level1_zero_scale_failed', 0)])
                     writer.writerow(['Reliability', 'Repair Mode', hierarchical.get('repair_mode', 'normal')])
                 repair_quality = rel.get('repair_quality', {})
@@ -118,6 +126,15 @@ class ReportGenerator:
                     writer.writerow(['RepairQuality', f'{level_name}.avg_before_error', f"{stats.get('avg_before_error', 0):.6f}"])
                     writer.writerow(['RepairQuality', f'{level_name}.avg_after_error', f"{stats.get('avg_after_error', 0):.6f}"])
                     writer.writerow(['RepairQuality', f'{level_name}.improved_rate', f"{stats.get('improved_rate', 0):.2%}"])
+                layer_repair_quality = rel.get('layer_repair_quality', {})
+                for layer_name, levels in sorted(layer_repair_quality.items()):
+                    for level_name, stats in sorted(levels.items()):
+                        prefix = f'{layer_name}.{level_name}'
+                        writer.writerow(['LayerRepairQuality', f'{prefix}.attempted', stats.get('attempted', 0)])
+                        writer.writerow(['LayerRepairQuality', f'{prefix}.effective_improved', stats.get('effective_improved', 0)])
+                        writer.writerow(['LayerRepairQuality', f'{prefix}.avg_before_error', f"{stats.get('avg_before_error', 0):.6f}"])
+                        writer.writerow(['LayerRepairQuality', f'{prefix}.avg_after_error', f"{stats.get('avg_after_error', 0):.6f}"])
+                        writer.writerow(['LayerRepairQuality', f'{prefix}.improved_rate', f"{stats.get('improved_rate', 0):.2%}"])
             
             # 硬件开销指标
             if 'hardware_overhead' in metrics:
@@ -183,6 +200,19 @@ class ReportGenerator:
                 f.write(f"| 未纠正数 | {rel.get('faults_missed', 0)} |\n")
                 f.write(f"| 检测失败数 | {rel.get('detection_failures', 0)} |\n")
                 f.write(f"| **故障纠正率** | **{rel.get('fault_correction_rate', 0):.2%}** |\n\n")
+                fault_detail = rel.get('fault_detail_stats', {})
+                fault_model_counts = fault_detail.get('fault_model_counts', rel.get('faults_by_model', {}))
+                if fault_detail or fault_model_counts:
+                    f.write("### 2.0 故障模型分布\n\n")
+                    f.write("| 指标 | 值 |\n")
+                    f.write("|------|----|\n")
+                    f.write(f"| 受影响权重数 | {fault_detail.get('affected_weight_count', 0)} |\n")
+                    f.write(f"| stuck_at_zero | {fault_model_counts.get('stuck_at_zero', 0)} |\n")
+                    f.write(f"| stuck_at_one | {fault_model_counts.get('stuck_at_one', 0)} |\n")
+                    for model_name, count in sorted(fault_model_counts.items()):
+                        if model_name not in ('stuck_at_zero', 'stuck_at_one'):
+                            f.write(f"| {model_name} | {count} |\n")
+                    f.write("\n")
                 hierarchical = rel.get('hierarchical_correction', {})
                 if hierarchical:
                     f.write("### 2.1 三级容错统计\n\n")
@@ -191,6 +221,7 @@ class ReportGenerator:
                     f.write(f"| Level 1纠正数 | {hierarchical.get('level1_corrections', 0)} |\n")
                     f.write(f"| Level 2纠正数 | {hierarchical.get('level2_corrections', 0)} |\n")
                     f.write(f"| Level 3纠正数 | {hierarchical.get('level3_corrections', 0)} |\n")
+                    f.write(f"| Level 1 failed singleton | {hierarchical.get('level1_failed_singleton', 0)} |\n")
                     f.write(f"| Level 1 zero-scale failed | {hierarchical.get('level1_zero_scale_failed', 0)} |\n")
                     f.write(f"| 修复模式 | {hierarchical.get('repair_mode', 'normal')} |\n\n")
                 repair_quality = rel.get('repair_quality', {})
@@ -203,6 +234,22 @@ class ReportGenerator:
                             f"| {level_name} | {stats.get('attempted', 0)} | {stats.get('effective_improved', 0)} | "
                             f"{stats.get('exact_restored', 0)} | {stats.get('avg_before_error', 0):.6f} | "
                             f"{stats.get('avg_after_error', 0):.6f} | {stats.get('improved_rate', 0):.2%} |\n"
+                        )
+                    f.write("\n")
+                layer_repair_quality = rel.get('layer_repair_quality', {})
+                if layer_repair_quality:
+                    f.write("### 2.2.1 逐层修复质量 Top Residual\n\n")
+                    f.write("| Layer | Level | Attempted | Improved Rate | Avg Before Error | Avg After Error |\n")
+                    f.write("|------|-------|-----------|---------------|------------------|-----------------|\n")
+                    layer_rows = []
+                    for layer_name, levels in layer_repair_quality.items():
+                        for level_name, stats in levels.items():
+                            layer_rows.append((stats.get('avg_after_error', 0), layer_name, level_name, stats))
+                    for _, layer_name, level_name, stats in sorted(layer_rows, reverse=True)[:10]:
+                        f.write(
+                            f"| {layer_name} | {level_name} | {stats.get('attempted', 0)} | "
+                            f"{stats.get('improved_rate', 0):.2%} | {stats.get('avg_before_error', 0):.6f} | "
+                            f"{stats.get('avg_after_error', 0):.6f} |\n"
                         )
                     f.write("\n")
                 

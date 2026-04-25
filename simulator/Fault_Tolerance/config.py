@@ -26,6 +26,12 @@ class FaultToleranceConfig:
             'random_seed': 42,  # 随机种子，用于可重现性
             'bit_flip_positions': 'random',  # 'random' 或 'msb' 或 'lsb'
             'bit_flip_ratio': 0.25,
+            'fault_model_probs': None,
+            'fault_weight_ratio': 1.0,
+            'fault_granularity': 'ou_weight',
+            'stuck_at_one_value_mode': 'layer_absmax',
+            'stuck_at_one_value': None,
+            'stuck_at_zero_value': 0.0,
         },
         
         # 多数表决器配置

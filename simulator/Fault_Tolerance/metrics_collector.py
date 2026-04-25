@@ -46,6 +46,7 @@ class MetricsCollector:
                 'level2_rate': 0.0,
                 'level3_rate': 0.0,
                 'level2_similarity_avg': 0.0,  # Level 2平均相似度
+                'level1_failed_singleton': 0,
                 'level1_zero_scale_failed': 0,
                 'repair_mode': 'normal',
             }
@@ -94,11 +95,16 @@ class MetricsCollector:
                 self.timing['end_time'] - self.timing['start_time']
             )
     
-    def update_fault_injection_stats(self, total_faults: int, 
-                                     faults_by_layer: Dict[str, int]):
+    def update_fault_injection_stats(self, total_faults: int,
+                                     faults_by_layer: Dict[str, int],
+                                     faults_by_model: Optional[Dict[str, int]] = None,
+                                     fault_detail_stats: Optional[Dict[str, Any]] = None):
         """更新故障注入统计"""
         self.reliability_metrics['total_faults_injected'] = total_faults
         self.reliability_metrics['layer_wise_faults'] = faults_by_layer.copy()
+        self.reliability_metrics['faults_by_model'] = (faults_by_model or {}).copy()
+        if fault_detail_stats:
+            self.reliability_metrics['fault_detail_stats'] = json.loads(json.dumps(fault_detail_stats))
     
     def update_voting_stats(self, successful_corrections: int,
                           detection_failures: int,
@@ -123,6 +129,7 @@ class MetricsCollector:
                                             level2_count: int,
                                             level3_count: int,
                                             level2_similarity_avg: float = 0.0,
+                                            level1_failed_singleton: int = 0,
                                             level1_zero_scale_failed: int = 0,
                                             repair_mode: str = 'normal'):
         """更新三级容错统计"""
@@ -130,6 +137,7 @@ class MetricsCollector:
         self.reliability_metrics['hierarchical_correction']['level2_corrections'] = level2_count
         self.reliability_metrics['hierarchical_correction']['level3_corrections'] = level3_count
         self.reliability_metrics['hierarchical_correction']['level2_similarity_avg'] = level2_similarity_avg
+        self.reliability_metrics['hierarchical_correction']['level1_failed_singleton'] = level1_failed_singleton
         self.reliability_metrics['hierarchical_correction']['level1_zero_scale_failed'] = level1_zero_scale_failed
         self.reliability_metrics['hierarchical_correction']['repair_mode'] = repair_mode
         
@@ -143,6 +151,10 @@ class MetricsCollector:
     def update_repair_quality_stats(self, repair_quality: Dict[str, Any]):
         """更新逐级修复质量统计。"""
         self.reliability_metrics['repair_quality'] = json.loads(json.dumps(repair_quality))
+
+    def update_layer_repair_quality_stats(self, layer_repair_quality: Dict[str, Any]):
+        """更新逐层修复质量统计。"""
+        self.reliability_metrics['layer_repair_quality'] = json.loads(json.dumps(layer_repair_quality))
     
     def update_hardware_overhead(self, 
                                 computation_latency: float,

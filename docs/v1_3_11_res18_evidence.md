@@ -17,6 +17,17 @@ Artifact:
 
 The full-sample result confirms that the 1000-sample recovery was not a sampling artifact.
 
+Primary multi-seed Level1-only full results:
+
+| seed | baseline | faulty | FT | recovery | correction | repair improved |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 42 | 92.40% | 84.21% | 91.69% | 91.33% | 95.64% | 91.49% |
+| 43 | 92.40% | 35.68% | 77.79% | 74.24% | 95.74% | 91.13% |
+| 44 | 92.40% | 70.84% | 89.72% | 87.57% | 95.62% | 91.23% |
+
+The average recovery is about 84.38%, so the V1.3.11 multi-seed gate is not fully passed:
+the mean is slightly below 85%, and seed 43 is below the 80% per-seed threshold.
+
 The older directories below are invalid and should not be used in V1.3.11 tables:
 
 - `sim_stress_level1`

@@ -8,7 +8,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 import sys
 
@@ -151,6 +151,8 @@ class FaultToleranceSimulator:
         
         # 仿真状态
         self.simulation_results = {}
+        self.detailed_fault_mask = {}
+        self.fault_detail_stats = {}
         
         print("\n✅ 所有模块初始化完成\n")
     
@@ -375,6 +377,82 @@ class FaultToleranceSimulator:
         in_channels = weight.shape[1]
         return [(out_ch, in_ch) for out_ch in range(out_channels) for in_ch in range(in_channels)]
 
+    @staticmethod
+    def _new_fault_detail_stats() -> Dict[str, Any]:
+        return {
+            'affected_weight_count': 0,
+            'fault_model_counts': {},
+            'layer_details': {},
+        }
+
+    @staticmethod
+    def _normalize_fault_model_probs(fault_models: List[str], probs: Optional[List[float]]) -> List[float]:
+        if not fault_models:
+            return []
+        if probs is None or len(probs) != len(fault_models):
+            return [1.0 / len(fault_models)] * len(fault_models)
+        probs = [max(float(p), 0.0) for p in probs]
+        total = sum(probs)
+        if total <= 0:
+            return [1.0 / len(fault_models)] * len(fault_models)
+        return [p / total for p in probs]
+
+    @staticmethod
+    def _sample_fault_model(fault_models: List[str], probs: List[float]) -> str:
+        if not fault_models:
+            return 'bit_flip'
+        return str(np.random.choice(fault_models, p=probs))
+
+    @staticmethod
+    def _record_fault_detail(stats: Dict[str, Any], layer_name: str, model_name: str):
+        stats['affected_weight_count'] = int(stats.get('affected_weight_count', 0)) + 1
+        stats.setdefault('fault_model_counts', {})
+        stats['fault_model_counts'][model_name] = int(stats['fault_model_counts'].get(model_name, 0)) + 1
+        layer_stats = stats.setdefault('layer_details', {}).setdefault(layer_name, {
+            'faulty_ou_count': 0,
+            'affected_weight_count': 0,
+            'fault_model_counts': {},
+        })
+        layer_stats['affected_weight_count'] = int(layer_stats.get('affected_weight_count', 0)) + 1
+        layer_stats.setdefault('fault_model_counts', {})
+        layer_stats['fault_model_counts'][model_name] = int(layer_stats['fault_model_counts'].get(model_name, 0)) + 1
+
+    @staticmethod
+    def _fault_model_count(stats: Dict[str, Any], model_name: str) -> int:
+        return int(stats.get('fault_model_counts', {}).get(model_name, 0))
+
+    def _resolve_stuck_at_one_value(self,
+                                    mode: str,
+                                    configured_value: Optional[float],
+                                    layer_weight: torch.Tensor,
+                                    global_absmax: float) -> float:
+        if configured_value is not None:
+            return float(configured_value)
+        mode = (mode or 'layer_absmax').strip().lower()
+        if mode == 'constant_one':
+            return 1.0
+        if mode == 'global_absmax':
+            return float(global_absmax)
+        # 默认用健康层权重的绝对最大值，避免不同层量级被 constant 1 放大。
+        return float(layer_weight.detach().abs().max().item())
+
+    @staticmethod
+    def _apply_fault_entry(flat_weights: torch.Tensor, entry: Any, num_weights: int):
+        if isinstance(entry, dict):
+            idx = int(entry.get('index', -1))
+            if 0 <= idx < num_weights:
+                flat_weights[idx] = float(entry.get('replacement_value', flat_weights[idx].item()))
+            return
+        idx = int(entry)
+        if 0 <= idx < num_weights:
+            flat_weights[idx] *= -1
+
+    def _sync_fault_detail_stats_to_injector(self):
+        self.fault_injector.fault_statistics['faults_by_model'] = dict(
+            self.fault_detail_stats.get('fault_model_counts', {})
+        )
+        self.fault_injector.fault_statistics['fault_detail_stats'] = self.fault_detail_stats
+
     def _get_mask_groups(self, layer_name: str, weight: torch.Tensor) -> Dict[bytes, List[Tuple[int, int]]]:
         """按mask形状分组OU（用于Level 2快速候选筛选）"""
         if not hasattr(self, '_mask_group_index'):
@@ -471,16 +549,20 @@ class FaultToleranceSimulator:
     def _record_repair_quality(bucket: Dict[str, float],
                                before_weight: torch.Tensor,
                                after_weight: torch.Tensor,
-                               original_weight: torch.Tensor):
+                               original_weight: torch.Tensor,
+                               secondary_bucket: Optional[Dict[str, float]] = None):
         before_error = torch.norm((before_weight - original_weight).float(), p=2).item()
         after_error = torch.norm((after_weight - original_weight).float(), p=2).item()
-        bucket['attempted'] += 1
-        bucket['before_error_sum'] += float(before_error)
-        bucket['after_error_sum'] += float(after_error)
-        if after_error + 1e-8 < before_error:
-            bucket['effective_improved'] += 1
-        if after_error < 1e-6:
-            bucket['exact_restored'] += 1
+        for target_bucket in [bucket, secondary_bucket]:
+            if target_bucket is None:
+                continue
+            target_bucket['attempted'] += 1
+            target_bucket['before_error_sum'] += float(before_error)
+            target_bucket['after_error_sum'] += float(after_error)
+            if after_error + 1e-8 < before_error:
+                target_bucket['effective_improved'] += 1
+            if after_error < 1e-6:
+                target_bucket['exact_restored'] += 1
 
     @staticmethod
     def _is_invalid_scale_factor(scale_factor: float, eps: float = 1e-6) -> bool:
@@ -513,6 +595,26 @@ class FaultToleranceSimulator:
 
         # 初始化详细故障位置记录
         self.detailed_fault_mask = {}
+        self.fault_detail_stats = self._new_fault_detail_stats()
+        fault_models = [str(model) for model in fault_config.get('fault_models', ['bit_flip'])]
+        fault_model_probs = self._normalize_fault_model_probs(fault_models, fault_config.get('fault_model_probs'))
+        use_structured_weight_faults = any(
+            model in ('stuck_at_zero', 'stuck_at_one') for model in fault_models
+        )
+        fault_weight_ratio = float(fault_config.get('fault_weight_ratio', 1.0))
+        stuck_at_one_mode = fault_config.get('stuck_at_one_value_mode', 'layer_absmax')
+        stuck_at_one_value = fault_config.get('stuck_at_one_value')
+        stuck_at_zero_value = float(fault_config.get('stuck_at_zero_value', 0.0))
+
+        global_absmax = 1.0
+        if stuck_at_one_mode == 'global_absmax':
+            global_values = []
+            for candidate_layer in layer_names:
+                module = self._get_module_by_name(candidate_layer)
+                if module is not None and hasattr(module, 'weight'):
+                    global_values.append(float(module.weight.data.detach().abs().max().item()))
+            if global_values:
+                global_absmax = max(global_values)
 
         # 🔍 添加故障分布统计
         print(f"\n  🔍 故障注入详细分布（故障率={fault_rate}）:")
@@ -556,22 +658,79 @@ class FaultToleranceSimulator:
                 if weight.dim() == 4:
                     ou_weights = weight[out_ch, in_ch, :, :].clone()
                     num_weights = ou_weights.numel()
-                    num_weights_to_fault = min(8, num_weights)
-                    if num_weights_to_fault == 0:
+                    if num_weights == 0:
                         continue
 
-                    bit_flip_ratio = fault_config.get('bit_flip_ratio', 0.25)
-                    num_flipped = max(1, int(num_weights_to_fault * bit_flip_ratio))
-
                     flat_weights = ou_weights.flatten()
-                    flat_indices = torch.randperm(num_weights_to_fault, device=weight.device)[:num_flipped]
-                    flat_weights[flat_indices] *= -1
+                    if use_structured_weight_faults:
+                        num_faulted_weights = max(1, int(num_weights * fault_weight_ratio))
+                        num_faulted_weights = min(num_weights, num_faulted_weights)
+                        flat_indices = torch.randperm(num_weights, device=weight.device)[:num_faulted_weights]
+                        one_value = self._resolve_stuck_at_one_value(
+                            mode=stuck_at_one_mode,
+                            configured_value=stuck_at_one_value,
+                            layer_weight=weight,
+                            global_absmax=global_absmax,
+                        )
+                        entries = []
+                        for raw_idx in flat_indices.cpu().tolist():
+                            fault_model = self._sample_fault_model(fault_models, fault_model_probs)
+                            if fault_model == 'stuck_at_zero':
+                                replacement_value = stuck_at_zero_value
+                            elif fault_model == 'stuck_at_one':
+                                replacement_value = one_value
+                            else:
+                                fault_model = 'bit_flip'
+                                replacement_value = -float(flat_weights[raw_idx].item())
+                            flat_weights[raw_idx] = float(replacement_value)
+                            entries.append({
+                                'index': int(raw_idx),
+                                'fault_model': fault_model,
+                                'replacement_value': float(replacement_value),
+                            })
+                            self._record_fault_detail(self.fault_detail_stats, layer_name, fault_model)
+                        self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = entries
+                        weight[out_ch, in_ch, :, :] = flat_weights.reshape(ou_weights.shape)
+                    else:
+                        num_weights_to_fault = min(8, num_weights)
+                        if num_weights_to_fault == 0:
+                            continue
+                        bit_flip_ratio = fault_config.get('bit_flip_ratio', 0.25)
+                        num_flipped = max(1, int(num_weights_to_fault * bit_flip_ratio))
+                        flat_indices = torch.randperm(num_weights_to_fault, device=weight.device)[:num_flipped]
+                        flat_weights[flat_indices] *= -1
 
-                    self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = flat_indices.cpu().tolist()
-                    weight[out_ch, in_ch, :, :] = flat_weights.reshape(ou_weights.shape)
+                        self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = flat_indices.cpu().tolist()
+                        weight[out_ch, in_ch, :, :] = flat_weights.reshape(ou_weights.shape)
+                        for _ in flat_indices.cpu().tolist():
+                            self._record_fault_detail(self.fault_detail_stats, layer_name, 'bit_flip')
                 elif weight.dim() == 2:
-                    weight[out_ch, in_ch] *= -1
-                    self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = [0]
+                    if use_structured_weight_faults:
+                        fault_model = self._sample_fault_model(fault_models, fault_model_probs)
+                        one_value = self._resolve_stuck_at_one_value(
+                            mode=stuck_at_one_mode,
+                            configured_value=stuck_at_one_value,
+                            layer_weight=weight,
+                            global_absmax=global_absmax,
+                        )
+                        if fault_model == 'stuck_at_zero':
+                            replacement_value = stuck_at_zero_value
+                        elif fault_model == 'stuck_at_one':
+                            replacement_value = one_value
+                        else:
+                            fault_model = 'bit_flip'
+                            replacement_value = -float(weight[out_ch, in_ch].item())
+                        weight[out_ch, in_ch] = float(replacement_value)
+                        self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = [{
+                            'index': 0,
+                            'fault_model': fault_model,
+                            'replacement_value': float(replacement_value),
+                        }]
+                        self._record_fault_detail(self.fault_detail_stats, layer_name, fault_model)
+                    else:
+                        weight[out_ch, in_ch] *= -1
+                        self.detailed_fault_mask[layer_name][(out_ch, in_ch)] = [0]
+                        self._record_fault_detail(self.fault_detail_stats, layer_name, 'bit_flip')
 
             # 记录故障
             ou_fault_mask[layer_name] = faulty_ous
@@ -580,10 +739,23 @@ class FaultToleranceSimulator:
             num_faulty_ous = len(faulty_ous)
             self.fault_injector.fault_statistics['total_faults_injected'] += num_faulty_ous
             self.fault_injector.fault_statistics['faults_by_layer'][layer_name] = num_faulty_ous
+            self.fault_detail_stats.setdefault('layer_details', {}).setdefault(layer_name, {
+                'faulty_ou_count': 0,
+                'affected_weight_count': 0,
+                'fault_model_counts': {},
+            })['faulty_ou_count'] = num_faulty_ous
 
             total_flipped = sum(len(indices) for indices in self.detailed_fault_mask[layer_name].values())
-            print(f"    {layer_name}: {num_faulty_ous} 个故障OU, {total_flipped} 个权重翻转 (总共 {total_ous} 个OU)")
+            layer_stats = self.fault_detail_stats['layer_details'].get(layer_name, {})
+            zero_count = layer_stats.get('fault_model_counts', {}).get('stuck_at_zero', 0)
+            one_count = layer_stats.get('fault_model_counts', {}).get('stuck_at_one', 0)
+            if use_structured_weight_faults:
+                print(f"    {layer_name}: {num_faulty_ous} 个故障OU, {total_flipped} 个权重stuck-at "
+                      f"(zero={zero_count}, one={one_count}, 总共 {total_ous} 个OU)")
+            else:
+                print(f"    {layer_name}: {num_faulty_ous} 个故障OU, {total_flipped} 个权重翻转 (总共 {total_ous} 个OU)")
         
+        self._sync_fault_detail_stats_to_injector()
         return ou_fault_mask
     
     def _apply_fault_mask(self, fault_mask: Dict[str, List[Tuple[int, int]]]):
@@ -593,6 +765,7 @@ class FaultToleranceSimulator:
         Args:
             fault_mask: 每层的故障OU坐标列表
         """
+        self.fault_detail_stats = self._new_fault_detail_stats()
         for layer_name, faulty_ou_indices in fault_mask.items():
             module = self._get_module_by_name(layer_name)
             if module is None or not hasattr(module, 'weight'):
@@ -604,6 +777,11 @@ class FaultToleranceSimulator:
                 continue
 
             all_ous = None
+            self.fault_detail_stats.setdefault('layer_details', {}).setdefault(layer_name, {
+                'faulty_ou_count': len(faulty_ou_indices),
+                'affected_weight_count': 0,
+                'fault_model_counts': {},
+            })['faulty_ou_count'] = len(faulty_ou_indices)
 
             # 应用故障到指定的OU
             for ou_entry in faulty_ou_indices:
@@ -618,27 +796,48 @@ class FaultToleranceSimulator:
 
                 if weight.dim() == 4:
                     if hasattr(self, 'detailed_fault_mask') and layer_name in self.detailed_fault_mask:
-                        fault_indices = self.detailed_fault_mask[layer_name].get((out_ch, in_ch))
+                        fault_entries = self.detailed_fault_mask[layer_name].get((out_ch, in_ch))
                     else:
-                        fault_indices = None
+                        fault_entries = None
 
-                    if fault_indices:
+                    if fault_entries:
                         ou_weights = weight[out_ch, in_ch, :, :].clone()
                         flat_weights = ou_weights.flatten()
                         num_weights_to_fault = min(8, flat_weights.numel())
-                        for idx in fault_indices:
-                            if idx < num_weights_to_fault:
-                                flat_weights[idx] *= -1
+                        for entry in fault_entries:
+                            if isinstance(entry, dict):
+                                model_name = str(entry.get('fault_model', 'bit_flip'))
+                                self._apply_fault_entry(flat_weights, entry, flat_weights.numel())
+                            else:
+                                model_name = 'bit_flip'
+                                self._apply_fault_entry(flat_weights, entry, num_weights_to_fault)
+                            self._record_fault_detail(self.fault_detail_stats, layer_name, model_name)
                         weight[out_ch, in_ch, :, :] = flat_weights.reshape(ou_weights.shape)
                     else:
                         weight[out_ch, in_ch, :, :] *= -1
+                        self._record_fault_detail(self.fault_detail_stats, layer_name, 'bit_flip')
                 elif weight.dim() == 2:
-                    weight[out_ch, in_ch] *= -1
+                    if hasattr(self, 'detailed_fault_mask') and layer_name in self.detailed_fault_mask:
+                        fault_entries = self.detailed_fault_mask[layer_name].get((out_ch, in_ch))
+                    else:
+                        fault_entries = None
+                    if fault_entries and isinstance(fault_entries[0], dict):
+                        entry = fault_entries[0]
+                        weight[out_ch, in_ch] = float(entry.get('replacement_value', weight[out_ch, in_ch].item()))
+                        self._record_fault_detail(
+                            self.fault_detail_stats,
+                            layer_name,
+                            str(entry.get('fault_model', 'bit_flip')),
+                        )
+                    else:
+                        weight[out_ch, in_ch] *= -1
+                        self._record_fault_detail(self.fault_detail_stats, layer_name, 'bit_flip')
             
             # 更新统计
             num_faulty_ous = len(faulty_ou_indices)
             self.fault_injector.fault_statistics['total_faults_injected'] += num_faulty_ous
             self.fault_injector.fault_statistics['faults_by_layer'][layer_name] = num_faulty_ous
+        self._sync_fault_detail_stats_to_injector()
     
     def _apply_weight_level_correction(self,
                                       ou_fault_mask: Dict[str, List[Tuple[int, int]]],
@@ -678,6 +877,13 @@ class FaultToleranceSimulator:
         }
         if repair_mode == 'oracle':
             repair_quality_buckets['oracle'] = self._new_repair_quality_bucket()
+        layer_repair_quality_buckets: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+        def layer_quality_bucket(layer: str, level: str) -> Dict[str, float]:
+            return layer_repair_quality_buckets.setdefault(layer, {}).setdefault(
+                level,
+                self._new_repair_quality_bucket(),
+            )
 
         level1_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
         level2_corrected_ous: Dict[str, List[Tuple[int, int]]] = {}
@@ -740,6 +946,7 @@ class FaultToleranceSimulator:
                         before_weight=before_weight,
                         after_weight=after_weight,
                         original_weight=original_weight,
+                        secondary_bucket=layer_quality_bucket(layer_name, 'oracle'),
                     )
                     layer_oracle.append(faulty_ou)
                     oracle_count += 1
@@ -872,6 +1079,7 @@ class FaultToleranceSimulator:
                             before_weight=faulty_current_weight,
                             after_weight=faulty_current_weight,
                             original_weight=faulty_original_weight,
+                            secondary_bucket=layer_quality_bucket(layer_name, 'level1'),
                         )
                         if level1_zero_scale_failed <= 3:
                             print(f"  ⚠️ Level 1 zero-scale skipped: {layer_name}[{faulty_ou}] "
@@ -890,6 +1098,7 @@ class FaultToleranceSimulator:
                         before_weight=faulty_current_weight,
                         after_weight=corrected_weight_after,
                         original_weight=faulty_original_weight,
+                        secondary_bucket=layer_quality_bucket(layer_name, 'level1'),
                     )
 
                     if level1_count < 3:
@@ -1030,6 +1239,7 @@ class FaultToleranceSimulator:
                         before_weight=before_weight,
                         after_weight=after_weight,
                         original_weight=original_weight,
+                        secondary_bucket=layer_quality_bucket(layer_name, 'level2'),
                     )
 
                     level2_count += 1
@@ -1063,25 +1273,33 @@ class FaultToleranceSimulator:
                             before_weight=before_weight,
                             after_weight=after_weight,
                             original_weight=original_weight,
+                            secondary_bucket=layer_quality_bucket(layer_name, 'level3'),
                         )
                         continue
                     # ✅ Level 3细粒度容错：只置零故障权重，保留健康权重
                     if hasattr(self, 'detailed_fault_mask') and layer_name in self.detailed_fault_mask:
                         if faulty_ou_idx in self.detailed_fault_mask[layer_name]:
                             # 有详细故障记录，只置零故障权重
-                            fault_indices = self.detailed_fault_mask[layer_name][faulty_ou_idx]
+                            fault_entries = self.detailed_fault_mask[layer_name][faulty_ou_idx]
 
                             # 获取该OU的权重
                             out_ch, in_ch = faulty_ou_idx
                             ou_weights = layer_weights[out_ch, in_ch, :, :]
                             flat_weights = ou_weights.flatten()
 
-                            # 只翻转前8个权重（与故障注入一致）
-                            flat_weights[:8][fault_indices] = 0
+                            for entry in fault_entries:
+                                if isinstance(entry, dict):
+                                    fault_index = int(entry.get('index', -1))
+                                    if 0 <= fault_index < flat_weights.numel():
+                                        flat_weights[fault_index] = 0
+                                else:
+                                    fault_index = int(entry)
+                                    if 0 <= fault_index < min(8, flat_weights.numel()):
+                                        flat_weights[fault_index] = 0
                             layer_weights[out_ch, in_ch, :, :] = flat_weights.reshape(ou_weights.shape)
 
                             if level3_count < 3:
-                                print(f"  ✅ Level 3: {layer_name}[{faulty_ou_idx}] {len(fault_indices)} 个故障权重置0")
+                                print(f"  ✅ Level 3: {layer_name}[{faulty_ou_idx}] {len(fault_entries)} 个故障权重置0")
                         else:
                             # 没有故障记录，可能是整个OU故障（兼容性处理）
                             out_ch, in_ch = faulty_ou_idx
@@ -1103,6 +1321,7 @@ class FaultToleranceSimulator:
                         before_weight=before_weight,
                         after_weight=after_weight,
                         original_weight=original_weight,
+                        secondary_bucket=layer_quality_bucket(layer_name, 'level3'),
                     )
             else:
                 # 如果Level 3未启用，这些故障无法纠正
@@ -1172,6 +1391,14 @@ class FaultToleranceSimulator:
             for level_name, bucket in repair_quality_buckets.items()
             if bucket.get('attempted', 0) > 0
         }
+        layer_repair_quality = {
+            layer_name: {
+                level_name: self._finalize_repair_quality_bucket(bucket)
+                for level_name, bucket in layer_buckets.items()
+                if bucket.get('attempted', 0) > 0
+            }
+            for layer_name, layer_buckets in layer_repair_quality_buckets.items()
+        }
 
         return {
             'level1_count': level1_count,
@@ -1192,7 +1419,8 @@ class FaultToleranceSimulator:
             'level2_corrected_ous': level2_corrected_ous,
             'level3_corrected_ous': level3_corrected_ous,
             'oracle_corrected_ous': oracle_corrected_ous,
-            'uncorrected_by_layer': uncorrected_by_layer
+            'uncorrected_by_layer': uncorrected_by_layer,
+            'layer_repair_quality': layer_repair_quality,
         }
     
     
@@ -1220,7 +1448,9 @@ class FaultToleranceSimulator:
         fault_stats = self.fault_injector.get_statistics()
         self.metrics_collector.update_fault_injection_stats(
             total_faults=fault_stats['total_faults_injected'],
-            faults_by_layer=fault_stats['faults_by_layer']
+            faults_by_layer=fault_stats['faults_by_layer'],
+            faults_by_model=fault_stats.get('faults_by_model', {}),
+            fault_detail_stats=fault_stats.get('fault_detail_stats', {}),
         )
         
         # 表决统计
@@ -1242,11 +1472,15 @@ class FaultToleranceSimulator:
                 level2_count=self._hierarchical_stats['level2_count'],
                 level3_count=self._hierarchical_stats['level3_count'],
                 level2_similarity_avg=level2_similarity,
+                level1_failed_singleton=self._hierarchical_stats.get('level1_failed_singleton', 0),
                 level1_zero_scale_failed=self._hierarchical_stats.get('level1_zero_scale_failed', 0),
                 repair_mode=self._hierarchical_stats.get('repair_mode', 'normal'),
             )
             self.metrics_collector.update_repair_quality_stats(
                 self._hierarchical_stats.get('repair_quality', {})
+            )
+            self.metrics_collector.update_layer_repair_quality_stats(
+                self._hierarchical_stats.get('layer_repair_quality', {})
             )
         
         # 硬件开销（包含三级容错的额外开销）

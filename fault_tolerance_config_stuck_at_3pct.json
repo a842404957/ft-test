@@ -1,0 +1,41 @@
+{
+  "model": {
+    "name": "Res18",
+    "num_classes": 10
+  },
+  "fault_injection": {
+    "enabled": true,
+    "fault_rate": 0.03,
+    "fault_models": [
+      "stuck_at_zero",
+      "stuck_at_one"
+    ],
+    "fault_model_probs": [
+      0.5,
+      0.5
+    ],
+    "fault_weight_ratio": 1.0,
+    "fault_granularity": "ou_weight",
+    "stuck_at_one_value_mode": "layer_absmax",
+    "stuck_at_zero_value": 0.0,
+    "target_layers": "all",
+    "exclude_critical_layers": [
+      "__last__"
+    ],
+    "random_seed": 42
+  },
+  "simulation": {
+    "batch_size": 128,
+    "num_test_samples": 10000,
+    "device": "cuda",
+    "verbose": true
+  },
+  "report": {
+    "output_dir": "./fault_tolerance_results/stuck_at_3pct",
+    "formats": [
+      "json",
+      "csv",
+      "md"
+    ]
+  }
+}

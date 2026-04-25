@@ -36,7 +36,9 @@ from fault_tolerance_analyse import analyse
 from main import build_budgeted_grouping_config, prepare_ft_artifacts, resolve_ft_training_config, save_ft_build_only_projection
 from run_hierarchical_fault_tolerance import _build_runtime_config, resolve_runtime_model_name, resolve_levels_overrides
 from scripts.analyse_redundancy_construction import build_redundancy_construction_report
+from scripts.analyse_fault_seed_failure import analyse_fault_seed_failure
 from scripts.collect_ft_results import aggregate_evidence_reports, read_simulation_summary
+from scripts.run_fault_seed_sweep import run_seed_sweep
 from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceSimulator
 from simulator.Fault_Tolerance.fault_tolerance_simulation import resolve_excluded_critical_layers
 from simulator.Fault_Tolerance.config import FaultToleranceConfig
@@ -837,6 +839,142 @@ class TestFTRegression(unittest.TestCase):
             self.assertAlmostEqual(simulator.model.conv.weight[1, 1, 0, 0].item(), original_weights['conv.weight'][1, 1, 0, 0].item(), places=6)
             self.assertEqual(stats['repair_quality']['oracle']['exact_restored'], 1)
 
+    def test_stuck_at_zero_sets_selected_weights_to_zero(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyStuckZero')
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyStuckZero', 'num_classes': 10},
+                'fault_injection': {
+                    'enabled': True,
+                    'fault_rate': 1.0,
+                    'fault_models': ['stuck_at_zero'],
+                    'fault_model_probs': [1.0],
+                    'fault_weight_ratio': 1.0,
+                    'exclude_critical_layers': [],
+                    'random_seed': 7,
+                },
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.copy_(torch.arange(1, 9, dtype=torch.float32).reshape(2, 4, 1, 1))
+            simulator = FaultToleranceSimulator(model, 'ToyStuckZero', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            simulator._inject_ou_level_faults()
+            self.assertTrue(torch.all(simulator.model.conv.weight == 0))
+            self.assertEqual(simulator.fault_detail_stats['fault_model_counts']['stuck_at_zero'], 8)
+
+    def test_stuck_at_one_uses_configured_value_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyStuckOne')
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyStuckOne', 'num_classes': 10},
+                'fault_injection': {
+                    'enabled': True,
+                    'fault_rate': 1.0,
+                    'fault_models': ['stuck_at_one'],
+                    'fault_model_probs': [1.0],
+                    'fault_weight_ratio': 1.0,
+                    'stuck_at_one_value_mode': 'constant_one',
+                    'stuck_at_one_value': 3.5,
+                    'exclude_critical_layers': [],
+                    'random_seed': 7,
+                },
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.copy_(torch.arange(1, 9, dtype=torch.float32).reshape(2, 4, 1, 1))
+            simulator = FaultToleranceSimulator(model, 'ToyStuckOne', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            simulator._inject_ou_level_faults()
+            self.assertTrue(torch.allclose(simulator.model.conv.weight, torch.full_like(simulator.model.conv.weight, 3.5)))
+            self.assertEqual(simulator.fault_detail_stats['fault_model_counts']['stuck_at_one'], 8)
+
+    def test_stuck_at_ratio_and_seed_are_reproducible(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyStuckRatio')
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyStuckRatio', 'num_classes': 10},
+                'fault_injection': {
+                    'enabled': True,
+                    'fault_rate': 1.0,
+                    'fault_models': ['stuck_at_zero', 'stuck_at_one'],
+                    'fault_model_probs': [0.5, 0.5],
+                    'fault_weight_ratio': 1.0,
+                    'exclude_critical_layers': [],
+                    'random_seed': 123,
+                },
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+            }), encoding='utf-8')
+
+            class WiderConvModel(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv = nn.Conv2d(16, 16, kernel_size=1, bias=False)
+
+            masks = []
+            stats = []
+            for _ in range(2):
+                model = WiderConvModel()
+                with torch.no_grad():
+                    model.conv.weight.copy_(torch.arange(1, 257, dtype=torch.float32).reshape(16, 16, 1, 1))
+                simulator = FaultToleranceSimulator(model, 'ToyStuckRatio', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+                simulator._inject_ou_level_faults()
+                masks.append(json.dumps({
+                    layer: {str(key): value for key, value in entries.items()}
+                    for layer, entries in simulator.detailed_fault_mask.items()
+                }, sort_keys=True))
+                stats.append(simulator.fault_detail_stats['fault_model_counts'])
+
+            self.assertEqual(masks[0], masks[1])
+            total = stats[0]['stuck_at_zero'] + stats[0]['stuck_at_one']
+            zero_ratio = stats[0]['stuck_at_zero'] / total
+            self.assertGreater(zero_ratio, 0.40)
+            self.assertLess(zero_ratio, 0.60)
+
+    def test_oracle_restore_works_under_stuck_at(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_ft_group_artifacts(temp_dir, model_name='ToyStuckOracle')
+            config_path = temp_dir / 'config.json'
+            config_path.write_text(json.dumps({
+                'model': {'name': 'ToyStuckOracle', 'num_classes': 10},
+                'fault_injection': {
+                    'enabled': True,
+                    'fault_rate': 1.0,
+                    'fault_models': ['stuck_at_zero'],
+                    'fault_model_probs': [1.0],
+                    'fault_weight_ratio': 1.0,
+                    'exclude_critical_layers': [],
+                    'random_seed': 42,
+                },
+                'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+                'hierarchical_fault_tolerance': {
+                    'enabled': True,
+                    'repair_mode': 'oracle',
+                    'level1': {'enabled': True},
+                    'level2': {'enabled': False},
+                    'level3': {'enabled': False},
+                },
+            }), encoding='utf-8')
+
+            model = TinyConvModel()
+            with torch.no_grad():
+                model.conv.weight.copy_(torch.arange(1, 9, dtype=torch.float32).reshape(2, 4, 1, 1))
+            simulator = FaultToleranceSimulator(model, 'ToyStuckOracle', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            original_weights = simulator._save_model_weights()
+            mask = simulator._inject_ou_level_faults()
+            stats = simulator._apply_weight_level_correction(mask, original_weights)
+            self.assertTrue(torch.allclose(simulator.model.conv.weight, original_weights['conv.weight']))
+            self.assertEqual(stats['oracle_count'], 8)
+
     def test_zero_scale_level1_is_not_counted_as_success(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             temp_dir = Path(temp_dir_name)
@@ -927,10 +1065,13 @@ class TestFTRegression(unittest.TestCase):
         stress3 = FaultToleranceConfig('fault_tolerance_config_stress_3pct.json')
         stress5 = FaultToleranceConfig('fault_tolerance_config_stress_5pct.json')
         late = FaultToleranceConfig('fault_tolerance_config_target_late_layers.json')
+        stuck3 = FaultToleranceConfig('fault_tolerance_config_stuck_at_3pct.json')
         self.assertAlmostEqual(stress3.get('fault_injection', 'fault_rate'), 0.03, places=6)
         self.assertAlmostEqual(stress5.get('fault_injection', 'fault_rate'), 0.05, places=6)
         self.assertEqual(stress3.get('fault_injection', 'bit_flip_ratio'), 1.0)
         self.assertIn('conv10.weight', late.get('fault_injection', 'target_layers'))
+        self.assertEqual(stuck3.get('fault_injection', 'fault_models'), ['stuck_at_zero', 'stuck_at_one'])
+        self.assertEqual(stuck3.get('fault_injection', 'fault_model_probs'), [0.5, 0.5])
 
     def test_level1_only_mode_resolves(self):
         overrides = resolve_levels_overrides('level1')
@@ -987,6 +1128,102 @@ class TestFTRegression(unittest.TestCase):
             self.assertEqual(by_name['sim_stress_level1']['validity'], 'invalid')
             self.assertEqual(by_name['sim_stress_level1']['invalid_reason'], 'pre-fix twice-projected artifact')
             self.assertTrue((temp_dir / 'evidence' / 'evidence_summary.csv').exists())
+
+    def test_run_fault_seed_sweep_writes_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+
+            def fake_runner(command, cwd=None, check=False):
+                seed = command[command.index('--fault-seed') + 1]
+                output_dir = Path(command[command.index('--output-dir') + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                recovery = '91.00%' if seed == '42' else '86.00%'
+                summary = (
+                    'Category,Metric,Value\n'
+                    'Reliability,Total Faults Injected,10\n'
+                    'Reliability,Faults Corrected,9\n'
+                    'Reliability,Faults Missed,1\n'
+                    'Reliability,Fault Correction Rate,95.00%\n'
+                    'Reliability,Level1 Corrections,9\n'
+                    'Reliability,Level1 Failed Singleton,1\n'
+                    'Reliability,Level1 Zero Scale Failed,0\n'
+                    'Reliability,Affected Weight Count,80\n'
+                    'Reliability,Stuck At Zero Count,40\n'
+                    'Reliability,Stuck At One Count,40\n'
+                    'Reliability,Repair Mode,normal\n'
+                    'RepairQuality,level1.attempted,9\n'
+                    'RepairQuality,level1.effective_improved,9\n'
+                    'RepairQuality,level1.improved_rate,100.00%\n'
+                    'Accuracy,Baseline Accuracy,92.00%\n'
+                    'Accuracy,Faulty Accuracy,80.00%\n'
+                    'Accuracy,FT Accuracy,90.00%\n'
+                    f'Accuracy,Recovery Rate,{recovery}\n'
+                )
+                (output_dir / 'fault_tolerance_summary_20260424_000000.csv').write_text(summary, encoding='utf-8')
+
+            result = run_seed_sweep(Namespace(
+                model='Res18',
+                translate='ft_codebook_budgeted_translate',
+                config='fault_tolerance_config_stuck_at_3pct.json',
+                repair_mode='normal',
+                levels='level1',
+                samples=-1,
+                seeds='42,43',
+                artifact_dir='artifacts',
+                output_dir=str(temp_dir / 'sweep'),
+                tag='toy',
+                dry_run=False,
+            ), command_runner=fake_runner)
+            self.assertTrue(Path(result['csv']).exists())
+            self.assertEqual(len(result['rows']), 2)
+            self.assertTrue(result['gate']['avg_recovery_gate'])
+
+    def test_analyse_fault_seed_failure_writes_diagnosis(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            for seed, after_error in [(42, 0.01), (43, 0.50)]:
+                report_dir = temp_dir / f'seed_{seed}'
+                report_dir.mkdir()
+                payload = {
+                    'metrics': {
+                        'reliability': {
+                            'layer_wise_faults': {'conv.weight': 10},
+                            'layer_wise_corrections': {'conv.weight': 8},
+                            'layer_repair_quality': {
+                                'conv.weight': {
+                                    'level1': {
+                                        'attempted': 8,
+                                        'effective_improved': 7,
+                                        'avg_before_error': 1.0,
+                                        'avg_after_error': after_error,
+                                        'improved_rate': 0.875,
+                                    }
+                                }
+                            },
+                            'fault_detail_stats': {
+                                'layer_details': {
+                                    'conv.weight': {
+                                        'affected_weight_count': 80,
+                                        'fault_model_counts': {'stuck_at_zero': 40, 'stuck_at_one': 40},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (report_dir / 'fault_tolerance_report_20260424_000000.json').write_text(
+                    json.dumps(payload),
+                    encoding='utf-8',
+                )
+
+            result = analyse_fault_seed_failure(Namespace(
+                evidence_root=str(temp_dir),
+                report_dirs='',
+                focus_seed=43,
+                output_dir=str(temp_dir / 'diagnosis'),
+            ))
+            self.assertTrue(Path(result['csv']).exists())
+            self.assertEqual(result['summary']['top_residual_layers'][0]['layer'], 'conv.weight')
 
     def test_redundancy_construction_analysis_script_on_synthetic_data(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:

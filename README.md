@@ -1,11 +1,12 @@
-# ft-test V1.3.11
+# ft-test V1.3.12
 
-V1.3.11 进入 `Res18 Evidence Package` 阶段：`V1.3.10` 已经证明 codebook-aware adaptation 后，Res18 在 `stress_3pct` 下只靠 Level 1 可以恢复大部分准确率损失。当前目标是把该结果做成可复现、可对照、可聚合的证据包，而不是继续改核心 grouping 算法。
+V1.3.12 进入 `Multi-Seed Robustness + Stuck-at Fault Migration` 阶段：固定现有 Res18 `ft_codebook_budgeted_translate` adapted artifact，不改核心 grouping、不重训、不切 Vgg16，先补齐 bit-flip 多 seed 稳健性证据，并把真实 OU 权重级 stuck-at zero/one 故障接入仿真。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 `V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
 `V1.3.10` 为什么转向短阶段适配训练，见 [docs/v1_3_10_projection_adaptation_notes.md](docs/v1_3_10_projection_adaptation_notes.md)。
 `V1.3.11` 的 Res18 证据包计划和当前结果，见 [docs/v1_3_11_res18_evidence.md](docs/v1_3_11_res18_evidence.md)。
+`V1.3.12` 的 stuck-at 迁移和多 seed 稳健性计划，见 [docs/v1_3_12_stuck_at_and_multiseed.md](docs/v1_3_12_stuck_at_and_multiseed.md)。
 
 ## 环境前提
 

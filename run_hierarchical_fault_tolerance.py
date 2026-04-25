@@ -225,6 +225,7 @@ def _export_compare_summary(all_results, output_dir):
             'level1_corrections': hierarchical.get('level1_corrections', 0),
             'level2_corrections': hierarchical.get('level2_corrections', 0),
             'level3_corrections': hierarchical.get('level3_corrections', 0),
+            'level1_failed_singleton': hierarchical.get('level1_failed_singleton', 0),
             'level1_zero_scale_failed': hierarchical.get('level1_zero_scale_failed', 0),
             'repair_mode': hierarchical.get('repair_mode', 'normal'),
             'level1_improved_rate': repair_quality.get('level1', {}).get('improved_rate', 0.0),
@@ -245,13 +246,13 @@ def _export_compare_summary(all_results, output_dir):
 
     with open(md_path, 'w', encoding='utf-8') as handle:
         handle.write('# Comparison Summary\n\n')
-        handle.write('| strategy | fault_correction_rate | ft_accuracy | accuracy_recovery_rate | level1 | level2 | level3 | zero_scale_failed | repair_mode | level1_improved_rate | level2_improved_rate |\n')
-        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
+        handle.write('| strategy | fault_correction_rate | ft_accuracy | accuracy_recovery_rate | level1 | level2 | level3 | failed_singleton | zero_scale_failed | repair_mode | level1_improved_rate | level2_improved_rate |\n')
+        handle.write('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n')
         for row in summary_rows:
             handle.write(
                 '| {strategy} | {fault_correction_rate:.6f} | {ft_accuracy:.6f} | '
                 '{accuracy_recovery_rate:.6f} | {level1_corrections} | '
-                '{level2_corrections} | {level3_corrections} | {level1_zero_scale_failed} | '
+                '{level2_corrections} | {level3_corrections} | {level1_failed_singleton} | {level1_zero_scale_failed} | '
                 '{repair_mode} | {level1_improved_rate:.6f} | {level2_improved_rate:.6f} |\n'.format(**row)
             )
 
