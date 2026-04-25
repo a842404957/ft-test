@@ -203,6 +203,25 @@ def resolve_levels_overrides(levels: str):
     }
 
 
+def resolve_level1_selection_overrides(args):
+    overrides = {}
+    if getattr(args, 'level1_selection', None):
+        overrides['level1.selection'] = args.level1_selection
+    if getattr(args, 'level1_topk', None) is not None:
+        overrides['level1.topk'] = int(args.level1_topk)
+    if getattr(args, 'level1_max_expected_error', None) is not None:
+        overrides['level1.max_expected_error'] = float(args.level1_max_expected_error)
+    if getattr(args, 'level1_min_expected_improvement', None) is not None:
+        overrides['level1.min_expected_improvement'] = float(args.level1_min_expected_improvement)
+    if getattr(args, 'level1_critical_layer_config', None):
+        overrides['level1.critical_layer_config'] = args.level1_critical_layer_config
+    if getattr(args, 'level1_cache_max_group_size', None) is not None:
+        overrides['level1.cache_max_group_size'] = int(args.level1_cache_max_group_size)
+    if getattr(args, 'level1_cache_critical_layers_only', False):
+        overrides['level1.cache_critical_layers_only'] = True
+    return overrides
+
+
 def _export_compare_summary(all_results, output_dir):
     if not output_dir:
         return []
@@ -329,7 +348,7 @@ def run_simulation_with_config(model, test_loader, config_name, config_overrides
 
 def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_group_cluster_translate',
                        model_name='Vgg16', report_output_dir=None, data_dir='.',
-                       repair_mode='normal', levels='all', fault_seed=None):
+                       repair_mode='normal', levels='all', fault_seed=None, level1_overrides=None):
     """比较不同容错策略的效果"""
     print("\n" + "=" * 80)
     print("📊 三级容错策略对比实验")
@@ -371,6 +390,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
         'overrides': {
             'repair_mode': repair_mode,
             **resolve_levels_overrides('level1'),
+            **(level1_overrides or {}),
         }
     }
     level1_level2 = {
@@ -378,6 +398,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
         'overrides': {
             'repair_mode': repair_mode,
             **resolve_levels_overrides('level1_level2'),
+            **(level1_overrides or {}),
         }
     }
     all_levels = {
@@ -385,6 +406,7 @@ def compare_strategies(config_file=None, num_samples=1000, translate_name='ft_gr
         'overrides': {
             'repair_mode': repair_mode,
             **resolve_levels_overrides('all'),
+            **(level1_overrides or {}),
         }
     }
     if levels == 'level1':
@@ -535,8 +557,24 @@ def main():
                        help='artifact 目录；默认当前目录，可指向 results/ft_runs/<model>/<translate>/<tag>/artifacts')
     parser.add_argument('--fault-seed', type=int, default=None,
                        help='覆盖配置文件中的 fault_injection.random_seed，用于多 seed 容错实验')
+    parser.add_argument('--level1-selection', type=str, default=None,
+                       choices=['default', 'best_pair', 'weighted_average'],
+                       help='Level1 repair candidate selection mode; omitted keeps V1.3.12 default behavior')
+    parser.add_argument('--level1-topk', type=int, default=None,
+                       help='Top-k cached Level1 candidates for best_pair/weighted_average')
+    parser.add_argument('--level1-max-expected-error', type=float, default=None,
+                       help='Optional max expected repair error before low-confidence fallback')
+    parser.add_argument('--level1-min-expected-improvement', type=float, default=None,
+                       help='Required expected-error improvement over default before replacing default candidate')
+    parser.add_argument('--level1-critical-layer-config', type=str, default='',
+                       help='JSON config overriding Level1 selection policy per layer')
+    parser.add_argument('--level1-cache-max-group-size', type=int, default=None,
+                       help='Max group size before Level1 cache candidate prefilter is used')
+    parser.add_argument('--level1-cache-critical-layers-only', action='store_true',
+                       help='Build Level1 repair cache only for layers listed in the critical layer config')
     
     args = parser.parse_args()
+    level1_overrides = resolve_level1_selection_overrides(args)
     
     if args.mode == 'compare':
         # 运行对比实验
@@ -550,6 +588,7 @@ def main():
             report_output_dir=args.output_dir or None,
             data_dir=args.artifact_dir,
             fault_seed=args.fault_seed,
+            level1_overrides=level1_overrides,
         )
     else:
         # 单次运行
@@ -578,6 +617,7 @@ def main():
             config_overrides={
                 'repair_mode': args.repair_mode,
                 **resolve_levels_overrides(args.levels),
+                **level1_overrides,
             },
             base_config_file=args.config,
             num_samples=args.samples,

@@ -49,6 +49,7 @@ class MetricsCollector:
                 'level1_failed_singleton': 0,
                 'level1_zero_scale_failed': 0,
                 'repair_mode': 'normal',
+                'level1_selection': {},
             }
         }
         self.reliability_metrics['repair_quality'] = {}
@@ -131,7 +132,8 @@ class MetricsCollector:
                                             level2_similarity_avg: float = 0.0,
                                             level1_failed_singleton: int = 0,
                                             level1_zero_scale_failed: int = 0,
-                                            repair_mode: str = 'normal'):
+                                            repair_mode: str = 'normal',
+                                            level1_selection: Optional[Dict[str, Any]] = None):
         """更新三级容错统计"""
         self.reliability_metrics['hierarchical_correction']['level1_corrections'] = level1_count
         self.reliability_metrics['hierarchical_correction']['level2_corrections'] = level2_count
@@ -140,6 +142,7 @@ class MetricsCollector:
         self.reliability_metrics['hierarchical_correction']['level1_failed_singleton'] = level1_failed_singleton
         self.reliability_metrics['hierarchical_correction']['level1_zero_scale_failed'] = level1_zero_scale_failed
         self.reliability_metrics['hierarchical_correction']['repair_mode'] = repair_mode
+        self.reliability_metrics['hierarchical_correction']['level1_selection'] = json.loads(json.dumps(level1_selection or {}))
         
         # 计算各级纠正率
         total_corrected = level1_count + level2_count + level3_count

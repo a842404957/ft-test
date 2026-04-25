@@ -51,7 +51,14 @@ class FaultToleranceConfig:
             'level1': {
                 'name': 'redundancy_group',
                 'enabled': True,
-                'description': '冗余组内替换（主策略）'
+                'description': '冗余组内替换（主策略）',
+                'selection': 'default',
+                'topk': 3,
+                'max_expected_error': None,
+                'min_expected_improvement': 0.0,
+                'critical_layer_config': '',
+                'cache_max_group_size': 4096,
+                'cache_critical_layers_only': False,
             },
             'level2': {
                 'name': 'nearest_pattern',

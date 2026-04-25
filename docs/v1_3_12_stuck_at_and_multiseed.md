@@ -117,3 +117,14 @@ Do not move to Vgg16 until Res18 passes the evidence gate:
 - FT accuracy is never below faulty accuracy
 - repair improved rate stays at least 90%
 - stuck-at oracle restores accuracy to baseline
+
+## V1.3.13 Follow-up
+
+Level2/3 do not recover seed43 despite near-100% correction count, so the next patch targets optional Level1 candidate selection rather than grouping, retraining, or the fault model.
+
+- Audit: `docs/v1_3_13_level1_selection_audit.md`
+- Protocol: `docs/v1_3_13_level1_selection_robustness.md`
+- Best-pair config: `level1_critical_layers_res18_bestpair.json`
+- Weighted config: `level1_critical_layers_res18_weighted.json`
+
+Default Level1 behavior remains unchanged unless `--level1-selection` is explicitly provided.

@@ -5,6 +5,10 @@
 集成所有模块，执行端到端的容错机制仿真
 """
 
+import csv
+import json
+import pickle
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -74,6 +78,7 @@ class FaultToleranceSimulator:
         self.model = model
         self.model_name = model_name
         self.translate_name = translate_name
+        self.data_dir = Path(data_dir)
 
         # 加载配置
         self.config = FaultToleranceConfig(config_file)
@@ -113,6 +118,15 @@ class FaultToleranceSimulator:
         
         if not self.redundancy_parser.parse_all_layers():
             raise RuntimeError("❌ 冗余组解析失败，无法继续")
+
+        # Optional V1.3.13 Level1 candidate cache. The default path does not build
+        # this cache, preserving V1.3.12 behavior unless selection is requested.
+        self.level1_critical_layer_config = self._load_level1_critical_layer_config()
+        self.level1_repair_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+        self.level1_repair_cache_by_ou: Dict[str, Dict[Tuple[int, int], Tuple[Any, ...]]] = {}
+        self.level1_cache_summary: Dict[str, Any] = {}
+        if self._level1_selection_cache_enabled():
+            self._compile_level1_repair_cache()
         
         # 3. 故障注入器
         self.fault_injector = FaultInjector(
@@ -569,6 +583,512 @@ class FaultToleranceSimulator:
         if not np.isfinite(scale_factor):
             return True
         return abs(float(scale_factor)) <= eps
+
+    def _level1_config(self) -> Dict[str, Any]:
+        hierarchical = self.config.config.get('hierarchical_fault_tolerance', {})
+        return hierarchical.get('level1', {}) or {}
+
+    def _load_level1_critical_layer_config(self) -> Dict[str, Dict[str, Any]]:
+        cfg = self._level1_config()
+        config_path = cfg.get('critical_layer_config') or cfg.get('critical_layers_config')
+        if not config_path:
+            return {}
+
+        path = Path(str(config_path))
+        if not path.is_absolute():
+            candidates = [Path.cwd() / path, project_root / path, self.data_dir / path]
+            path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        if not path.exists():
+            print(f"  ⚠️ Level1 critical layer config not found: {config_path}")
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            print(f"  ⚠️ Failed to load Level1 critical layer config {path}: {exc}")
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        if 'layers' in payload and isinstance(payload['layers'], dict):
+            payload = payload['layers']
+        normalized = {}
+        for layer_name, layer_cfg in payload.items():
+            if isinstance(layer_cfg, dict):
+                normalized[str(layer_name)] = dict(layer_cfg)
+        return normalized
+
+    def _effective_level1_policy(self, layer_name: str) -> Dict[str, Any]:
+        cfg = dict(self._level1_config())
+        layer_cfg = self.level1_critical_layer_config.get(layer_name, {})
+        mode = str(layer_cfg.get('selection', cfg.get('selection', 'default')) or 'default').strip().lower()
+        topk = int(layer_cfg.get('topk', cfg.get('topk', 3)) or 3)
+        max_expected_error = layer_cfg.get('max_expected_error', cfg.get('max_expected_error', None))
+        min_expected_improvement = layer_cfg.get(
+            'min_expected_improvement',
+            cfg.get('min_expected_improvement', 0.0),
+        )
+        return {
+            'selection': mode if mode in ('default', 'best_pair', 'weighted_average') else 'default',
+            'topk': max(1, topk),
+            'max_expected_error': None if max_expected_error in (None, '') else float(max_expected_error),
+            'min_expected_improvement': float(min_expected_improvement or 0.0),
+        }
+
+    def _level1_selection_cache_enabled(self) -> bool:
+        cfg = self._level1_config()
+        global_mode = str(cfg.get('selection', 'default') or 'default').strip().lower()
+        configured_modes = [
+            str(layer_cfg.get('selection', 'default') or 'default').strip().lower()
+            for layer_cfg in self.level1_critical_layer_config.values()
+        ]
+        requested = global_mode != 'default' or any(mode != 'default' for mode in configured_modes)
+        if not requested:
+            return False
+        if bool(cfg.get('cache_critical_layers_only', False)) and not self.level1_critical_layer_config:
+            print("  ⚠️ Level1 cache critical-only requested but no critical layer config was loaded; using default Level1 selection")
+            return False
+        return True
+
+    def _layer_should_build_level1_cache(self, layer_name: str) -> bool:
+        cfg = self._level1_config()
+        if bool(cfg.get('cache_critical_layers_only', False)):
+            return layer_name in self.level1_critical_layer_config
+        return self._effective_level1_policy(layer_name)['selection'] != 'default' or layer_name in self.level1_critical_layer_config
+
+    def _block_for_ou(self, group: RedundancyGroup, ou: Tuple[int, int]) -> Tuple[Optional[Dict[str, Any]], int]:
+        entry = group.ou_to_block.get(ou)
+        if entry is not None and entry['member_index'] < len(group.block_members):
+            return group.block_members[entry['member_index']], int(entry['offset'])
+        return None, 0
+
+    def _multiplier_for_ou(self, group: RedundancyGroup, ou: Tuple[int, int], block: Optional[Dict[str, Any]]) -> float:
+        if block is not None:
+            return float(block.get('multiplier', 1.0))
+        try:
+            return float(group.multipliers[group.ou_indices.index(ou)])
+        except (ValueError, IndexError):
+            return 1.0
+
+    def _compatible_level1_candidates(self,
+                                      group: RedundancyGroup,
+                                      faulty_ou: Tuple[int, int],
+                                      block_offset: int) -> List[Tuple[Optional[Dict[str, Any]], Tuple[int, int], int]]:
+        candidates = []
+        if group.block_members:
+            for candidate_block in group.block_members:
+                channel_span = int(candidate_block.get('channel_span', 1))
+                if block_offset >= channel_span:
+                    continue
+                candidate_ou = (
+                    int(candidate_block['out_ch']),
+                    int(candidate_block['in_ch_start']) + block_offset,
+                )
+                if candidate_ou == faulty_ou:
+                    continue
+                candidates.append((candidate_block, candidate_ou, block_offset))
+            return candidates
+
+        for candidate_ou in group.ou_indices:
+            if candidate_ou == faulty_ou:
+                continue
+            candidates.append((None, candidate_ou, 0))
+        return candidates
+
+    def _compute_expected_repair_error(self,
+                                       target_weight: torch.Tensor,
+                                       candidate_weight: torch.Tensor,
+                                       scale_factor: float) -> float:
+        if self._is_invalid_scale_factor(scale_factor):
+            return float('inf')
+        target_vec = target_weight.detach().float()
+        candidate_vec = candidate_weight.detach().float() * float(scale_factor)
+        denom = torch.norm(target_vec, p=2).item()
+        if denom <= 1e-8:
+            denom = 1e-8
+        error = torch.norm((target_vec - candidate_vec).float(), p=2).item() / denom
+        return float(error) if np.isfinite(error) else float('inf')
+
+    def _prefilter_level1_candidates(self,
+                                     target_weight: torch.Tensor,
+                                     target_multiplier: float,
+                                     candidates: List[Tuple[Optional[Dict[str, Any]], Tuple[int, int], int]],
+                                     layer_weights: torch.Tensor,
+                                     limit: int) -> List[Tuple[Optional[Dict[str, Any]], Tuple[int, int], int]]:
+        if len(candidates) <= limit:
+            return candidates
+        target_norm = torch.norm(target_weight.detach().float(), p=2).item()
+        scored = []
+        for candidate_block, candidate_ou, candidate_block_offset in candidates:
+            candidate_multiplier = self._multiplier_for_ou(
+                RedundancyGroup(-1, '', -1),
+                candidate_ou,
+                candidate_block,
+            ) if candidate_block is not None else 1.0
+            if candidate_block is None or abs(candidate_multiplier) <= 1e-8:
+                multiplier_penalty = 1.0
+            else:
+                scale = self.compute_member_to_member_scale(target_multiplier, candidate_multiplier)
+                multiplier_penalty = 0.0 if not self._is_invalid_scale_factor(scale) else 10.0
+            candidate_weight = self._extract_ou_weight(layer_weights, candidate_ou)
+            candidate_norm = torch.norm(candidate_weight.detach().float(), p=2).item()
+            norm_penalty = abs(np.log((candidate_norm + 1e-8) / (target_norm + 1e-8)))
+            similarity = self._compute_ou_similarity(target_weight, candidate_weight)
+            scored.append((multiplier_penalty + norm_penalty + (1.0 - similarity), candidate_block, candidate_ou, candidate_block_offset))
+        scored.sort(key=lambda item: item[0])
+        return [(block, ou, offset) for _, block, ou, offset in scored[:limit]]
+
+    def _compile_level1_repair_cache(self):
+        cfg = self._level1_config()
+        max_group_size = int(cfg.get('cache_max_group_size', 4096) or 4096)
+        global_topk = int(cfg.get('topk', 3) or 3)
+        prefilter_limit = max(global_topk * 16, 64)
+        cache_rows = []
+        summary_rows = []
+
+        print("\n🔧 编译 Level1 repair candidate cache...")
+        for layer_name in self.data_loader.get_all_layer_names():
+            if not self._layer_should_build_level1_cache(layer_name):
+                continue
+            module = self._get_module_by_name(layer_name)
+            if module is None or not hasattr(module, 'weight'):
+                continue
+            layer_weights = module.weight.data
+            groups = self.redundancy_parser.get_layer_groups(layer_name)
+            policy = self._effective_level1_policy(layer_name)
+            topk = policy['topk']
+            layer_errors = []
+            no_valid = 0
+            cache_entries = 0
+            ou_count = 0
+
+            for group in groups:
+                if group.size() < 2:
+                    continue
+                group_ous = list(dict.fromkeys(group.ou_indices))
+                for faulty_ou in group_ous:
+                    faulty_block, block_offset = self._block_for_ou(group, faulty_ou)
+                    target_multiplier = self._multiplier_for_ou(group, faulty_ou, faulty_block)
+                    if self._is_invalid_scale_factor(target_multiplier):
+                        no_valid += 1
+                        continue
+                    target_weight = self._extract_ou_weight(layer_weights, faulty_ou)
+                    candidates = self._compatible_level1_candidates(group, faulty_ou, block_offset)
+                    if group.size() > max_group_size:
+                        candidates = self._prefilter_level1_candidates(
+                            target_weight,
+                            target_multiplier,
+                            candidates,
+                            layer_weights,
+                            prefilter_limit,
+                        )
+
+                    records = []
+                    for candidate_block, candidate_ou, candidate_block_offset in candidates:
+                        candidate_multiplier = self._multiplier_for_ou(group, candidate_ou, candidate_block)
+                        if abs(candidate_multiplier) <= 1e-8:
+                            continue
+                        scale_factor = self.compute_member_to_member_scale(target_multiplier, candidate_multiplier)
+                        if self._is_invalid_scale_factor(scale_factor):
+                            continue
+                        candidate_weight = self._extract_ou_weight(layer_weights, candidate_ou)
+                        expected_error = self._compute_expected_repair_error(target_weight, candidate_weight, scale_factor)
+                        if not np.isfinite(expected_error):
+                            continue
+                        records.append({
+                            'layer': layer_name,
+                            'group_id': int(group.group_id),
+                            'faulty_ou': tuple(int(v) for v in faulty_ou),
+                            'faulty_block_start': int(faulty_block.get('in_ch_start', faulty_ou[1])) if faulty_block else int(faulty_ou[1]),
+                            'channel_span': int(faulty_block.get('channel_span', 1)) if faulty_block else 1,
+                            'block_offset': int(block_offset),
+                            'candidate_ou': tuple(int(v) for v in candidate_ou),
+                            'candidate_block_start': int(candidate_block.get('in_ch_start', candidate_ou[1])) if candidate_block else int(candidate_ou[1]),
+                            'candidate_block_offset': int(candidate_block_offset),
+                            'scale_factor': float(scale_factor),
+                            'expected_error': float(expected_error),
+                            'group_size': int(group.size()),
+                        })
+
+                    records.sort(key=lambda item: item['expected_error'])
+                    records = records[:topk]
+                    if not records:
+                        no_valid += 1
+                        continue
+                    for rank, record in enumerate(records, start=1):
+                        record['candidate_rank'] = rank
+                        cache_rows.append(record)
+                    key = (
+                        layer_name,
+                        int(group.group_id),
+                        int(faulty_ou[0]),
+                        int(faulty_ou[1]),
+                        records[0]['faulty_block_start'],
+                        records[0]['channel_span'],
+                        records[0]['block_offset'],
+                    )
+                    self.level1_repair_cache[key] = records
+                    self.level1_repair_cache_by_ou.setdefault(layer_name, {})[faulty_ou] = key
+                    layer_errors.extend([record['expected_error'] for record in records])
+                    cache_entries += len(records)
+                    ou_count += 1
+
+            summary = {
+                'layer': layer_name,
+                'selection': policy['selection'],
+                'topk': topk,
+                'cached_ou_count': ou_count,
+                'cache_entries': cache_entries,
+                'no_valid_candidate_count': no_valid,
+                'cache_coverage': ou_count / max(ou_count + no_valid, 1),
+                'avg_expected_error': float(np.mean(layer_errors)) if layer_errors else 0.0,
+                'p95_expected_error': float(np.percentile(layer_errors, 95)) if layer_errors else 0.0,
+            }
+            summary_rows.append(summary)
+            print(
+                f"  ✓ {layer_name}: cached_ous={ou_count} entries={cache_entries} "
+                f"avg_expected={summary['avg_expected_error']:.4f}"
+            )
+
+        self.level1_cache_summary = {
+            'rows': summary_rows,
+            'total_cache_entries': len(cache_rows),
+            'critical_layers_only': bool(cfg.get('cache_critical_layers_only', False)),
+            'max_group_size': max_group_size,
+        }
+        self._write_level1_repair_cache_files(cache_rows, summary_rows)
+
+    def _write_level1_repair_cache_files(self, cache_rows: List[Dict[str, Any]], summary_rows: List[Dict[str, Any]]):
+        if not cache_rows and not summary_rows:
+            return
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"model_{self.model_name}_{self.translate_name}"
+        cache_path = self.data_dir / f"{stem}_level1_repair_cache.pkl"
+        summary_csv = self.data_dir / f"{stem}_repair_cache_summary.csv"
+        summary_json = self.data_dir / f"{stem}_repair_cache_summary.json"
+        with open(cache_path, 'wb') as handle:
+            pickle.dump({
+                'cache': self.level1_repair_cache,
+                'cache_by_ou': self.level1_repair_cache_by_ou,
+                'rows': cache_rows,
+                'summary': self.level1_cache_summary,
+            }, handle, pickle.HIGHEST_PROTOCOL)
+        fieldnames = [
+            'layer', 'selection', 'topk', 'cached_ou_count', 'cache_entries',
+            'no_valid_candidate_count', 'cache_coverage', 'avg_expected_error',
+            'p95_expected_error',
+        ]
+        with open(summary_csv, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in summary_rows:
+                writer.writerow({name: row.get(name, '') for name in fieldnames})
+        summary_json.write_text(json.dumps(self.level1_cache_summary, indent=2, ensure_ascii=False), encoding='utf-8')
+        print(f"  🧾 Level1 repair cache saved: {cache_path}")
+
+    def _get_level1_cache_records(self, layer_name: str, faulty_ou: Tuple[int, int]) -> List[Dict[str, Any]]:
+        key = self.level1_repair_cache_by_ou.get(layer_name, {}).get(faulty_ou)
+        if key is None:
+            return []
+        return list(self.level1_repair_cache.get(key, []))
+
+    @staticmethod
+    def _new_level1_selection_stats() -> Dict[str, Any]:
+        return {
+            'level1_selection_mode': 'default',
+            'best_pair_used': 0,
+            'weighted_average_used': 0,
+            'fallback_to_default': 0,
+            'low_confidence_repair': 0,
+            'fallback_reasons': {},
+            'events': [],
+        }
+
+    @staticmethod
+    def _increment_reason(container: Dict[str, int], reason: str):
+        container[reason] = int(container.get(reason, 0)) + 1
+
+    @staticmethod
+    def _pearson_corr(pairs: List[Tuple[float, float]]) -> Optional[float]:
+        clean = [(float(x), float(y)) for x, y in pairs if np.isfinite(x) and np.isfinite(y)]
+        if len(clean) < 2:
+            return None
+        xs = np.asarray([item[0] for item in clean], dtype=np.float64)
+        ys = np.asarray([item[1] for item in clean], dtype=np.float64)
+        if np.std(xs) <= 1e-12 or np.std(ys) <= 1e-12:
+            return None
+        return float(np.corrcoef(xs, ys)[0, 1])
+
+    def _record_level1_selection_event(self,
+                                       stats: Dict[str, Any],
+                                       layer_name: str,
+                                       mode: str,
+                                       default_expected_error: float,
+                                       selected_expected_error: float,
+                                       actual_before_error: float,
+                                       actual_after_error: float,
+                                       fallback_reason: str = ''):
+        if mode == 'best_pair':
+            stats['best_pair_used'] += 1
+        elif mode == 'weighted_average':
+            stats['weighted_average_used'] += 1
+        if fallback_reason:
+            stats['fallback_to_default'] += 1
+            self._increment_reason(stats['fallback_reasons'], fallback_reason)
+        event = {
+            'layer': layer_name,
+            'selection_mode': mode,
+            'fallback_reason': fallback_reason,
+            'default_expected_error': float(default_expected_error) if np.isfinite(default_expected_error) else None,
+            'selected_expected_error': float(selected_expected_error) if np.isfinite(selected_expected_error) else None,
+            'expected_error_improvement': (
+                float(default_expected_error - selected_expected_error)
+                if np.isfinite(default_expected_error) and np.isfinite(selected_expected_error)
+                else None
+            ),
+            'actual_before_error': float(actual_before_error),
+            'actual_after_error': float(actual_after_error),
+            'actual_error_improvement': float(actual_before_error - actual_after_error),
+        }
+        stats['events'].append(event)
+
+    def _finalize_level1_selection_stats(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        events = stats.get('events', [])
+
+        def avg(field: str) -> Optional[float]:
+            values = [event.get(field) for event in events if event.get(field) is not None]
+            return float(np.mean(values)) if values else None
+
+        by_layer_pairs: Dict[str, List[Tuple[float, float]]] = {}
+        global_pairs = []
+        for event in events:
+            expected = event.get('selected_expected_error')
+            actual = event.get('actual_after_error')
+            if expected is None or actual is None:
+                continue
+            global_pairs.append((expected, actual))
+            by_layer_pairs.setdefault(event['layer'], []).append((expected, actual))
+
+        by_layer_corr = {
+            layer: self._pearson_corr(pairs)
+            for layer, pairs in sorted(by_layer_pairs.items())
+        }
+        mode_counts = {}
+        for event in events:
+            mode = event.get('selection_mode', 'default')
+            mode_counts[mode] = int(mode_counts.get(mode, 0)) + 1
+
+        effective_mode = stats.get('level1_selection_mode', 'default')
+        if mode_counts:
+            effective_mode = next(iter(mode_counts.keys())) if len(mode_counts) == 1 else 'mixed'
+        return {
+            'level1_selection_mode': effective_mode,
+            'best_pair_used': int(stats.get('best_pair_used', 0)),
+            'weighted_average_used': int(stats.get('weighted_average_used', 0)),
+            'fallback_to_default': int(stats.get('fallback_to_default', 0)),
+            'fallback_reason': dict(stats.get('fallback_reasons', {})),
+            'low_confidence_repair': int(stats.get('low_confidence_repair', 0)),
+            'default_expected_error': avg('default_expected_error'),
+            'selected_expected_error': avg('selected_expected_error'),
+            'expected_error_improvement': avg('expected_error_improvement'),
+            'actual_before_error': avg('actual_before_error'),
+            'actual_after_error': avg('actual_after_error'),
+            'actual_error_improvement': avg('actual_error_improvement'),
+            'expected_actual_corr': self._pearson_corr(global_pairs),
+            'expected_actual_corr_by_layer': by_layer_corr,
+            'mode_counts': mode_counts,
+            'event_count': len(events),
+        }
+
+    def _select_level1_repair_choice(self,
+                                     layer_name: str,
+                                     faulty_ou: Tuple[int, int],
+                                     faulty_set: set,
+                                     original_layer_weights: torch.Tensor,
+                                     default_choice: Dict[str, Any],
+                                     policy: Dict[str, Any]) -> Dict[str, Any]:
+        mode = policy['selection']
+        if mode == 'default':
+            return default_choice
+
+        records = [
+            record for record in self._get_level1_cache_records(layer_name, faulty_ou)
+            if tuple(record.get('candidate_ou', ())) not in faulty_set
+        ][:policy['topk']]
+        if not records:
+            choice = dict(default_choice)
+            choice['fallback_reason'] = 'no_healthy_cache_candidate'
+            return choice
+
+        max_expected_error = policy.get('max_expected_error')
+        if max_expected_error is not None:
+            filtered = [record for record in records if float(record['expected_error']) <= max_expected_error]
+            if not filtered:
+                choice = dict(default_choice)
+                choice['fallback_reason'] = 'max_expected_error'
+                choice['low_confidence'] = True
+                return choice
+            records = filtered
+
+        if mode == 'best_pair':
+            selected = min(records, key=lambda record: float(record['expected_error']))
+            candidate_ou = tuple(selected['candidate_ou'])
+            candidate_weight = self._extract_ou_weight(original_layer_weights, candidate_ou)
+            corrected_weight = candidate_weight * float(selected['scale_factor'])
+            selected_choice = {
+                'replacement_ou': candidate_ou,
+                'replacement_origin': 'best_pair',
+                'scale_factor': float(selected['scale_factor']),
+                'corrected_weight': corrected_weight,
+                'selected_expected_error': float(selected['expected_error']),
+                'mode': 'best_pair',
+                'candidate_records': [selected],
+            }
+        elif mode == 'weighted_average':
+            weighted_terms = []
+            weights = []
+            for record in records:
+                candidate_ou = tuple(record['candidate_ou'])
+                candidate_weight = self._extract_ou_weight(original_layer_weights, candidate_ou)
+                weight = 1.0 / (float(record['expected_error']) + 1e-8)
+                if not np.isfinite(weight):
+                    continue
+                weighted_terms.append(candidate_weight * float(record['scale_factor']) * weight)
+                weights.append(weight)
+            if not weighted_terms or sum(weights) <= 0:
+                choice = dict(default_choice)
+                choice['fallback_reason'] = 'weighted_average_invalid'
+                return choice
+            corrected_weight = torch.stack(weighted_terms, dim=0).sum(dim=0) / float(sum(weights))
+            if not torch.isfinite(corrected_weight).all():
+                choice = dict(default_choice)
+                choice['fallback_reason'] = 'weighted_average_nonfinite'
+                return choice
+            selected_choice = {
+                'replacement_ou': tuple(records[0]['candidate_ou']),
+                'replacement_origin': 'weighted_average',
+                'scale_factor': float(records[0]['scale_factor']),
+                'corrected_weight': corrected_weight,
+                'selected_expected_error': float(np.average(
+                    [float(record['expected_error']) for record in records],
+                    weights=weights,
+                )),
+                'mode': 'weighted_average',
+                'candidate_records': records,
+            }
+        else:
+            return default_choice
+
+        default_expected = float(default_choice.get('default_expected_error', float('inf')))
+        selected_expected = float(selected_choice['selected_expected_error'])
+        min_improvement = float(policy.get('min_expected_improvement', 0.0) or 0.0)
+        if np.isfinite(default_expected) and default_expected - selected_expected < min_improvement:
+            choice = dict(default_choice)
+            choice['fallback_reason'] = 'insufficient_expected_improvement'
+            choice['candidate_records'] = selected_choice.get('candidate_records', [])
+            return choice
+        selected_choice['default_expected_error'] = default_expected
+        selected_choice['fallback_reason'] = ''
+        return selected_choice
     
     def _inject_ou_level_faults(self) -> Dict[str, List[Tuple[int, int]]]:
         """
@@ -869,6 +1389,10 @@ class FaultToleranceSimulator:
         level1_scaled_repairs = 0
         level1_failed_singleton = 0
         level1_zero_scale_failed = 0
+        level1_selection_stats = self._new_level1_selection_stats()
+        level1_selection_stats['level1_selection_mode'] = str(
+            hierarchical_config.get('level1', {}).get('selection', 'default') or 'default'
+        ).strip().lower()
 
         repair_quality_buckets = {
             'level1': self._new_repair_quality_bucket(),
@@ -1045,8 +1569,6 @@ class FaultToleranceSimulator:
                     if replacement_ou is None:
                         continue
 
-                    replacement_out_ch, replacement_in_ch = replacement_ou
-
                     if faulty_block is not None:
                         faulty_multiplier = float(faulty_block.get('multiplier', 1.0))
                     else:
@@ -1058,20 +1580,47 @@ class FaultToleranceSimulator:
                         replacement_idx = containing_group.ou_indices.index(replacement_ou)
                         replacement_multiplier = containing_group.multipliers[replacement_idx]
 
-                    # 使用倍数关系计算修正后的权重
-                    # weight_faulty = weight_replacement * (faulty_multiplier / replacement_multiplier)
-                    if layer_weights.dim() == 4:
-                        replacement_weight = original_layer_weights[replacement_out_ch, replacement_in_ch, :, :]
-                    elif layer_weights.dim() == 2:
-                        replacement_weight = original_layer_weights[replacement_out_ch, replacement_in_ch]
-                    else:
-                        continue
-
                     # 计算缩放因子
                     if abs(replacement_multiplier) > 1e-8:
                         scale_factor = self.compute_member_to_member_scale(faulty_multiplier, replacement_multiplier)
                     else:
                         scale_factor = float('nan')
+
+                    if layer_weights.dim() not in (2, 4):
+                        continue
+
+                    replacement_weight = self._extract_ou_weight(original_layer_weights, replacement_ou)
+                    default_expected_error = self._compute_expected_repair_error(
+                        faulty_original_weight,
+                        replacement_weight,
+                        scale_factor,
+                    )
+                    default_choice = {
+                        'replacement_ou': replacement_ou,
+                        'replacement_origin': replacement_origin,
+                        'scale_factor': scale_factor,
+                        'corrected_weight': replacement_weight * scale_factor if not self._is_invalid_scale_factor(scale_factor) else faulty_current_weight,
+                        'default_expected_error': default_expected_error,
+                        'selected_expected_error': default_expected_error,
+                        'mode': 'default',
+                        'fallback_reason': '',
+                    }
+                    policy = self._effective_level1_policy(layer_name)
+                    selected_choice = self._select_level1_repair_choice(
+                        layer_name=layer_name,
+                        faulty_ou=faulty_ou,
+                        faulty_set=faulty_set,
+                        original_layer_weights=original_layer_weights,
+                        default_choice=default_choice,
+                        policy=policy,
+                    )
+                    replacement_ou = selected_choice.get('replacement_ou', replacement_ou)
+                    replacement_origin = selected_choice.get('replacement_origin', replacement_origin)
+                    scale_factor = float(selected_choice.get('scale_factor', scale_factor))
+                    corrected_weight = selected_choice.get('corrected_weight', default_choice['corrected_weight'])
+                    if selected_choice.get('low_confidence'):
+                        level1_selection_stats['low_confidence_repair'] += 1
+
                     if self._is_invalid_scale_factor(scale_factor):
                         level1_zero_scale_failed += 1
                         self._record_repair_quality(
@@ -1085,7 +1634,6 @@ class FaultToleranceSimulator:
                             print(f"  ⚠️ Level 1 zero-scale skipped: {layer_name}[{faulty_ou}] "
                                   f"(faulty_multiplier={faulty_multiplier:.4f}, replacement_multiplier={replacement_multiplier:.4f})")
                         continue
-                    corrected_weight = replacement_weight * scale_factor
 
                     # 应用替换
                     if layer_weights.dim() == 4:
@@ -1093,6 +1641,18 @@ class FaultToleranceSimulator:
                     elif layer_weights.dim() == 2:
                         layer_weights[out_ch, in_ch] = corrected_weight
                     corrected_weight_after = self._extract_ou_weight(layer_weights, faulty_ou).clone()
+                    actual_before_error = torch.norm((faulty_current_weight - faulty_original_weight).float(), p=2).item()
+                    actual_after_error = torch.norm((corrected_weight_after - faulty_original_weight).float(), p=2).item()
+                    self._record_level1_selection_event(
+                        level1_selection_stats,
+                        layer_name=layer_name,
+                        mode=selected_choice.get('mode', 'default'),
+                        default_expected_error=float(selected_choice.get('default_expected_error', default_expected_error)),
+                        selected_expected_error=float(selected_choice.get('selected_expected_error', default_expected_error)),
+                        actual_before_error=actual_before_error,
+                        actual_after_error=actual_after_error,
+                        fallback_reason=selected_choice.get('fallback_reason', ''),
+                    )
                     self._record_repair_quality(
                         repair_quality_buckets['level1'],
                         before_weight=faulty_current_weight,
@@ -1399,6 +1959,7 @@ class FaultToleranceSimulator:
             }
             for layer_name, layer_buckets in layer_repair_quality_buckets.items()
         }
+        level1_selection = self._finalize_level1_selection_stats(level1_selection_stats)
 
         return {
             'level1_count': level1_count,
@@ -1415,6 +1976,7 @@ class FaultToleranceSimulator:
             'total_correctable': total_corrected,
             'repair_mode': repair_mode,
             'repair_quality': repair_quality,
+            'level1_selection': level1_selection,
             'level1_corrected_ous': level1_corrected_ous,
             'level2_corrected_ous': level2_corrected_ous,
             'level3_corrected_ous': level3_corrected_ous,
@@ -1475,6 +2037,7 @@ class FaultToleranceSimulator:
                 level1_failed_singleton=self._hierarchical_stats.get('level1_failed_singleton', 0),
                 level1_zero_scale_failed=self._hierarchical_stats.get('level1_zero_scale_failed', 0),
                 repair_mode=self._hierarchical_stats.get('repair_mode', 'normal'),
+                level1_selection=self._hierarchical_stats.get('level1_selection', {}),
             )
             self.metrics_collector.update_repair_quality_stats(
                 self._hierarchical_stats.get('repair_quality', {})

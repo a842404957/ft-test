@@ -1,0 +1,7 @@
+{
+  "conv11.weight": {"selection": "best_pair", "topk": 3},
+  "conv12.weight": {"selection": "best_pair", "topk": 3},
+  "conv13.weight": {"selection": "best_pair", "topk": 3},
+  "conv14.weight": {"selection": "weighted_average", "topk": 3},
+  "conv15.weight": {"selection": "weighted_average", "topk": 3}
+}

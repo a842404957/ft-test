@@ -68,6 +68,12 @@ class TinyTrainModel(nn.Module):
         return x.mean(dim=(2, 3))
 
 
+class TinySelectionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(4, 3, kernel_size=1, bias=False)
+
+
 def _write_pkl(path: Path, payload):
     with open(path, 'wb') as handle:
         pickle.dump(payload, handle, pickle.HIGHEST_PROTOCOL)
@@ -216,6 +222,78 @@ def _build_zero_scale_ft_artifacts(temp_dir: Path, model_name: str = 'ToyZero'):
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_mask.pkl', mask)
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_coverage_ratio_information.pkl', coverage_ratio)
     _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_reuse_ratio_information.pkl', coverage_ratio)
+
+
+def _build_level1_selection_artifacts(temp_dir: Path, model_name: str = 'ToySelect', channel_span: int = 1):
+    mask = {'conv.weight': torch.ones((3, 4, 1, 1), dtype=torch.float32)}
+    members = []
+    for out_ch, multiplier, role in [(0, 1.0, 'prototype'), (1, 1.0, 'member'), (2, 1.0, 'member')]:
+        members.append({
+            'out_ch': out_ch,
+            'in_ch_start': 0,
+            'channel_span': channel_span,
+            'multiplier': multiplier,
+            'role': role,
+            'mask_signature': 'shared',
+            'similarity': 1.0,
+        })
+    group_information = {
+        'conv.weight': {
+            'layer_name': 'conv.weight',
+            'group_count': 1,
+            'block_count': 3,
+            'ou_count': 3 * channel_span,
+            'repairable_block_count': 3,
+            'repairable_ou_count': 3 * channel_span,
+            'coverage_ratio': 1.0,
+            'block_coverage_ratio': 1.0,
+            'singleton_group_count': 0,
+            'singleton_ratio': 0.0,
+            'avg_group_size': 3.0,
+            'exact_group_count': 1,
+            'scaled_group_count': 0,
+            'exact_group_ratio': 1.0,
+            'scaled_group_ratio': 0.0,
+            'groups': [{
+                'group_id': 0,
+                'member_count': 3,
+                'group_size': 3 * channel_span,
+                'covered_ou_count': 3 * channel_span,
+                'repair_mode': 'exact',
+                'prototype': {
+                    'out_ch': 0,
+                    'in_ch_start': 0,
+                    'channel_span': channel_span,
+                    'multiplier': 1.0,
+                    'role': 'prototype',
+                    'mask_signature': 'shared',
+                },
+                'members': members,
+            }],
+        }
+    }
+    coverage_ratio = {'conv.weight': 1.0}
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_group_information.pkl', group_information)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_mask.pkl', mask)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_coverage_ratio_information.pkl', coverage_ratio)
+    _write_pkl(temp_dir / f'model_{model_name}_ft_group_cluster_translate_reuse_ratio_information.pkl', coverage_ratio)
+
+
+def _write_level1_config(temp_dir: Path, model_name: str, level1_cfg: dict):
+    config_path = temp_dir / 'config.json'
+    config_path.write_text(json.dumps({
+        'model': {'name': model_name, 'num_classes': 10},
+        'simulation': {'device': 'cpu', 'verbose': False, 'batch_size': 1},
+        'hierarchical_fault_tolerance': {
+            'enabled': True,
+            'repair_mode': 'normal',
+            'level1': {'enabled': True, **level1_cfg},
+            'level2': {'enabled': False},
+            'level3': {'enabled': False},
+        },
+        'report': {'output_dir': str(temp_dir / 'reports')},
+    }), encoding='utf-8')
+    return config_path
 
 
 def _build_codebook_group_artifacts(temp_dir: Path, model_name: str = 'ToyCodebookTrain'):
@@ -1060,6 +1138,154 @@ class TestFTRegression(unittest.TestCase):
             self.assertIn('avg_before_error', level1_quality)
             self.assertIn('avg_after_error', level1_quality)
             self.assertIn('improved_rate', level1_quality)
+            self.assertIn('level1_selection', stats)
+
+    def test_level1_repair_cache_is_block_aware_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToySelectBlock', channel_span=2)
+            config_path = _write_level1_config(temp_dir, 'ToySelectBlock', {
+                'selection': 'best_pair',
+                'topk': 2,
+            })
+
+            model = TinySelectionModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 1, 0, 0] = 10.0
+                model.conv.weight[1, 1, 0, 0] = 5.0
+                model.conv.weight[2, 1, 0, 0] = 5.0
+
+            simulator_a = FaultToleranceSimulator(model, 'ToySelectBlock', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            simulator_b = FaultToleranceSimulator(model, 'ToySelectBlock', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            key = simulator_a.level1_repair_cache_by_ou['conv.weight'][(2, 1)]
+            self.assertEqual(key[-1], 1)
+            records = simulator_a.level1_repair_cache[key]
+            self.assertEqual(records[0]['block_offset'], 1)
+            self.assertEqual(records[0]['candidate_block_offset'], 1)
+            self.assertEqual(records[0]['channel_span'], 2)
+            self.assertEqual(simulator_a.level1_repair_cache, simulator_b.level1_repair_cache)
+            self.assertTrue((temp_dir / 'model_ToySelectBlock_ft_group_cluster_translate_level1_repair_cache.pkl').exists())
+
+    def test_level1_zero_invalid_scale_candidate_skipped_in_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_zero_scale_ft_artifacts(temp_dir, model_name='ToyZeroCache')
+            config_path = _write_level1_config(temp_dir, 'ToyZeroCache', {
+                'selection': 'best_pair',
+                'topk': 3,
+            })
+            model = TinyConvModel()
+            simulator = FaultToleranceSimulator(model, 'ToyZeroCache', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            self.assertNotIn((1, 0), simulator.level1_repair_cache_by_ou.get('conv.weight', {}))
+
+    def test_level1_best_pair_uses_lowest_expected_error_candidate(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToyBestPair')
+            config_path = _write_level1_config(temp_dir, 'ToyBestPair', {
+                'selection': 'best_pair',
+                'topk': 3,
+            })
+            model = TinySelectionModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 10.0
+                model.conv.weight[1, 0, 0, 0] = 5.0
+                model.conv.weight[2, 0, 0, 0] = 5.0
+            simulator = FaultToleranceSimulator(model, 'ToyBestPair', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[2, 0, 0, 0] = -99.0
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(2, 0)]}, original_weights)
+            self.assertAlmostEqual(simulator.model.conv.weight[2, 0, 0, 0].item(), 5.0, places=6)
+            self.assertEqual(stats['level1_selection']['best_pair_used'], 1)
+
+    def test_level1_best_pair_top1_faulty_falls_back_to_top2(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToyTop2')
+            config_path = _write_level1_config(temp_dir, 'ToyTop2', {
+                'selection': 'best_pair',
+                'topk': 3,
+            })
+            model = TinySelectionModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 8.0
+                model.conv.weight[1, 0, 0, 0] = 5.0
+                model.conv.weight[2, 0, 0, 0] = 5.0
+            simulator = FaultToleranceSimulator(model, 'ToyTop2', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[1, 0, 0, 0] = -88.0
+                simulator.model.conv.weight[2, 0, 0, 0] = -99.0
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(2, 0), (1, 0)]}, original_weights)
+            self.assertAlmostEqual(simulator.model.conv.weight[2, 0, 0, 0].item(), 8.0, places=6)
+            self.assertEqual(stats['level1_count'], 2)
+
+    def test_level1_min_expected_improvement_fallbacks_to_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToySafeFallback')
+            config_path = _write_level1_config(temp_dir, 'ToySafeFallback', {
+                'selection': 'best_pair',
+                'topk': 3,
+                'min_expected_improvement': 2.0,
+            })
+            model = TinySelectionModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 10.0
+                model.conv.weight[1, 0, 0, 0] = 5.0
+                model.conv.weight[2, 0, 0, 0] = 5.0
+            simulator = FaultToleranceSimulator(model, 'ToySafeFallback', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[2, 0, 0, 0] = -99.0
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(2, 0)]}, original_weights)
+            self.assertAlmostEqual(simulator.model.conv.weight[2, 0, 0, 0].item(), 10.0, places=6)
+            self.assertEqual(stats['level1_selection']['fallback_to_default'], 1)
+            self.assertEqual(stats['level1_selection']['fallback_reason']['insufficient_expected_improvement'], 1)
+
+    def test_level1_weighted_average_produces_finite_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToyWeighted')
+            config_path = _write_level1_config(temp_dir, 'ToyWeighted', {
+                'selection': 'weighted_average',
+                'topk': 2,
+            })
+            model = TinySelectionModel()
+            with torch.no_grad():
+                model.conv.weight.zero_()
+                model.conv.weight[0, 0, 0, 0] = 4.0
+                model.conv.weight[1, 0, 0, 0] = 6.0
+                model.conv.weight[2, 0, 0, 0] = 5.0
+            simulator = FaultToleranceSimulator(model, 'ToyWeighted', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            original_weights = simulator._save_model_weights()
+            with torch.no_grad():
+                simulator.model.conv.weight[2, 0, 0, 0] = -99.0
+            stats = simulator._apply_weight_level_correction({'conv.weight': [(2, 0)]}, original_weights)
+            self.assertTrue(torch.isfinite(simulator.model.conv.weight[2, 0, 0, 0]))
+            self.assertEqual(stats['level1_selection']['weighted_average_used'], 1)
+
+    def test_level1_critical_layer_config_overrides_global_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            _build_level1_selection_artifacts(temp_dir, model_name='ToyCritical')
+            critical_path = temp_dir / 'critical.json'
+            critical_path.write_text(json.dumps({'conv.weight': {'selection': 'best_pair', 'topk': 2}}), encoding='utf-8')
+            config_path = _write_level1_config(temp_dir, 'ToyCritical', {
+                'selection': 'default',
+                'critical_layer_config': str(critical_path),
+                'cache_critical_layers_only': True,
+            })
+            model = TinySelectionModel()
+            simulator = FaultToleranceSimulator(model, 'ToyCritical', 'ft_group_cluster_translate', str(config_path), str(temp_dir))
+            policy = simulator._effective_level1_policy('conv.weight')
+            self.assertEqual(policy['selection'], 'best_pair')
+            self.assertIn('conv.weight', simulator.level1_repair_cache_by_ou)
 
     def test_stress_configs_load(self):
         stress3 = FaultToleranceConfig('fault_tolerance_config_stress_3pct.json')
@@ -1132,8 +1358,10 @@ class TestFTRegression(unittest.TestCase):
     def test_run_fault_seed_sweep_writes_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             temp_dir = Path(temp_dir_name)
+            commands = []
 
             def fake_runner(command, cwd=None, check=False):
+                commands.append(command)
                 seed = command[command.index('--fault-seed') + 1]
                 output_dir = Path(command[command.index('--output-dir') + 1])
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -1172,11 +1400,20 @@ class TestFTRegression(unittest.TestCase):
                 artifact_dir='artifacts',
                 output_dir=str(temp_dir / 'sweep'),
                 tag='toy',
+                level1_selection='best_pair',
+                level1_topk=3,
+                level1_critical_layer_config='level1_critical_layers_res18_bestpair.json',
+                level1_max_expected_error=None,
+                level1_min_expected_improvement=0.0,
+                level1_cache_max_group_size=4096,
+                level1_cache_critical_layers_only=True,
                 dry_run=False,
             ), command_runner=fake_runner)
             self.assertTrue(Path(result['csv']).exists())
             self.assertEqual(len(result['rows']), 2)
             self.assertTrue(result['gate']['avg_recovery_gate'])
+            self.assertIn('--level1-selection', commands[0])
+            self.assertIn('--level1-cache-critical-layers-only', commands[0])
 
     def test_analyse_fault_seed_failure_writes_diagnosis(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:

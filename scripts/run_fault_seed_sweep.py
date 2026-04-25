@@ -48,7 +48,11 @@ def summarize_gate(rows):
     valid_rows = [row for row in rows if row.get('repair_mode') != 'oracle']
     recoveries = [float(row['recovery_rate']) for row in valid_rows if row.get('recovery_rate') != '']
     improved_rates = [float(row['repair_improved_rate']) for row in valid_rows if row.get('repair_improved_rate') != '']
-    ft_not_worse = all(float(row['ft_accuracy']) >= float(row['faulty_accuracy']) for row in valid_rows)
+    comparable_rows = [
+        row for row in valid_rows
+        if row.get('ft_accuracy') not in ('', None) and row.get('faulty_accuracy') not in ('', None)
+    ]
+    ft_not_worse = all(float(row['ft_accuracy']) >= float(row['faulty_accuracy']) for row in comparable_rows)
     gate = {
         'seed_count': len(valid_rows),
         'recovery_mean': statistics.mean(recoveries) if recoveries else 0.0,
@@ -56,7 +60,7 @@ def summarize_gate(rows):
         'recovery_min': min(recoveries) if recoveries else 0.0,
         'recovery_max': max(recoveries) if recoveries else 0.0,
         'worst_seed': '',
-        'ft_accuracy_not_worse_than_faulty': ft_not_worse,
+        'ft_accuracy_not_worse_than_faulty': ft_not_worse if comparable_rows else False,
         'avg_recovery_gate': False,
         'no_seed_below_80_gate': False,
         'repair_improved_gate': False,
@@ -85,7 +89,10 @@ def write_summary(rows, gate, output_dir: Path):
         'recovery_rate', 'correction_rate', 'repair_improved_rate',
         'total_faults', 'level1_corrections', 'level1_zero_scale_failed',
         'level1_failed_singleton', 'affected_weight_count',
-        'stuck_at_zero_count', 'stuck_at_one_count', 'oracle_recovery', 'repair_mode',
+        'stuck_at_zero_count', 'stuck_at_one_count', 'level1_selection_mode',
+        'best_pair_used', 'weighted_average_used', 'fallback_to_default',
+        'selected_expected_error', 'actual_after_error',
+        'oracle_recovery', 'repair_mode',
     ]
     csv_path = output_dir / 'seed_sweep_summary.csv'
     with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
@@ -143,6 +150,19 @@ def run_seed_sweep(args, command_runner=subprocess.run):
             '--artifact-dir', args.artifact_dir,
             '--output-dir', str(seed_dir),
         ]
+        optional_args = [
+            ('--level1-selection', getattr(args, 'level1_selection', None)),
+            ('--level1-topk', getattr(args, 'level1_topk', None)),
+            ('--level1-critical-layer-config', getattr(args, 'level1_critical_layer_config', None)),
+            ('--level1-max-expected-error', getattr(args, 'level1_max_expected_error', None)),
+            ('--level1-min-expected-improvement', getattr(args, 'level1_min_expected_improvement', None)),
+            ('--level1-cache-max-group-size', getattr(args, 'level1_cache_max_group_size', None)),
+        ]
+        for flag, value in optional_args:
+            if value not in (None, ''):
+                command.extend([flag, str(value)])
+        if getattr(args, 'level1_cache_critical_layers_only', False):
+            command.append('--level1-cache-critical-layers-only')
         if args.dry_run:
             print(' '.join(command))
         else:
@@ -176,6 +196,12 @@ def run_seed_sweep(args, command_runner=subprocess.run):
             'affected_weight_count': metrics.get('affected_weight_count', ''),
             'stuck_at_zero_count': metrics.get('stuck_at_zero_count', ''),
             'stuck_at_one_count': metrics.get('stuck_at_one_count', ''),
+            'level1_selection_mode': metrics.get('level1_selection_mode', ''),
+            'best_pair_used': metrics.get('best_pair_used', ''),
+            'weighted_average_used': metrics.get('weighted_average_used', ''),
+            'fallback_to_default': metrics.get('fallback_to_default', ''),
+            'selected_expected_error': metrics.get('selected_expected_error', ''),
+            'actual_after_error': metrics.get('actual_after_error', ''),
             'oracle_recovery': metrics.get('accuracy_recovery_rate', '') if repair_mode == 'oracle' else '',
             'repair_mode': repair_mode,
         }
@@ -202,6 +228,13 @@ def build_parser():
     parser.add_argument('--artifact-dir', required=True)
     parser.add_argument('--output-dir', default='')
     parser.add_argument('--tag', default='res18_codebook_adapt')
+    parser.add_argument('--level1-selection', default=None, choices=['default', 'best_pair', 'weighted_average'])
+    parser.add_argument('--level1-topk', type=int, default=None)
+    parser.add_argument('--level1-critical-layer-config', default='')
+    parser.add_argument('--level1-max-expected-error', type=float, default=None)
+    parser.add_argument('--level1-min-expected-improvement', type=float, default=None)
+    parser.add_argument('--level1-cache-max-group-size', type=int, default=None)
+    parser.add_argument('--level1-cache-critical-layers-only', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     return parser
 

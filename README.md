@@ -1,12 +1,13 @@
-# ft-test V1.3.12
+# ft-test V1.3.13
 
-V1.3.12 进入 `Multi-Seed Robustness + Stuck-at Fault Migration` 阶段：固定现有 Res18 `ft_codebook_budgeted_translate` adapted artifact，不改核心 grouping、不重训、不切 Vgg16，先补齐 bit-flip 多 seed 稳健性证据，并把真实 OU 权重级 stuck-at zero/one 故障接入仿真。
+V1.3.13 进入 `Level1 Repair Selection Robustness Patch` 阶段：固定现有 Res18 `ft_codebook_budgeted_translate` adapted artifact，不改核心 grouping、不重训、不切 Vgg16，只增加可选的 Level1 repair candidate selection，用于验证 seed43 是否可通过更稳健的候选选择改善。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 `V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
 `V1.3.10` 为什么转向短阶段适配训练，见 [docs/v1_3_10_projection_adaptation_notes.md](docs/v1_3_10_projection_adaptation_notes.md)。
 `V1.3.11` 的 Res18 证据包计划和当前结果，见 [docs/v1_3_11_res18_evidence.md](docs/v1_3_11_res18_evidence.md)。
 `V1.3.12` 的 stuck-at 迁移和多 seed 稳健性计划，见 [docs/v1_3_12_stuck_at_and_multiseed.md](docs/v1_3_12_stuck_at_and_multiseed.md)。
+`V1.3.13` 的 Level1 selection 审计和验证顺序，见 [docs/v1_3_13_level1_selection_audit.md](docs/v1_3_13_level1_selection_audit.md) 与 [docs/v1_3_13_level1_selection_robustness.md](docs/v1_3_13_level1_selection_robustness.md)。
 
 ## 环境前提
 
@@ -416,9 +417,16 @@ FT 训练现在会额外生成：
 - `scripts/analyse_redundancy_construction.py`
 - `--repair-mode {normal,oracle}`
 - `--levels {level1,level1_level2,all}`
+- `--level1-selection {default,best_pair,weighted_average}`
+- `--level1-critical-layer-config`
 - `fault_tolerance_config_stress_3pct.json`
 - `fault_tolerance_config_stress_5pct.json`
 - `fault_tolerance_config_target_late_layers.json`
+
+`--level1-selection` 默认不传，保持 V1.3.12 的 Level1 行为且不构建 repair cache。V1.3.13 的 seed43 验证优先使用：
+
+- `level1_critical_layers_res18_bestpair.json`
+- `level1_critical_layers_res18_weighted.json`
 
 `analyse_redundancy_construction.py` 会输出每层：
 

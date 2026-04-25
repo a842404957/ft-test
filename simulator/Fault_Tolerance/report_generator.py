@@ -118,6 +118,25 @@ class ReportGenerator:
                     writer.writerow(['Reliability', 'Level1 Failed Singleton', hierarchical.get('level1_failed_singleton', 0)])
                     writer.writerow(['Reliability', 'Level1 Zero Scale Failed', hierarchical.get('level1_zero_scale_failed', 0)])
                     writer.writerow(['Reliability', 'Repair Mode', hierarchical.get('repair_mode', 'normal')])
+                    level1_selection = hierarchical.get('level1_selection', {}) or {}
+                    if level1_selection:
+                        writer.writerow(['Level1Selection', 'level1_selection_mode', level1_selection.get('level1_selection_mode', 'default')])
+                        writer.writerow(['Level1Selection', 'best_pair_used', level1_selection.get('best_pair_used', 0)])
+                        writer.writerow(['Level1Selection', 'weighted_average_used', level1_selection.get('weighted_average_used', 0)])
+                        writer.writerow(['Level1Selection', 'fallback_to_default', level1_selection.get('fallback_to_default', 0)])
+                        writer.writerow(['Level1Selection', 'fallback_reason', json.dumps(level1_selection.get('fallback_reason', {}), ensure_ascii=False)])
+                        writer.writerow(['Level1Selection', 'low_confidence_repair', level1_selection.get('low_confidence_repair', 0)])
+                        for metric_name in [
+                            'default_expected_error',
+                            'selected_expected_error',
+                            'expected_error_improvement',
+                            'actual_before_error',
+                            'actual_after_error',
+                            'actual_error_improvement',
+                            'expected_actual_corr',
+                        ]:
+                            value = level1_selection.get(metric_name)
+                            writer.writerow(['Level1Selection', metric_name, '' if value is None else f"{value:.6f}"])
                 repair_quality = rel.get('repair_quality', {})
                 for level_name, stats in repair_quality.items():
                     writer.writerow(['RepairQuality', f'{level_name}.attempted', stats.get('attempted', 0)])
@@ -224,6 +243,29 @@ class ReportGenerator:
                     f.write(f"| Level 1 failed singleton | {hierarchical.get('level1_failed_singleton', 0)} |\n")
                     f.write(f"| Level 1 zero-scale failed | {hierarchical.get('level1_zero_scale_failed', 0)} |\n")
                     f.write(f"| 修复模式 | {hierarchical.get('repair_mode', 'normal')} |\n\n")
+                    level1_selection = hierarchical.get('level1_selection', {}) or {}
+                    if level1_selection:
+                        f.write("### 2.1.1 Level1 Selection 统计\n\n")
+                        f.write("| 指标 | 值 |\n")
+                        f.write("|------|----|\n")
+                        f.write(f"| level1_selection_mode | {level1_selection.get('level1_selection_mode', 'default')} |\n")
+                        f.write(f"| best_pair_used | {level1_selection.get('best_pair_used', 0)} |\n")
+                        f.write(f"| weighted_average_used | {level1_selection.get('weighted_average_used', 0)} |\n")
+                        f.write(f"| fallback_to_default | {level1_selection.get('fallback_to_default', 0)} |\n")
+                        f.write(f"| fallback_reason | `{json.dumps(level1_selection.get('fallback_reason', {}), ensure_ascii=False)}` |\n")
+                        f.write(f"| low_confidence_repair | {level1_selection.get('low_confidence_repair', 0)} |\n")
+                        for metric_name in [
+                            'default_expected_error',
+                            'selected_expected_error',
+                            'expected_error_improvement',
+                            'actual_before_error',
+                            'actual_after_error',
+                            'actual_error_improvement',
+                            'expected_actual_corr',
+                        ]:
+                            value = level1_selection.get(metric_name)
+                            f.write(f"| {metric_name} | {'' if value is None else f'{value:.6f}'} |\n")
+                        f.write("\n")
                 repair_quality = rel.get('repair_quality', {})
                 if repair_quality:
                     f.write("### 2.2 修复质量统计\n\n")
