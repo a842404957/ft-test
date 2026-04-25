@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -44,39 +45,99 @@ def format_pct(value):
     return f'{float(value):.2%}'
 
 
+def _numeric_values(rows, field):
+    values = []
+    for row in rows:
+        value = row.get(field)
+        if value in ('', None):
+            continue
+        values.append(float(value))
+    return values
+
+
+def _percentile(values, q):
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * float(q)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _seed_for_recovery(rows, target, mode='nearest'):
+    candidates = [row for row in rows if row.get('recovery_rate') not in ('', None)]
+    if not candidates:
+        return ''
+    if mode == 'min':
+        row = min(candidates, key=lambda item: (float(item.get('recovery_rate') or 0.0), int(item.get('seed', 0))))
+    elif mode == 'max':
+        row = max(candidates, key=lambda item: (float(item.get('recovery_rate') or 0.0), -int(item.get('seed', 0))))
+    else:
+        row = min(candidates, key=lambda item: (abs(float(item.get('recovery_rate') or 0.0) - target), int(item.get('seed', 0))))
+    return row.get('seed', '')
+
+
 def summarize_gate(rows):
     valid_rows = [row for row in rows if row.get('repair_mode') != 'oracle']
-    recoveries = [float(row['recovery_rate']) for row in valid_rows if row.get('recovery_rate') != '']
-    improved_rates = [float(row['repair_improved_rate']) for row in valid_rows if row.get('repair_improved_rate') != '']
+    recoveries = _numeric_values(valid_rows, 'recovery_rate')
+    improved_rates = _numeric_values(valid_rows, 'repair_improved_rate')
+    ratios = _numeric_values(valid_rows, 'stuck_zero_one_ratio')
     comparable_rows = [
         row for row in valid_rows
         if row.get('ft_accuracy') not in ('', None) and row.get('faulty_accuracy') not in ('', None)
     ]
     ft_not_worse = all(float(row['ft_accuracy']) >= float(row['faulty_accuracy']) for row in comparable_rows)
+    median_recovery = statistics.median(recoveries) if recoveries else 0.0
+    ratio_gate = all(0.8 <= ratio <= 1.25 for ratio in ratios) if ratios else True
     gate = {
         'seed_count': len(valid_rows),
         'recovery_mean': statistics.mean(recoveries) if recoveries else 0.0,
         'recovery_std': statistics.stdev(recoveries) if len(recoveries) > 1 else 0.0,
         'recovery_min': min(recoveries) if recoveries else 0.0,
         'recovery_max': max(recoveries) if recoveries else 0.0,
+        'recovery_median': median_recovery,
+        'recovery_q25': _percentile(recoveries, 0.25),
+        'recovery_q75': _percentile(recoveries, 0.75),
+        'recovery_p10': _percentile(recoveries, 0.10),
         'worst_seed': '',
+        'median_seed': '',
+        'best_seed': '',
         'ft_accuracy_not_worse_than_faulty': ft_not_worse if comparable_rows else False,
-        'avg_recovery_gate': False,
-        'no_seed_below_80_gate': False,
-        'repair_improved_gate': False,
+        'repair_improved_mean': statistics.mean(improved_rates) if improved_rates else 0.0,
+        'repair_improved_min': min(improved_rates) if improved_rates else 0.0,
+        'stuck_zero_one_ratio_mean': statistics.mean(ratios) if ratios else '',
+        'seed_count_gate': False,
+        'mean_recovery_gate': False,
+        'min_recovery_gate': False,
+        'repair_improved_mean_gate': False,
+        'stuck_zero_one_ratio_gate': ratio_gate,
         'passed': False,
     }
     if valid_rows and recoveries:
-        worst_row = min(valid_rows, key=lambda row: float(row.get('recovery_rate') or 0.0))
-        gate['worst_seed'] = worst_row.get('seed', '')
+        gate['worst_seed'] = _seed_for_recovery(valid_rows, gate['recovery_min'], mode='min')
+        gate['median_seed'] = _seed_for_recovery(valid_rows, median_recovery, mode='nearest')
+        gate['best_seed'] = _seed_for_recovery(valid_rows, gate['recovery_max'], mode='max')
+    gate['seed_count_gate'] = gate['seed_count'] >= 10
+    gate['mean_recovery_gate'] = gate['recovery_mean'] >= 0.90
+    gate['min_recovery_gate'] = gate['recovery_min'] >= 0.75 if recoveries else False
+    gate['repair_improved_mean_gate'] = gate['repair_improved_mean'] >= 0.95 if improved_rates else False
+    # Backward-compatible V1.3.12/V1.3.13 aliases kept for older tests and reports.
     gate['avg_recovery_gate'] = gate['recovery_mean'] >= 0.85
     gate['no_seed_below_80_gate'] = gate['recovery_min'] >= 0.80 if recoveries else False
-    gate['repair_improved_gate'] = min(improved_rates) >= 0.90 if improved_rates else False
+    gate['repair_improved_gate'] = gate['repair_improved_min'] >= 0.90 if improved_rates else False
     gate['passed'] = (
-        gate['avg_recovery_gate']
-        and gate['no_seed_below_80_gate']
+        gate['seed_count_gate']
+        and gate['mean_recovery_gate']
+        and gate['min_recovery_gate']
         and gate['ft_accuracy_not_worse_than_faulty']
-        and gate['repair_improved_gate']
+        and gate['repair_improved_mean_gate']
+        and gate['stuck_zero_one_ratio_gate']
     )
     return gate
 
@@ -90,6 +151,8 @@ def write_summary(rows, gate, output_dir: Path):
         'total_faults', 'level1_corrections', 'level1_zero_scale_failed',
         'level1_failed_singleton', 'affected_weight_count',
         'stuck_at_zero_count', 'stuck_at_one_count', 'level1_selection_mode',
+        'stuck_at_zero_weight_count', 'stuck_at_one_weight_count',
+        'stuck_zero_one_ratio',
         'best_pair_used', 'weighted_average_used', 'fallback_to_default',
         'selected_expected_error', 'actual_after_error',
         'oracle_recovery', 'repair_mode',
@@ -109,11 +172,14 @@ def write_summary(rows, gate, output_dir: Path):
         '# Fault Seed Sweep Summary',
         '',
         f"- passed: `{gate['passed']}`",
-        f"- recovery mean/std/min/max: `{gate['recovery_mean']:.4f}` / `{gate['recovery_std']:.4f}` / `{gate['recovery_min']:.4f}` / `{gate['recovery_max']:.4f}`",
-        f"- worst_seed: `{gate['worst_seed']}`",
+        f"- recovery mean/std/min/p10/q25/median/q75/max: `{gate['recovery_mean']:.4f}` / `{gate['recovery_std']:.4f}` / `{gate['recovery_min']:.4f}` / `{gate['recovery_p10']:.4f}` / `{gate['recovery_q25']:.4f}` / `{gate['recovery_median']:.4f}` / `{gate['recovery_q75']:.4f}` / `{gate['recovery_max']:.4f}`",
+        f"- worst/median/best seed: `{gate['worst_seed']}` / `{gate['median_seed']}` / `{gate['best_seed']}`",
+        f"- repair improved mean/min: `{gate['repair_improved_mean']:.4f}` / `{gate['repair_improved_min']:.4f}`",
+        f"- ft_accuracy_not_worse_than_faulty: `{gate['ft_accuracy_not_worse_than_faulty']}`",
+        f"- stuck_zero_one_ratio_gate: `{gate['stuck_zero_one_ratio_gate']}`",
         '',
-        '| seed | baseline | faulty | ft | recovery | correction | repair improved | total faults | level1 | stuck0 | stuck1 |',
-        '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+        '| seed | baseline | faulty | ft | recovery | correction | repair improved | total faults | level1 | stuck0 weights | stuck1 weights | zero/one |',
+        '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
     ]
     for row in rows:
         lines.append(
@@ -121,7 +187,8 @@ def write_summary(rows, gate, output_dir: Path):
             f"{format_pct(row.get('faulty_accuracy'))} | {format_pct(row.get('ft_accuracy'))} | "
             f"{format_pct(row.get('recovery_rate'))} | {format_pct(row.get('correction_rate'))} | "
             f"{format_pct(row.get('repair_improved_rate'))} | {row.get('total_faults', '')} | "
-            f"{row.get('level1_corrections', '')} | {row.get('stuck_at_zero_count', '')} | {row.get('stuck_at_one_count', '')} |"
+            f"{row.get('level1_corrections', '')} | {row.get('stuck_at_zero_weight_count', '')} | "
+            f"{row.get('stuck_at_one_weight_count', '')} | {row.get('stuck_zero_one_ratio', '')} |"
         )
     md_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return {'csv': str(csv_path), 'json': str(json_path), 'md': str(md_path)}
@@ -176,6 +243,12 @@ def run_seed_sweep(args, command_runner=subprocess.run):
         faulty = metrics.get('faulty_accuracy', '')
         accuracy_drop = float(baseline) - float(faulty) if baseline != '' and faulty != '' else ''
         repair_mode = metrics.get('repair_mode', args.repair_mode)
+        zero_weight_count = metrics.get('stuck_at_zero_count', '')
+        one_weight_count = metrics.get('stuck_at_one_count', '')
+        if zero_weight_count != '' and one_weight_count != '' and float(one_weight_count) > 0:
+            stuck_zero_one_ratio = float(zero_weight_count) / float(one_weight_count)
+        else:
+            stuck_zero_one_ratio = ''
         row = {
             'seed': seed,
             'output_dir': str(seed_dir),
@@ -196,6 +269,9 @@ def run_seed_sweep(args, command_runner=subprocess.run):
             'affected_weight_count': metrics.get('affected_weight_count', ''),
             'stuck_at_zero_count': metrics.get('stuck_at_zero_count', ''),
             'stuck_at_one_count': metrics.get('stuck_at_one_count', ''),
+            'stuck_at_zero_weight_count': zero_weight_count,
+            'stuck_at_one_weight_count': one_weight_count,
+            'stuck_zero_one_ratio': stuck_zero_one_ratio,
             'level1_selection_mode': metrics.get('level1_selection_mode', ''),
             'best_pair_used': metrics.get('best_pair_used', ''),
             'weighted_average_used': metrics.get('weighted_average_used', ''),
