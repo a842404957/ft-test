@@ -8,6 +8,7 @@
 import csv
 import json
 import pickle
+import time
 
 import torch
 import torch.nn as nn
@@ -392,6 +393,24 @@ class FaultToleranceSimulator:
         return [(out_ch, in_ch) for out_ch in range(out_channels) for in_ch in range(in_channels)]
 
     @staticmethod
+    def _flat_ou_index_to_tuple(flat_index: int, in_channels: int) -> Tuple[int, int]:
+        return (int(flat_index) // int(in_channels), int(flat_index) % int(in_channels))
+
+    def _sample_faulty_ous(self, weight: torch.Tensor, fault_rate: float) -> Tuple[List[Tuple[int, int]], int]:
+        """按flat OU索引采样，避免为Vgg16/Res50大FC层物化完整OU tuple列表。"""
+        if weight.dim() < 2:
+            return [], 0
+        out_channels = int(weight.shape[0])
+        in_channels = int(weight.shape[1])
+        total_ous = out_channels * in_channels
+        if total_ous <= 0 or fault_rate <= 0:
+            return [], total_ous
+        fault_flags = np.random.rand(total_ous) < float(fault_rate)
+        faulty_indices = np.flatnonzero(fault_flags)
+        faulty_ous = [self._flat_ou_index_to_tuple(int(idx), in_channels) for idx in faulty_indices]
+        return faulty_ous, total_ous
+
+    @staticmethod
     def _new_fault_detail_stats() -> Dict[str, Any]:
         return {
             'affected_weight_count': 0,
@@ -536,6 +555,13 @@ class FaultToleranceSimulator:
         return ((cosine + 1.0) / 2.0).item()
 
     @staticmethod
+    def _l2_error(weight: torch.Tensor, reference: torch.Tensor) -> float:
+        diff = (weight - reference).float()
+        if diff.numel() == 1:
+            return abs(float(diff.item()))
+        return torch.norm(diff, p=2).item()
+
+    @staticmethod
     def _new_repair_quality_bucket() -> Dict[str, float]:
         return {
             'attempted': 0,
@@ -560,13 +586,10 @@ class FaultToleranceSimulator:
         }
 
     @staticmethod
-    def _record_repair_quality(bucket: Dict[str, float],
-                               before_weight: torch.Tensor,
-                               after_weight: torch.Tensor,
-                               original_weight: torch.Tensor,
-                               secondary_bucket: Optional[Dict[str, float]] = None):
-        before_error = torch.norm((before_weight - original_weight).float(), p=2).item()
-        after_error = torch.norm((after_weight - original_weight).float(), p=2).item()
+    def _record_repair_quality_errors(bucket: Dict[str, float],
+                                      before_error: float,
+                                      after_error: float,
+                                      secondary_bucket: Optional[Dict[str, float]] = None):
         for target_bucket in [bucket, secondary_bucket]:
             if target_bucket is None:
                 continue
@@ -577,6 +600,21 @@ class FaultToleranceSimulator:
                 target_bucket['effective_improved'] += 1
             if after_error < 1e-6:
                 target_bucket['exact_restored'] += 1
+
+    @staticmethod
+    def _record_repair_quality(bucket: Dict[str, float],
+                               before_weight: torch.Tensor,
+                               after_weight: torch.Tensor,
+                               original_weight: torch.Tensor,
+                               secondary_bucket: Optional[Dict[str, float]] = None):
+        before_error = FaultToleranceSimulator._l2_error(before_weight, original_weight)
+        after_error = FaultToleranceSimulator._l2_error(after_weight, original_weight)
+        FaultToleranceSimulator._record_repair_quality_errors(
+            bucket,
+            before_error,
+            after_error,
+            secondary_bucket=secondary_bucket,
+        )
 
     @staticmethod
     def _is_invalid_scale_factor(scale_factor: float, eps: float = 1e-6) -> bool:
@@ -900,6 +938,24 @@ class FaultToleranceSimulator:
             'fallback_to_default': 0,
             'low_confidence_repair': 0,
             'fallback_reasons': {},
+            'summary_count': 0,
+            'summary_sums': {
+                'default_expected_error': 0.0,
+                'selected_expected_error': 0.0,
+                'expected_error_improvement': 0.0,
+                'actual_before_error': 0.0,
+                'actual_after_error': 0.0,
+                'actual_error_improvement': 0.0,
+            },
+            'summary_counts': {
+                'default_expected_error': 0,
+                'selected_expected_error': 0,
+                'expected_error_improvement': 0,
+                'actual_before_error': 0,
+                'actual_after_error': 0,
+                'actual_error_improvement': 0,
+            },
+            'max_sampled_events': 10000,
             'events': [],
         }
 
@@ -949,12 +1005,25 @@ class FaultToleranceSimulator:
             'actual_after_error': float(actual_after_error),
             'actual_error_improvement': float(actual_before_error - actual_after_error),
         }
-        stats['events'].append(event)
+        stats['summary_count'] = int(stats.get('summary_count', 0)) + 1
+        for field, value in event.items():
+            if field not in stats['summary_sums'] or value is None:
+                continue
+            stats['summary_sums'][field] += float(value)
+            stats['summary_counts'][field] += 1
+
+        # Keep a bounded sample for expected/actual correlation. Storing one
+        # dict per repaired OU is too expensive for Vgg16-scale FC layers.
+        if len(stats['events']) < int(stats.get('max_sampled_events', 10000)):
+            stats['events'].append(event)
 
     def _finalize_level1_selection_stats(self, stats: Dict[str, Any]) -> Dict[str, Any]:
         events = stats.get('events', [])
 
         def avg(field: str) -> Optional[float]:
+            count = int(stats.get('summary_counts', {}).get(field, 0))
+            if count > 0:
+                return float(stats.get('summary_sums', {}).get(field, 0.0)) / count
             values = [event.get(field) for event in events if event.get(field) is not None]
             return float(np.mean(values)) if values else None
 
@@ -996,7 +1065,8 @@ class FaultToleranceSimulator:
             'expected_actual_corr': self._pearson_corr(global_pairs),
             'expected_actual_corr_by_layer': by_layer_corr,
             'mode_counts': mode_counts,
-            'event_count': len(events),
+            'event_count': int(stats.get('summary_count', len(events))),
+            'sampled_event_count': len(events),
         }
 
     def _select_level1_repair_choice(self,
@@ -1160,16 +1230,10 @@ class FaultToleranceSimulator:
             if weight.dim() < 2:
                 continue
 
-            all_ous = self._build_ou_list(weight)
-            total_ous = len(all_ous)
+            faulty_ous, total_ous = self._sample_faulty_ous(weight, fault_rate)
             if total_ous == 0 or fault_rate <= 0:
                 ou_fault_mask[layer_name] = []
                 continue
-
-            # 每个OU独立故障概率
-            fault_flags = np.random.rand(total_ous) < fault_rate
-            faulty_indices = np.flatnonzero(fault_flags)
-            faulty_ous = [all_ous[idx] for idx in faulty_indices]
 
             self.detailed_fault_mask[layer_name] = {}
 
@@ -1445,6 +1509,8 @@ class FaultToleranceSimulator:
             layer_level2 = []
             layer_level3 = []
             layer_oracle = []
+            layer_start_time = time.time()
+            print(f"  [FT correction] {layer_name}: faulty_ous={len(faulty_ous)} groups={len(groups)}")
             layer_mask = self.data_loader.get_layer_mask(layer_name)
             if layer_mask is not None and layer_mask.shape[:2] == layer_weights.shape[:2]:
                 layer_mask = layer_mask.to(layer_weights.device)
@@ -1487,11 +1553,7 @@ class FaultToleranceSimulator:
                 for faulty_ou in faulty_ous:
                     containing_group = None
 
-                    # 找到故障OU所在的冗余组
-                    for group in groups:
-                        if faulty_ou in group.ou_indices:
-                            containing_group = group
-                            break
+                    containing_group = self.redundancy_parser.get_group_for_ou(layer_name, faulty_ou)
 
                     if containing_group is None:
                         continue
@@ -1590,11 +1652,15 @@ class FaultToleranceSimulator:
                         continue
 
                     replacement_weight = self._extract_ou_weight(original_layer_weights, replacement_ou)
-                    default_expected_error = self._compute_expected_repair_error(
-                        faulty_original_weight,
-                        replacement_weight,
-                        scale_factor,
-                    )
+                    policy = self._effective_level1_policy(layer_name)
+                    if policy.get('selection') == 'default':
+                        default_expected_error = float('nan')
+                    else:
+                        default_expected_error = self._compute_expected_repair_error(
+                            faulty_original_weight,
+                            replacement_weight,
+                            scale_factor,
+                        )
                     default_choice = {
                         'replacement_ou': replacement_ou,
                         'replacement_origin': replacement_origin,
@@ -1605,7 +1671,6 @@ class FaultToleranceSimulator:
                         'mode': 'default',
                         'fallback_reason': '',
                     }
-                    policy = self._effective_level1_policy(layer_name)
                     selected_choice = self._select_level1_repair_choice(
                         layer_name=layer_name,
                         faulty_ou=faulty_ou,
@@ -1641,23 +1706,22 @@ class FaultToleranceSimulator:
                     elif layer_weights.dim() == 2:
                         layer_weights[out_ch, in_ch] = corrected_weight
                     corrected_weight_after = self._extract_ou_weight(layer_weights, faulty_ou).clone()
-                    actual_before_error = torch.norm((faulty_current_weight - faulty_original_weight).float(), p=2).item()
-                    actual_after_error = torch.norm((corrected_weight_after - faulty_original_weight).float(), p=2).item()
+                    actual_before_error = self._l2_error(faulty_current_weight, faulty_original_weight)
+                    actual_after_error = self._l2_error(corrected_weight_after, faulty_original_weight)
                     self._record_level1_selection_event(
                         level1_selection_stats,
                         layer_name=layer_name,
                         mode=selected_choice.get('mode', 'default'),
                         default_expected_error=float(selected_choice.get('default_expected_error', default_expected_error)),
-                        selected_expected_error=float(selected_choice.get('selected_expected_error', default_expected_error)),
+                            selected_expected_error=float(selected_choice.get('selected_expected_error', default_expected_error)),
                         actual_before_error=actual_before_error,
                         actual_after_error=actual_after_error,
                         fallback_reason=selected_choice.get('fallback_reason', ''),
                     )
-                    self._record_repair_quality(
+                    self._record_repair_quality_errors(
                         repair_quality_buckets['level1'],
-                        before_weight=faulty_current_weight,
-                        after_weight=corrected_weight_after,
-                        original_weight=faulty_original_weight,
+                        before_error=actual_before_error,
+                        after_error=actual_after_error,
                         secondary_bucket=layer_quality_bucket(layer_name, 'level1'),
                     )
 
@@ -1677,13 +1741,25 @@ class FaultToleranceSimulator:
                         level1_scaled_repairs += 1
 
             level1_corrected_ous[layer_name] = layer_level1
+            if repair_mode != 'oracle':
+                print(
+                    f"  [FT correction] {layer_name} level1_done: "
+                    f"level1={len(layer_level1)} elapsed={time.time() - layer_start_time:.1f}s"
+                )
 
             # ---------- Level 2: 相似模式替换（95%恢复，允许误差）----------
             # 策略：用相似OU的权重替换故障OU（可能不完全相同，约95%准确）
             # 只处理Level 1未纠正的故障
-            remaining_for_level2 = [ou for ou in faulty_ous if ou not in layer_level1]
+            layer_level1_set = set(layer_level1)
+            level2_enabled = hierarchical_config.get('level2', {}).get('enabled', True)
+            level3_enabled = hierarchical_config.get('level3', {}).get('enabled', True)
+            remaining_for_level2 = (
+                [ou for ou in faulty_ous if ou not in layer_level1_set]
+                if level2_enabled or level3_enabled
+                else []
+            )
 
-            if hierarchical_config.get('level2', {}).get('enabled', True):
+            if level2_enabled:
                 level2_cfg = hierarchical_config.get('level2', {})
                 similarity_threshold = level2_cfg.get('similarity_threshold', 0.85)
                 k_nearest = level2_cfg.get('k_nearest', 3)
@@ -1815,8 +1891,13 @@ class FaultToleranceSimulator:
 
             # ---------- Level 3: 自适应屏蔽（置0，最小化影响）----------
             # 策略：无法通过Level 1纠正的故障，将OU权重置0，避免错误传播
-            remaining_for_level3 = [ou for ou in faulty_ous if ou not in layer_level1 and ou not in layer_level2]
-            if hierarchical_config.get('level3', {}).get('enabled', True):
+            layer_level2_set = set(layer_level2)
+            remaining_for_level3 = (
+                [ou for ou in faulty_ous if ou not in layer_level1_set and ou not in layer_level2_set]
+                if level3_enabled
+                else []
+            )
+            if level3_enabled:
                 for faulty_ou_idx in remaining_for_level3:
                     before_weight = self._extract_ou_weight(layer_weights, faulty_ou_idx).clone()
                     original_weight = self._extract_ou_weight(original_layer_weights, faulty_ou_idx).clone()
@@ -1891,8 +1972,13 @@ class FaultToleranceSimulator:
             level3_corrected_ous[layer_name] = layer_level3
 
             # 剩余未纠正的故障
-            residual_uncorrected = [ou for ou in faulty_ous
-                                    if ou not in layer_level1 and ou not in layer_level2 and ou not in layer_level3]
+            layer_level3_set = set(layer_level3)
+            residual_uncorrected = [
+                ou for ou in faulty_ous
+                if ou not in layer_level1_set
+                and ou not in layer_level2_set
+                and ou not in layer_level3_set
+            ]
             if residual_uncorrected:
                 uncorrected_by_layer.setdefault(layer_name, []).extend(residual_uncorrected)
 

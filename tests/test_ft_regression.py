@@ -2,6 +2,8 @@ import csv
 import json
 import os
 import pickle
+import re
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -9,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -51,7 +54,7 @@ from simulator.Fault_Tolerance.fault_tolerance_simulation import FaultToleranceS
 from simulator.Fault_Tolerance.fault_tolerance_simulation import resolve_excluded_critical_layers
 from simulator.Fault_Tolerance.config import FaultToleranceConfig
 from simulator.Fault_Tolerance.pattern_data_loader import PatternDataLoader
-from simulator.Fault_Tolerance.redundancy_group_parser import RedundancyGroupParser
+from simulator.Fault_Tolerance.redundancy_group_parser import RedundancyGroup, RedundancyGroupParser
 
 
 class TinyConvModel(nn.Module):
@@ -846,6 +849,20 @@ class TestFTRegression(unittest.TestCase):
             )
             self.assertAlmostEqual(corrected_value, 4.0, places=6)
 
+    def test_redundancy_group_parser_builds_ou_to_group_index(self):
+        parser = object.__new__(RedundancyGroupParser)
+        parser.redundancy_groups = {}
+        parser.ou_to_group = {}
+        group = RedundancyGroup(7, 'conv.weight', 0)
+        group.add_block_member(1, 4, 3, multiplier=1.0, role='prototype')
+        group.add_block_member(2, 4, 3, multiplier=2.0, role='member')
+        parser.redundancy_groups['conv.weight'] = [group]
+        parser._build_layer_group_index('conv.weight', [group])
+
+        self.assertIs(parser.get_group_for_ou('conv.weight', (1, 5)), group)
+        self.assertIs(parser.get_group_for_ou('conv.weight', (2, 6)), group)
+        self.assertIsNone(parser.get_group_for_ou('conv.weight', (3, 6)))
+
     def test_fault_tolerance_analyse_returns_expected_structure(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             temp_dir = Path(temp_dir_name)
@@ -1024,6 +1041,26 @@ class TestFTRegression(unittest.TestCase):
             zero_ratio = stats[0]['stuck_at_zero'] / total
             self.assertGreater(zero_ratio, 0.40)
             self.assertLess(zero_ratio, 0.60)
+
+    def test_large_fc_fault_sampler_does_not_materialize_ou_list(self):
+        simulator = object.__new__(FaultToleranceSimulator)
+        simulator._build_ou_list = mock.Mock(side_effect=AssertionError('should not materialize full OU list'))
+        weight = torch.empty((2048, 2048), dtype=torch.float32)
+        np_state = np.random.get_state()
+        try:
+            np.random.seed(123)
+            faulty_ous_a, total_ous_a = simulator._sample_faulty_ous(weight, 0.001)
+            np.random.seed(123)
+            faulty_ous_b, total_ous_b = simulator._sample_faulty_ous(weight, 0.001)
+        finally:
+            np.random.set_state(np_state)
+
+        self.assertEqual(total_ous_a, 2048 * 2048)
+        self.assertEqual(total_ous_a, total_ous_b)
+        self.assertEqual(faulty_ous_a, faulty_ous_b)
+        self.assertGreater(len(faulty_ous_a), 0)
+        self.assertTrue(all(0 <= out_ch < 2048 and 0 <= in_ch < 2048 for out_ch, in_ch in faulty_ous_a[:100]))
+        simulator._build_ou_list.assert_not_called()
 
     def test_oracle_restore_works_under_stuck_at(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
@@ -1366,6 +1403,12 @@ class TestFTRegression(unittest.TestCase):
     def test_run_fault_seed_sweep_writes_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             temp_dir = Path(temp_dir_name)
+            artifact_dir = temp_dir / 'artifacts'
+            artifact_dir.mkdir()
+            _write_pkl(
+                artifact_dir / 'model_Res18_ft_codebook_budgeted_translate_group_information.pkl',
+                {'conv.weight': {'ou_count': 100, 'group_count': 20, 'singleton_group_count': 5, 'coverage_ratio': 0.5}},
+            )
             commands = []
 
             def fake_runner(command, cwd=None, check=False):
@@ -1405,7 +1448,7 @@ class TestFTRegression(unittest.TestCase):
                 levels='level1',
                 samples=-1,
                 seeds='42,43',
-                artifact_dir='artifacts',
+                artifact_dir=str(artifact_dir),
                 output_dir=str(temp_dir / 'sweep'),
                 tag='toy',
                 level1_selection='best_pair',
@@ -1429,6 +1472,43 @@ class TestFTRegression(unittest.TestCase):
             self.assertEqual(result['rows'][0]['stuck_at_zero_weight_count'], 40)
             self.assertEqual(result['rows'][0]['stuck_at_one_weight_count'], 40)
             self.assertAlmostEqual(result['rows'][0]['stuck_zero_one_ratio'], 1.0)
+            self.assertTrue((temp_dir / 'sweep' / 'preflight_diagnostics.csv').exists())
+            self.assertTrue((temp_dir / 'sweep' / 'seed_42' / 'runner.log').exists())
+
+    def test_run_fault_seed_sweep_records_failed_seed(self):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+
+            def failing_runner(command, cwd=None, check=False, **kwargs):
+                raise subprocess.CalledProcessError(returncode=9, cmd=command)
+
+            result = run_seed_sweep(Namespace(
+                model='Res18',
+                translate='ft_codebook_budgeted_translate',
+                config='fault_tolerance_config_stuck_at_3pct.json',
+                repair_mode='normal',
+                levels='level1',
+                samples=-1,
+                seeds='42',
+                artifact_dir='artifacts',
+                output_dir=str(temp_dir / 'sweep'),
+                tag='toy',
+                level1_selection=None,
+                level1_topk=None,
+                level1_critical_layer_config='',
+                level1_max_expected_error=None,
+                level1_min_expected_improvement=None,
+                level1_cache_max_group_size=None,
+                level1_cache_critical_layers_only=False,
+                dry_run=False,
+            ), command_runner=failing_runner)
+
+            self.assertEqual(result['rows'][0]['run_status'], 'failed')
+            self.assertEqual(result['rows'][0]['returncode'], 9)
+            self.assertFalse(result['gate']['passed'])
+            runner_log = temp_dir / 'sweep' / 'seed_42' / 'runner.log'
+            self.assertTrue(runner_log.exists())
+            self.assertIn('returncode=9', runner_log.read_text(encoding='utf-8'))
 
     def test_run_fault_seed_sweep_aggregates_ten_seed_gate_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir_name:
@@ -2429,6 +2509,61 @@ class TestFTRegression(unittest.TestCase):
             self.assertTrue((temp_dir / 'artifacts' / 'model_ToyAdaptSave_ft_codebook_budgeted_translate_after_translate_parameters.pth').exists())
             rows = _read_csv_rows(temp_dir / 'artifacts' / 'model_ToyAdaptSave_ft_codebook_budgeted_translate_training_profile.csv')
             self.assertTrue(all(int(row['projection_sampled_member_links']) <= 1 for row in rows))
+
+    def test_v1_3_14_docs_do_not_contain_oracle_seed_placeholders(self):
+        doc_paths = [
+            Path('README.md'),
+            Path('docs/v1_3_14_seed_robustness_and_layer_impact.md'),
+            Path('docs/v1_3_14_res18_final_summary.md'),
+            Path('docs/v2_0_0_cross_model_plan.md'),
+        ]
+        for path in doc_paths:
+            text = path.read_text(encoding='utf-8')
+            self.assertNotIn('<seed>', text, msg=str(path))
+            self.assertIsNone(
+                re.search(r'--fault-seed\s*(?:\\\s*)?\n', text),
+                msg=f'empty --fault-seed placeholder in {path}',
+            )
+
+    def test_res18_paper_tables_exist_and_load(self):
+        table_dir = Path('results/paper_tables/res18')
+        expected_tables = {
+            'res18_stuck_at_10seed_summary.csv': {'seed', 'recovery_rate', 'stuck_zero_one_ratio'},
+            'res18_oracle_sanity.csv': {'seed', 'role', 'oracle_ft_accuracy', 'recovery_rate'},
+            'res18_seed43_layer_impact.csv': {'layer', 'restore_mode', 'marginal_accuracy_gain'},
+        }
+        for filename, required_fields in expected_tables.items():
+            path = table_dir / filename
+            self.assertTrue(path.exists(), msg=str(path))
+            with open(path, newline='', encoding='utf-8') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertGreater(len(rows), 0, msg=str(path))
+            self.assertTrue(required_fields.issubset(rows[0].keys()), msg=str(path))
+        summary = (table_dir / 'res18_final_summary.md').read_text(encoding='utf-8')
+        self.assertIn('results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/artifacts', summary)
+        self.assertIn('95.94%', summary)
+
+    def test_vgg16_and_res50_codebook_configs_parse(self):
+        configs = [
+            (Path('ft_codebook_layer_config_vgg16.json'), 'conv3.weight', [8, 4], 'fc2.weight'),
+            (Path('ft_codebook_layer_config_res50.json'), 'conv42.weight', [2, 1], 'shortcut4.weight'),
+        ]
+        for path, early_or_late_layer, expected_keep_counts, extra_layer in configs:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            self.assertIn('groups', payload)
+            self.assertGreater(len(payload['groups']), 0)
+            layer_overrides = {
+                group['layers']: {
+                    key: value
+                    for key, value in group.items()
+                    if key not in {'name', 'layers'}
+                }
+                for group in payload['groups']
+            }
+            resolved = _resolve_budgeted_layer_config({'layer_overrides': layer_overrides}, early_or_late_layer)
+            self.assertEqual(resolved['mask_codebook_keep_counts'], expected_keep_counts)
+            extra_resolved = _resolve_budgeted_layer_config({'layer_overrides': layer_overrides}, extra_layer)
+            self.assertIn('mask_codebook_keep_counts', extra_resolved)
 
 
 if __name__ == '__main__':

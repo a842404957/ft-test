@@ -102,6 +102,7 @@ class RedundancyGroupParser:
         
         # 存储解析结果
         self.redundancy_groups = {}  # {layer_name: [RedundancyGroup]}
+        self.ou_to_group = {}  # {layer_name: indexed lookup metadata}
         self.pattern_to_groups = defaultdict(list)  # {pattern_id: [group_ids]}
         self.statistics = {}
         
@@ -195,6 +196,69 @@ class RedundancyGroupParser:
 
         return groups
 
+    def _build_layer_group_index(self, layer_name: str, groups: List[RedundancyGroup]):
+        """构建OU到冗余组的O(1)索引。
+
+        Vgg16等大模型可包含上千万OU。直接用 `(out_ch, in_ch)` tuple
+        作为dict key会产生巨大的Python对象开销，因此优先构建 dense
+        flat-index 数组：`flat = out_ch * in_channels + in_ch`，数组值为
+        group列表下标。只有在坐标跨度远大于实际OU数时才回退到dict。
+        """
+        max_out = -1
+        max_in = -1
+        total_ous = 0
+        for group in groups:
+            for ou in group.ou_indices:
+                out_ch, in_ch = int(ou[0]), int(ou[1])
+                max_out = max(max_out, out_ch)
+                max_in = max(max_in, in_ch)
+                total_ous += 1
+
+        if max_out < 0 or max_in < 0:
+            self.ou_to_group[layer_name] = {'kind': 'empty'}
+            return
+
+        out_channels = max_out + 1
+        in_channels = max_in + 1
+        total_slots = out_channels * in_channels
+        duplicate_count = 0
+
+        use_dense = total_slots <= max(1_000_000, total_ous * 4)
+        if use_dense:
+            dtype = np.int32 if len(groups) < np.iinfo(np.int32).max else np.int64
+            group_indices = np.full(total_slots, -1, dtype=dtype)
+            for group_pos, group in enumerate(groups):
+                for ou in group.ou_indices:
+                    out_ch, in_ch = int(ou[0]), int(ou[1])
+                    flat_index = out_ch * in_channels + in_ch
+                    if group_indices[flat_index] != -1:
+                        duplicate_count += 1
+                        continue
+                    group_indices[flat_index] = group_pos
+            self.ou_to_group[layer_name] = {
+                'kind': 'dense',
+                'groups': groups,
+                'in_channels': in_channels,
+                'size': total_slots,
+                'group_indices': group_indices,
+            }
+        else:
+            layer_index = {}
+            for group in groups:
+                for ou in group.ou_indices:
+                    ou_key = (int(ou[0]), int(ou[1]))
+                    if ou_key in layer_index:
+                        duplicate_count += 1
+                        continue
+                    layer_index[ou_key] = group
+            self.ou_to_group[layer_name] = {
+                'kind': 'dict',
+                'index': layer_index,
+            }
+
+        if duplicate_count:
+            print(f"  ⚠️ {layer_name}: {duplicate_count} 个OU重复出现在多个组，索引保留首次出现的组")
+
     def _parse_layer_from_map_info(self, layer_name: str) -> List[RedundancyGroup]:
         """兼容旧PRAP路径：从map_information反推冗余组。"""
         # 获取映射信息
@@ -278,6 +342,38 @@ class RedundancyGroupParser:
     def get_layer_groups(self, layer_name: str) -> List[RedundancyGroup]:
         """获取指定层的冗余组"""
         return self.redundancy_groups.get(layer_name, [])
+
+    def get_group_for_ou(self, layer_name: str, ou: Tuple[int, int]) -> Optional[RedundancyGroup]:
+        """O(1) 获取指定OU所属冗余组。"""
+        layer_index = self.ou_to_group.get(layer_name)
+        if layer_index is None:
+            groups = self.get_layer_groups(layer_name)
+            self._build_layer_group_index(layer_name, groups)
+            layer_index = self.ou_to_group.get(layer_name)
+        if not layer_index:
+            return None
+
+        out_ch, in_ch = int(ou[0]), int(ou[1])
+        if layer_index.get('kind') == 'dense':
+            if out_ch < 0 or in_ch < 0:
+                return None
+            in_channels = int(layer_index['in_channels'])
+            flat_index = out_ch * in_channels + in_ch
+            if flat_index < 0 or flat_index >= int(layer_index['size']):
+                return None
+            group_pos = int(layer_index['group_indices'][flat_index])
+            if group_pos < 0:
+                return None
+            return layer_index['groups'][group_pos]
+        if layer_index.get('kind') == 'dict':
+            return layer_index['index'].get((out_ch, in_ch))
+        if layer_index.get('kind') == 'empty':
+            return None
+
+        # Backward compatibility for any raw dict index created by older code.
+        if isinstance(layer_index, dict):
+            return layer_index.get((out_ch, in_ch))
+        return None
     
     def get_group_by_id(self, layer_name: str, group_id: int) -> Optional[RedundancyGroup]:
         """根据ID获取冗余组"""

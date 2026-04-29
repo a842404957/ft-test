@@ -4,9 +4,12 @@ import argparse
 import csv
 import json
 import math
+import pickle
+import shlex
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +40,82 @@ def latest_file(directory: Path, pattern: str):
 
 def default_output_dir(model: str, translate: str, tag: str):
     return REPO_ROOT / 'results' / 'ft_runs' / model / translate / tag / 'seed_sweep'
+
+
+def _resolve_repo_path(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _load_fault_rate(config_path: str) -> float:
+    path = _resolve_repo_path(config_path)
+    if not path.exists():
+        return 0.0
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return 0.0
+    return float(payload.get('fault_injection', {}).get('fault_rate', 0.0) or 0.0)
+
+
+def write_preflight_diagnostics(args, output_dir: Path):
+    """写出artifact规模诊断，帮助提前识别Vgg16/Res50大层运行成本。"""
+    artifact_dir = _resolve_repo_path(args.artifact_dir)
+    group_path = artifact_dir / f'model_{args.model}_{args.translate}_group_information.pkl'
+    if not group_path.exists():
+        print(f'preflight_warning=missing_group_information:{group_path}')
+        return {}
+
+    fault_rate = _load_fault_rate(args.config)
+    rows = []
+    with open(group_path, 'rb') as handle:
+        group_information = pickle.load(handle)
+    for layer, info in group_information.items():
+        if not isinstance(info, dict):
+            continue
+        ou_count = int(info.get('ou_count') or 0)
+        group_count = int(info.get('group_count') or 0)
+        row = {
+            'layer': layer,
+            'ou_count': ou_count,
+            'group_count': group_count,
+            'singleton_group_count': int(info.get('singleton_group_count') or 0),
+            'coverage_ratio': float(info.get('coverage_ratio') or 0.0),
+            'singleton_ratio': float(info.get('singleton_ratio') or 0.0),
+            'avg_group_size': float(info.get('avg_group_size') or 0.0),
+            'expected_faults': int(round(ou_count * fault_rate)),
+        }
+        rows.append(row)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / 'preflight_diagnostics.csv'
+    json_path = output_dir / 'preflight_diagnostics.json'
+    fieldnames = [
+        'layer', 'ou_count', 'group_count', 'singleton_group_count',
+        'coverage_ratio', 'singleton_ratio', 'avg_group_size', 'expected_faults',
+    ]
+    with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    json_path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    total_ous = sum(row['ou_count'] for row in rows)
+    total_groups = sum(row['group_count'] for row in rows)
+    expected_faults = sum(row['expected_faults'] for row in rows)
+    print(f'preflight_diagnostics_csv={csv_path}')
+    print(f'preflight_total_ous={total_ous} total_groups={total_groups} expected_faults={expected_faults}')
+    large_rows = [
+        row for row in rows
+        if row['expected_faults'] >= 100000 or row['group_count'] >= 1000000
+    ]
+    for row in large_rows:
+        print(
+            'preflight_warning=large_layer '
+            f"layer={row['layer']} ou_count={row['ou_count']} "
+            f"group_count={row['group_count']} expected_faults={row['expected_faults']}"
+        )
+    return {'csv': str(csv_path), 'json': str(json_path), 'rows': rows}
 
 
 def format_pct(value):
@@ -145,7 +224,7 @@ def summarize_gate(rows):
 def write_summary(rows, gate, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        'seed', 'output_dir', 'summary_csv', 'report_json', 'report_md',
+        'seed', 'run_status', 'returncode', 'runner_log', 'run_error', 'output_dir', 'summary_csv', 'report_json', 'report_md',
         'baseline_accuracy', 'faulty_accuracy', 'ft_accuracy', 'accuracy_drop',
         'recovery_rate', 'correction_rate', 'repair_improved_rate',
         'total_faults', 'level1_corrections', 'level1_zero_scale_failed',
@@ -194,15 +273,52 @@ def write_summary(rows, gate, output_dir: Path):
     return {'csv': str(csv_path), 'json': str(json_path), 'md': str(md_path)}
 
 
+def _run_child_command(command, command_runner, runner_log: Path):
+    start = time.time()
+    with open(runner_log, 'a', encoding='utf-8') as handle:
+        handle.write(f"start_time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.write('command=' + ' '.join(shlex.quote(str(part)) for part in command) + '\n')
+        handle.flush()
+        try:
+            try:
+                completed = command_runner(
+                    command,
+                    cwd=str(REPO_ROOT),
+                    check=True,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except TypeError:
+                completed = command_runner(command, cwd=str(REPO_ROOT), check=True)
+            returncode = int(getattr(completed, 'returncode', 0) or 0)
+            handle.write(f"\nend_time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            handle.write(f"elapsed_sec={time.time() - start:.3f}\n")
+            handle.write(f"returncode={returncode}\n")
+            return 'completed', returncode, ''
+        except subprocess.CalledProcessError as exc:
+            returncode = int(exc.returncode)
+            handle.write(f"\nend_time={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            handle.write(f"elapsed_sec={time.time() - start:.3f}\n")
+            handle.write(f"returncode={returncode}\n")
+            handle.write(f"error={exc}\n")
+            return 'failed', returncode, str(exc)
+
+
 def run_seed_sweep(args, command_runner=subprocess.run):
     seeds = parse_seed_list(args.seeds)
     output_dir = Path(args.output_dir).resolve() if args.output_dir else default_output_dir(args.model, args.translate, args.tag).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    write_preflight_diagnostics(args, output_dir)
 
     rows = []
     for seed in seeds:
         seed_dir = output_dir / f'seed_{seed}'
         seed_dir.mkdir(parents=True, exist_ok=True)
+        runner_log = seed_dir / 'runner.log'
+        run_status = 'dry_run' if args.dry_run else 'completed'
+        returncode = 0
+        run_error = ''
         command = [
             sys.executable,
             str(REPO_ROOT / 'run_hierarchical_fault_tolerance.py'),
@@ -233,7 +349,7 @@ def run_seed_sweep(args, command_runner=subprocess.run):
         if args.dry_run:
             print(' '.join(command))
         else:
-            command_runner(command, cwd=str(REPO_ROOT), check=True)
+            run_status, returncode, run_error = _run_child_command(command, command_runner, runner_log)
 
         summary_csv = latest_file(seed_dir, 'fault_tolerance_summary_*.csv')
         report_json = latest_file(seed_dir, 'fault_tolerance_report_*.json')
@@ -251,6 +367,10 @@ def run_seed_sweep(args, command_runner=subprocess.run):
             stuck_zero_one_ratio = ''
         row = {
             'seed': seed,
+            'run_status': run_status if summary_csv else ('failed' if run_status == 'failed' else run_status),
+            'returncode': returncode,
+            'runner_log': str(runner_log),
+            'run_error': run_error,
             'output_dir': str(seed_dir),
             'summary_csv': str(summary_csv) if summary_csv else '',
             'report_json': str(report_json) if report_json else '',

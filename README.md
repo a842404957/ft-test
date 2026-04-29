@@ -1,6 +1,6 @@
-# ft-test V1.3.13
+# ft-test V1.3.14-final
 
-V1.3.13 进入 `Level1 Repair Selection Robustness Patch` 阶段：固定现有 Res18 `ft_codebook_budgeted_translate` adapted artifact，不改核心 grouping、不重训、不切 Vgg16，只增加可选的 Level1 repair candidate selection，用于验证 seed43 是否可通过更稳健的候选选择改善。
+V1.3.14-final 完成 Res18 `ft_codebook_budgeted_translate` stuck-at 0/1=1:1 主证据包。固定 adapted artifact 在 stuck-at 3% 10-seed Level1-only full sweep 下通过 revised primary gate：平均 recovery 95.94%，最差 seed recovery 79.39%，repair improved mean 96.50%，oracle 在 worst/median/best seeds 均恢复 baseline。下一阶段进入 V2.0.0 跨模型扩展，先做 Vgg16 pilot，再做 Res50 pilot。
 
 `V1.3.6` 的诊断结论见 [docs/v1_3_6_diagnosis.md](docs/v1_3_6_diagnosis.md)。
 `V1.3.8-b` 为什么停止继续搜索，见 [docs/v1_3_8_budgeted_failure.md](docs/v1_3_8_budgeted_failure.md)。
@@ -8,6 +8,15 @@ V1.3.13 进入 `Level1 Repair Selection Robustness Patch` 阶段：固定现有 
 `V1.3.11` 的 Res18 证据包计划和当前结果，见 [docs/v1_3_11_res18_evidence.md](docs/v1_3_11_res18_evidence.md)。
 `V1.3.12` 的 stuck-at 迁移和多 seed 稳健性计划，见 [docs/v1_3_12_stuck_at_and_multiseed.md](docs/v1_3_12_stuck_at_and_multiseed.md)。
 `V1.3.13` 的 Level1 selection 审计和验证顺序，见 [docs/v1_3_13_level1_selection_audit.md](docs/v1_3_13_level1_selection_audit.md) 与 [docs/v1_3_13_level1_selection_robustness.md](docs/v1_3_13_level1_selection_robustness.md)。
+`V1.3.14-final` 的 Res18 完整结果，见 [docs/v1_3_14_seed_robustness_and_layer_impact.md](docs/v1_3_14_seed_robustness_and_layer_impact.md) 与 [docs/v1_3_14_res18_final_summary.md](docs/v1_3_14_res18_final_summary.md)。
+`V2.0.0` 的 Vgg16/Res50 跨模型扩展计划，见 [docs/v2_0_0_cross_model_plan.md](docs/v2_0_0_cross_model_plan.md)。
+
+论文表格已整理到 [results/paper_tables/res18](results/paper_tables/res18)：
+
+- `res18_stuck_at_10seed_summary.csv`
+- `res18_oracle_sanity.csv`
+- `res18_seed43_layer_impact.csv`
+- `res18_final_summary.md`
 
 ## 环境前提
 

@@ -31,7 +31,7 @@ The summary reports mean/std/min/max, median, q25/q75, p10 recovery, worst/media
 
 ## Oracle Sanity
 
-Run oracle on the worst, median, and best seeds selected from `seed_sweep_summary.json`:
+Run oracle on the selected worst/median/best seeds from `seed_sweep_summary.json`: worst seed `43`, median seed `47`, best seed `42`.
 
 ```bash
 python run_hierarchical_fault_tolerance.py \
@@ -42,9 +42,33 @@ python run_hierarchical_fault_tolerance.py \
   --repair-mode oracle \
   --levels all \
   --samples -1 \
-  --fault-seed <seed> \
+  --fault-seed 43 \
   --artifact-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/artifacts \
-  --output-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/oracle_seed_<seed>
+  --output-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/oracle_seed_43
+
+python run_hierarchical_fault_tolerance.py \
+  --mode single \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --config fault_tolerance_config_stuck_at_3pct.json \
+  --repair-mode oracle \
+  --levels all \
+  --samples -1 \
+  --fault-seed 47 \
+  --artifact-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/artifacts \
+  --output-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/oracle_seed_47
+
+python run_hierarchical_fault_tolerance.py \
+  --mode single \
+  --model Res18 \
+  --translate ft_codebook_budgeted_translate \
+  --config fault_tolerance_config_stuck_at_3pct.json \
+  --repair-mode oracle \
+  --levels all \
+  --samples -1 \
+  --fault-seed 42 \
+  --artifact-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/artifacts \
+  --output-dir results/ft_runs/Res18/ft_codebook_budgeted_translate/res18_codebook_adapt/oracle_seed_42
 ```
 
 Oracle must restore baseline on all three seeds. If it does not, the fault/restore pipeline is invalid for that seed.
